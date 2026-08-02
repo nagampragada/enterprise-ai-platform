@@ -1,16 +1,16 @@
 # Current Task
 
-Current task: Approval of the minimum schema for the first implementation.
+Current task: Database infrastructure verification.
 
 No application code should be written yet.
 
-No implementation has started.
+No business implementation has started.
 
 ## Completion Criteria
 
-- Minimum secure schema is reviewed and approved
-- Required first-release tables are separated from deferred tables
-- Project context and current task documents reflect the reviewed simplified schema
+- Database engine, session, and health infrastructure are implemented and validated
+- Project context and current task documents reflect the infrastructure verification phase
+- The next planned work is the identity and organization schema slice
 
 ## Constraints
 
