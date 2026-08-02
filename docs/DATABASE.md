@@ -1,0 +1,709 @@
+# Database Architecture
+
+## Purpose
+
+This document defines the recommended Version 1 database architecture for the platform. It is a design-only artifact. No SQL, migrations, ORM models, API code, or dependency installation are part of this document.
+
+## Product Context
+
+The platform is a multi-tenant, Glean-like AI knowledge platform for small and medium-sized businesses. Version 1 includes:
+
+- Organizations
+- Users
+- Authentication
+- Roles
+- Document upload
+- Document ingestion
+- Document chunks and embeddings
+- AI chat and conversation history
+- Google Drive connector
+- Connector synchronization
+- One read-only PostgreSQL customer-data connector
+- Natural-language SQL
+- Usage tracking
+- Basic audit logging
+
+## Technology Decisions
+
+- Primary database: PostgreSQL
+- Vector support: pgvector
+- Primary keys: UUID
+- ORM later: SQLAlchemy 2.x
+- Migrations later: Alembic
+
+## Core Design Rules
+
+1. organization_id is the primary tenant-isolation boundary.
+2. Customer-owned data must be scoped to an organization.
+3. industry_id is organization metadata and must not be copied onto every table.
+4. Customer business databases remain external.
+5. The platform database stores configuration, indexed knowledge, conversations, security metadata, and operational records.
+6. Credentials and OAuth tokens must not be stored as unencrypted plain text.
+7. Sensitive actions must be auditable.
+8. The design must support permission syncing later without a complete redesign.
+9. Use soft deletion only where it has a clear business purpose.
+10. Avoid premature enterprise complexity.
+
+## Recommended Version 1 Approach
+
+The first working release should use a minimum secure schema rather than a fully expanded platform schema. The goal is to support tenancy, ingestion, retrieval, chat, connector synchronization, and auditability with the fewest tables that still keep future expansion viable.
+
+The key simplification is to keep only the tables required to run the first release safely, while deferring fine-grained authorization, detailed AI telemetry, item-level sync events, invitation workflows, and separate credential rows until those features create real business pressure.
+
+## Simplified Relationship Overview
+
+For non-technical readers:
+
+- An organization is the tenant boundary.
+- Users belong to an organization and receive one or more roles.
+- An organization can configure a Google Drive source and one PostgreSQL database source.
+- Documents belong to an organization and can have multiple versions and searchable chunks.
+- Users chat inside their organization, and assistant answers can cite document chunks or record generated SQL.
+- Sync jobs, ingestion jobs, audit logs, and application events provide the minimum operational record needed to run the system safely.
+
+## High-Level Entity Relationship Diagram
+
+```mermaid
+erDiagram
+    INDUSTRIES ||--o{ ORGANIZATIONS : classifies
+    ORGANIZATIONS ||--|| ORGANIZATION_SETTINGS : configures
+    ORGANIZATIONS ||--o{ USERS : owns
+    ORGANIZATIONS ||--o{ CONNECTORS : owns
+    ORGANIZATIONS ||--o{ DOCUMENTS : owns
+    ORGANIZATIONS ||--o{ INGESTION_JOBS : runs
+    ORGANIZATIONS ||--o{ CHAT_SESSIONS : owns
+    ORGANIZATIONS ||--o{ AUDIT_LOGS : owns
+    ORGANIZATIONS ||--o{ APPLICATION_EVENTS : owns
+
+    USERS ||--o{ USER_ROLES : assigned
+    ROLES ||--o{ USER_ROLES : grants
+    USERS ||--o{ AUTHENTICATION_SESSIONS : starts
+    USERS ||--o{ CHAT_SESSIONS : creates
+    USERS ||--o{ MESSAGES : sends
+
+    CONNECTORS ||--o{ CONNECTOR_SYNC_JOBS : runs
+    CONNECTORS ||--o| GOOGLE_DRIVE_SOURCES : specializes
+    CONNECTORS ||--o| DATABASE_SOURCES : specializes
+
+    DOCUMENTS ||--o{ DOCUMENT_VERSIONS : versions
+    DOCUMENT_VERSIONS ||--o{ DOCUMENT_CHUNKS : chunks
+    INGESTION_JOBS ||--o{ DOCUMENTS : creates_or_updates
+
+    CHAT_SESSIONS ||--o{ MESSAGES : contains
+    MESSAGES ||--o{ MESSAGE_CITATIONS : cites
+    MESSAGES ||--o{ GENERATED_QUERIES : records
+```
+
+Deferred capabilities not shown in the first-release diagram: invitations, permissions, role_permissions, separate connector_credentials, connector_sync_events, document_access_rules, ai_requests, model_usage, retrieval_events, and user_feedback.
+
+## Multi-Tenancy Strategy
+
+- organizations is the tenant root.
+- Every organization-scoped table must include organization_id except global reference tables such as industries and roles.
+- organization_id must come from authenticated server-side context.
+- Clients must not be allowed to choose arbitrary organization_id values.
+- Every organization-scoped repository query must filter by organization_id.
+- Cross-tenant automated tests are mandatory.
+- Unique constraints for tenant-owned identifiers should normally be composite with organization_id.
+
+## Future PostgreSQL Row-Level Security Strategy
+
+Recommended for a later phase:
+
+- Enable Row-Level Security on every organization-scoped table.
+- Set app.current_organization_id from authenticated server-side context.
+- Apply policies based on organization_id = current_setting('app.current_organization_id')::uuid.
+- Keep global reference tables outside tenant RLS.
+
+Version 1 can enforce tenancy at the application layer first, but the schema should be prepared for later RLS adoption.
+
+## pgvector Strategy
+
+- Store one embedding per document chunk in document_chunks.
+- Filter retrieval by organization_id and document state before vector ranking.
+- Re-index by creating a new document_version and new document_chunks rows rather than overwriting prior versions.
+- Standardize on one embedding model per environment in the first release.
+
+## Embedding-Dimension Considerations
+
+- embedding_dimension must match the chosen embedding model exactly.
+- The first release should not support mixed embedding dimensions in the same environment.
+- If the embedding model changes later, re-index into new document versions rather than mixing dimensions within one active dataset.
+
+## Connector Credential Security Strategy
+
+The first release should not create a separate connector_credentials table. Instead, connectors may contain:
+
+- encrypted_secret_reference
+- credential_status
+- credential_updated_at
+
+These fields must not contain raw OAuth tokens or raw database passwords. The intended meaning is:
+
+- encrypted_secret_reference points to a secret manager record or stores an application-encrypted reference value
+- credential_status indicates whether credentials are configured, expired, revoked, or invalid
+- credential_updated_at records the most recent credential change time
+
+If credential rotation, multi-secret history, or per-connector secret lifecycle becomes complex later, a dedicated connector_credentials table can be introduced without redesigning the connector ownership model.
+
+## Document Versioning Strategy
+
+- documents stores the stable logical document identity.
+- document_versions stores immutable uploaded or synchronized versions.
+- document_chunks belongs to a specific document_version.
+- Only one document_version should be current for a document at a time.
+- Re-ingestion should create a new version when source content changes.
+
+## Deletion and Re-Indexing Strategy
+
+- Use soft deletion on documents and chat_sessions because recovery and audit visibility are useful.
+- Keep document_versions and document_chunks tied to historical versions for traceability.
+- When a document is re-indexed, create a new version and new chunk set, then mark the earlier version non-current.
+- If a source document disappears from Google Drive or becomes disallowed, mark the document inactive or deleted and keep the operational history.
+
+## Initial-Sync and Incremental-Sync Tracking
+
+connector_sync_jobs is enough for the first release. Each row should temporarily hold:
+
+- status
+- started_at
+- completed_at
+- discovered_count
+- processed_count
+- failed_count
+- last_error
+- checkpoint metadata
+
+Checkpoint metadata can be stored as JSON to hold a cursor, sync token, or high-water mark until the sync model becomes more complex.
+
+## Chat, Citation, and SQL Storage Design
+
+- chat_sessions groups a conversation by organization and user.
+- messages stores ordered user and assistant messages.
+- message_citations stores structured evidence for assistant answers.
+- generated_queries stores natural-language SQL prompts, generated SQL, validation results, execution status, row limits, and result counts.
+- Basic model and token usage may initially be recorded on messages or generated_queries rather than requiring ai_requests and model_usage tables.
+
+## Minimum Secure Schema for First Implementation
+
+### Immediate Table Set
+
+#### Reference and tenancy
+
+- industries
+- organizations
+- organization_settings
+
+#### Identity
+
+- users
+- roles
+- user_roles
+- authentication_sessions
+
+#### Connectors
+
+- connectors
+- connector_sync_jobs
+- google_drive_sources
+- database_sources
+
+#### Documents
+
+- documents
+- document_versions
+- document_chunks
+- ingestion_jobs
+
+#### Conversations and SQL
+
+- chat_sessions
+- messages
+- message_citations
+- generated_queries
+
+#### Operations
+
+- audit_logs
+- application_events
+
+Immediate table count: 21.
+
+### Why This Is the Minimum Secure Set
+
+- It supports tenant ownership and tenant-filtered queries.
+- It supports login session tracking without a larger invitation or permission framework.
+- It supports both required connector types without premature connector specialization overhead.
+- It supports document ingestion, versioning, chunking, retrieval, citations, and natural-language SQL auditing.
+- It captures enough operational and audit data to investigate failures and sensitive actions.
+
+## Required Table Designs for the First Working Release
+
+### A. Reference and Tenancy
+
+#### industries
+
+- Purpose: Reference data for organization industry classification.
+- Primary key: id UUID.
+- Foreign keys: none.
+- Important columns: code, name, description, is_active, created_at.
+- Required fields: id, code, name, is_active, created_at.
+- Optional fields: description.
+- Unique constraints: unique(code), unique(name).
+- Check constraints: code must be non-empty.
+- Suggested indexes: unique(code), btree(is_active).
+- Tenant-isolation behavior: global table, no organization_id.
+- Data-retention considerations: prefer deactivation over deletion.
+- Relationships: organizations.industry_id references industries.id.
+
+#### organizations
+
+- Purpose: Tenant root for all customer-owned data.
+- Primary key: id UUID.
+- Foreign keys: industry_id -> industries.id.
+- Important columns: name, slug, industry_id, status, created_at, updated_at, deleted_at.
+- Required fields: id, name, slug, status, created_at, updated_at.
+- Optional fields: industry_id, deleted_at.
+- Unique constraints: unique(slug).
+- Check constraints: status limited to approved lifecycle values.
+- Suggested indexes: unique(slug), btree(industry_id), btree(status).
+- Tenant-isolation behavior: root tenant table.
+- Data-retention considerations: soft deletion is useful for account recovery and auditing.
+- Relationships: one-to-one with organization_settings; one-to-many with most first-release tables.
+
+#### organization_settings
+
+- Purpose: Store organization-level configuration separately from the core organization record.
+- Primary key: organization_id UUID.
+- Foreign keys: organization_id -> organizations.id.
+- Important columns: default_language, retention_policy_days, allowed_auth_providers, created_at, updated_at.
+- Required fields: organization_id, created_at, updated_at.
+- Optional fields: configuration values based on first-release needs.
+- Unique constraints: primary key on organization_id.
+- Check constraints: retention_policy_days >= 0 when present.
+- Suggested indexes: primary key only.
+- Tenant-isolation behavior: organization-scoped by organization_id.
+- Data-retention considerations: update in place; important changes should be mirrored in audit_logs.
+- Relationships: exactly one settings row per organization.
+
+### B. Identity
+
+#### users
+
+- Purpose: Store user identities within an organization.
+- Primary key: id UUID.
+- Foreign keys: organization_id -> organizations.id.
+- Important columns: email, full_name, password_hash or external_subject_id, auth_provider, status, last_login_at, created_at, updated_at, deleted_at.
+- Required fields: id, organization_id, email, auth_provider, status, created_at, updated_at.
+- Optional fields: full_name, password_hash, external_subject_id, last_login_at, deleted_at.
+- Unique constraints: unique(organization_id, email).
+- Check constraints: status limited to approved values; auth configuration must be internally consistent.
+- Suggested indexes: unique(organization_id, email), btree(status), btree(last_login_at).
+- Tenant-isolation behavior: directly organization-scoped.
+- Data-retention considerations: soft deletion preferred for audit continuity.
+- Relationships: one-to-many with user_roles, authentication_sessions, chat_sessions, messages, and audit_logs.
+
+#### roles
+
+- Purpose: Define coarse first-release access roles such as organization_admin and employee.
+- Primary key: id UUID.
+- Foreign keys: none.
+- Important columns: code, name, description, is_system, created_at.
+- Required fields: id, code, name, is_system, created_at.
+- Optional fields: description.
+- Unique constraints: unique(code).
+- Check constraints: code must be non-empty.
+- Suggested indexes: unique(code).
+- Tenant-isolation behavior: global reference table.
+- Data-retention considerations: roles should be stable and rarely deleted.
+- Relationships: many-to-many with users through user_roles.
+
+#### user_roles
+
+- Purpose: Assign roles to users within an organization.
+- Primary key: id UUID.
+- Foreign keys: organization_id -> organizations.id, user_id -> users.id, role_id -> roles.id, assigned_by_user_id -> users.id nullable.
+- Important columns: assigned_at, expires_at.
+- Required fields: id, organization_id, user_id, role_id, assigned_at.
+- Optional fields: assigned_by_user_id, expires_at.
+- Unique constraints: unique(organization_id, user_id, role_id).
+- Check constraints: expires_at is null or later than assigned_at.
+- Suggested indexes: btree(organization_id, user_id), btree(organization_id, role_id).
+- Tenant-isolation behavior: directly organization-scoped.
+- Data-retention considerations: keep role history if practical; otherwise rely on audit_logs for change history.
+- Relationships: joins users to roles.
+
+#### authentication_sessions
+
+- Purpose: Track authenticated sessions and refresh-token state.
+- Primary key: id UUID.
+- Foreign keys: organization_id -> organizations.id, user_id -> users.id.
+- Important columns: refresh_token_hash, session_status, issued_at, expires_at, last_seen_at, revoked_at, ip_address, user_agent.
+- Required fields: id, organization_id, user_id, refresh_token_hash, session_status, issued_at, expires_at.
+- Optional fields: last_seen_at, revoked_at, ip_address, user_agent.
+- Unique constraints: unique(refresh_token_hash).
+- Check constraints: expires_at > issued_at; revoked_at null or revoked_at >= issued_at.
+- Suggested indexes: btree(organization_id, user_id), btree(session_status, expires_at).
+- Tenant-isolation behavior: directly organization-scoped.
+- Data-retention considerations: retain recent revoked sessions for security investigations, purge older rows later.
+- Relationships: one user to many authentication sessions.
+
+### C. Connectors
+
+#### connectors
+
+- Purpose: Store connector registrations and minimal credential state for the first release.
+- Primary key: id UUID.
+- Foreign keys: organization_id -> organizations.id, created_by_user_id -> users.id nullable.
+- Important columns: connector_type, display_name, status, is_enabled, encrypted_secret_reference, credential_status, credential_updated_at, last_sync_at, last_successful_sync_at, created_at, updated_at.
+- Required fields: id, organization_id, connector_type, display_name, status, is_enabled, credential_status, created_at, updated_at.
+- Optional fields: created_by_user_id, encrypted_secret_reference, credential_updated_at, last_sync_at, last_successful_sync_at.
+- Unique constraints: unique(organization_id, connector_type, display_name).
+- Check constraints: connector_type limited to google_drive and postgresql in the first release; credential_status limited to approved values.
+- Suggested indexes: btree(organization_id, connector_type), btree(organization_id, status), btree(last_successful_sync_at).
+- Tenant-isolation behavior: directly organization-scoped.
+- Data-retention considerations: keep historical connector rows when used operationally.
+- Relationships: one-to-one with google_drive_sources or database_sources; one-to-many with connector_sync_jobs.
+
+#### connector_sync_jobs
+
+- Purpose: Track initial and incremental sync runs at a summary level.
+- Primary key: id UUID.
+- Foreign keys: organization_id -> organizations.id, connector_id -> connectors.id, started_by_user_id -> users.id nullable.
+- Important columns: sync_mode, status, started_at, completed_at, discovered_count, processed_count, failed_count, last_error, checkpoint_metadata, created_at.
+- Required fields: id, organization_id, connector_id, sync_mode, status, started_at, created_at.
+- Optional fields: started_by_user_id, completed_at, discovered_count, processed_count, failed_count, last_error, checkpoint_metadata.
+- Unique constraints: none.
+- Check constraints: counts >= 0; completed_at null or completed_at >= started_at; sync_mode limited to initial or incremental.
+- Suggested indexes: btree(organization_id, connector_id, started_at desc), btree(status), btree(sync_mode).
+- Tenant-isolation behavior: directly organization-scoped.
+- Data-retention considerations: retain for operational history and support.
+- Relationships: one connector to many sync jobs; ingestion_jobs may optionally reference a sync job.
+
+#### google_drive_sources
+
+- Purpose: Store Google Drive-specific configuration for approved folders.
+- Primary key: id UUID.
+- Foreign keys: organization_id -> organizations.id, connector_id -> connectors.id.
+- Important columns: approved_folder_ids, drive_account_email, sync_cursor, include_shared_drives, created_at, updated_at.
+- Required fields: id, organization_id, connector_id, approved_folder_ids, created_at, updated_at.
+- Optional fields: drive_account_email, sync_cursor, include_shared_drives.
+- Unique constraints: unique(connector_id).
+- Check constraints: approved_folder_ids must not be empty.
+- Suggested indexes: unique(connector_id), btree(organization_id).
+- Tenant-isolation behavior: directly organization-scoped.
+- Data-retention considerations: retain while connector exists.
+- Relationships: one specialized row per Google Drive connector.
+
+#### database_sources
+
+- Purpose: Store the read-only PostgreSQL connector configuration.
+- Primary key: id UUID.
+- Foreign keys: organization_id -> organizations.id, connector_id -> connectors.id.
+- Important columns: database_engine, host_reference, database_name, schema_allowlist, table_allowlist, sql_row_limit_default, sql_row_limit_max, metadata_last_synced_at, sql_guardrails_json, created_at, updated_at.
+- Required fields: id, organization_id, connector_id, database_engine, database_name, sql_row_limit_default, sql_row_limit_max, created_at, updated_at.
+- Optional fields: host_reference, schema_allowlist, table_allowlist, metadata_last_synced_at, sql_guardrails_json.
+- Unique constraints: unique(connector_id).
+- Check constraints: database_engine = postgresql in the first release; sql_row_limit_default > 0; sql_row_limit_max >= sql_row_limit_default.
+- Suggested indexes: unique(connector_id), btree(organization_id), btree(metadata_last_synced_at).
+- Tenant-isolation behavior: directly organization-scoped.
+- Data-retention considerations: retain while connector exists and minimize sensitive infrastructure detail.
+- Relationships: one specialized row per PostgreSQL connector; referenced by generated_queries.
+
+### D. Documents
+
+#### documents
+
+- Purpose: Store the stable logical identity of uploaded or synchronized documents.
+- Primary key: id UUID.
+- Foreign keys: organization_id -> organizations.id, connector_id -> connectors.id nullable, source_ingestion_job_id -> ingestion_jobs.id nullable, created_by_user_id -> users.id nullable.
+- Important columns: source_type, source_document_key, title, mime_type, current_version_id, status, checksum_latest, created_at, updated_at, deleted_at.
+- Required fields: id, organization_id, source_type, title, status, created_at, updated_at.
+- Optional fields: connector_id, source_ingestion_job_id, created_by_user_id, source_document_key, mime_type, current_version_id, checksum_latest, deleted_at.
+- Unique constraints: unique(organization_id, source_type, source_document_key) when source_document_key is present.
+- Check constraints: status limited to approved values.
+- Suggested indexes: btree(organization_id, status), btree(organization_id, connector_id), btree(current_version_id), btree(source_document_key).
+- Tenant-isolation behavior: directly organization-scoped.
+- Data-retention considerations: soft deletion recommended.
+- Relationships: one document to many versions; one document to many citations.
+
+#### document_versions
+
+- Purpose: Store immutable document versions produced by upload or synchronization.
+- Primary key: id UUID.
+- Foreign keys: organization_id -> organizations.id, document_id -> documents.id, ingestion_job_id -> ingestion_jobs.id nullable.
+- Important columns: version_number, content_checksum, storage_uri, extracted_text_uri or extracted_text, extraction_status, chunk_count, token_count, is_current, created_at.
+- Required fields: id, organization_id, document_id, version_number, content_checksum, extraction_status, is_current, created_at.
+- Optional fields: ingestion_job_id, storage_uri, extracted_text_uri, extracted_text, chunk_count, token_count.
+- Unique constraints: unique(document_id, version_number); only one current version per document.
+- Check constraints: version_number > 0; chunk_count and token_count >= 0 when present.
+- Suggested indexes: btree(organization_id, document_id), btree(document_id, is_current), btree(content_checksum).
+- Tenant-isolation behavior: directly organization-scoped.
+- Data-retention considerations: keep version history for auditability and re-indexing.
+- Relationships: one version to many chunks.
+
+#### document_chunks
+
+- Purpose: Store retrieval chunks and embeddings.
+- Primary key: id UUID.
+- Foreign keys: organization_id -> organizations.id, document_id -> documents.id, document_version_id -> document_versions.id.
+- Important columns: chunk_index, chunk_text, token_count, embedding, embedding_model, embedding_dimension, content_hash, page_number_start, page_number_end, created_at.
+- Required fields: id, organization_id, document_id, document_version_id, chunk_index, chunk_text, embedding, embedding_model, embedding_dimension, created_at.
+- Optional fields: token_count, content_hash, page_number_start, page_number_end.
+- Unique constraints: unique(document_version_id, chunk_index).
+- Check constraints: chunk_index >= 0; embedding_dimension > 0; token_count >= 0 when present.
+- Suggested indexes: btree(organization_id, document_id), btree(document_version_id), vector index on embedding.
+- Tenant-isolation behavior: directly organization-scoped.
+- Data-retention considerations: tied to version history; purge only if historical versions are intentionally removed.
+- Relationships: belongs to one document version; referenced by message_citations.
+
+#### ingestion_jobs
+
+- Purpose: Track upload or indexing work for documents.
+- Primary key: id UUID.
+- Foreign keys: organization_id -> organizations.id, connector_id -> connectors.id nullable, connector_sync_job_id -> connector_sync_jobs.id nullable, started_by_user_id -> users.id nullable.
+- Important columns: ingestion_type, status, started_at, completed_at, document_count, version_count, chunk_count, failure_count, error_summary.
+- Required fields: id, organization_id, ingestion_type, status, started_at.
+- Optional fields: connector_id, connector_sync_job_id, started_by_user_id, completed_at, document_count, version_count, chunk_count, failure_count, error_summary.
+- Unique constraints: none.
+- Check constraints: counts >= 0; completed_at null or completed_at >= started_at.
+- Suggested indexes: btree(organization_id, started_at desc), btree(connector_id, status), btree(connector_sync_job_id).
+- Tenant-isolation behavior: directly organization-scoped.
+- Data-retention considerations: operationally valuable; retain for debugging and throughput analysis.
+- Relationships: may create or update documents and document_versions.
+
+### E. Conversations and SQL
+
+#### chat_sessions
+
+- Purpose: Group a conversation by user and organization.
+- Primary key: id UUID.
+- Foreign keys: organization_id -> organizations.id, user_id -> users.id.
+- Important columns: title, status, last_message_at, created_at, updated_at, archived_at, deleted_at.
+- Required fields: id, organization_id, user_id, status, created_at, updated_at.
+- Optional fields: title, last_message_at, archived_at, deleted_at.
+- Unique constraints: none.
+- Check constraints: archived_at and deleted_at must be later than created_at when present.
+- Suggested indexes: btree(organization_id, user_id, last_message_at desc), btree(status), btree(deleted_at).
+- Tenant-isolation behavior: directly organization-scoped.
+- Data-retention considerations: soft deletion recommended.
+- Relationships: one chat session to many messages.
+
+#### messages
+
+- Purpose: Store ordered user and assistant messages.
+- Primary key: id UUID.
+- Foreign keys: organization_id -> organizations.id, chat_session_id -> chat_sessions.id, user_id -> users.id nullable.
+- Important columns: message_role, sequence_number, content_text, status, model_name, prompt_token_count, completion_token_count, total_token_count, created_at.
+- Required fields: id, organization_id, chat_session_id, message_role, sequence_number, content_text, created_at.
+- Optional fields: user_id, status, model_name, prompt_token_count, completion_token_count, total_token_count.
+- Unique constraints: unique(chat_session_id, sequence_number).
+- Check constraints: sequence_number > 0; token counts >= 0 when present; message_role limited to approved values.
+- Suggested indexes: btree(organization_id, chat_session_id, sequence_number), btree(message_role), btree(created_at).
+- Tenant-isolation behavior: directly organization-scoped.
+- Data-retention considerations: normally retained with the chat session.
+- Relationships: many messages per chat session; one message may have many citations and generated queries.
+
+#### message_citations
+
+- Purpose: Store structured citations for assistant answers.
+- Primary key: id UUID.
+- Foreign keys: organization_id -> organizations.id, message_id -> messages.id, document_id -> documents.id, document_version_id -> document_versions.id nullable, document_chunk_id -> document_chunks.id nullable.
+- Important columns: citation_order, snippet_text, locator_json, score, created_at.
+- Required fields: id, organization_id, message_id, document_id, citation_order, created_at.
+- Optional fields: document_version_id, document_chunk_id, snippet_text, locator_json, score.
+- Unique constraints: unique(message_id, citation_order).
+- Check constraints: citation_order > 0; score between 0 and 1 when normalized.
+- Suggested indexes: btree(message_id, citation_order), btree(document_id), btree(document_chunk_id).
+- Tenant-isolation behavior: directly organization-scoped.
+- Data-retention considerations: retain with message history for answer traceability.
+- Relationships: many citations per assistant message.
+
+#### generated_queries
+
+- Purpose: Audit natural-language SQL generation and SELECT-only execution outcomes.
+- Primary key: id UUID.
+- Foreign keys: organization_id -> organizations.id, message_id -> messages.id, connector_id -> connectors.id, database_source_id -> database_sources.id, user_id -> users.id nullable.
+- Important columns: natural_language_prompt, generated_sql, validation_status, execution_status, query_fingerprint, row_limit_applied, result_row_count, model_name, prompt_token_count, completion_token_count, total_token_count, generated_at, executed_at, error_summary.
+- Required fields: id, organization_id, message_id, connector_id, database_source_id, natural_language_prompt, generated_sql, validation_status, generated_at.
+- Optional fields: user_id, execution_status, query_fingerprint, row_limit_applied, result_row_count, model_name, prompt_token_count, completion_token_count, total_token_count, executed_at, error_summary.
+- Unique constraints: none.
+- Check constraints: row_limit_applied > 0 when present; result_row_count >= 0 when present; token counts >= 0 when present.
+- Suggested indexes: btree(organization_id, generated_at desc), btree(database_source_id, generated_at desc), btree(query_fingerprint).
+- Tenant-isolation behavior: directly organization-scoped.
+- Data-retention considerations: high audit value; retain longer than transient operational data.
+- Relationships: tied to one message and one database source.
+
+### F. Operations
+
+#### audit_logs
+
+- Purpose: Store auditable records of sensitive user and system actions.
+- Primary key: id UUID.
+- Foreign keys: organization_id -> organizations.id, actor_user_id -> users.id nullable.
+- Important columns: action_type, target_type, target_id, outcome, ip_address, user_agent, event_payload_json, occurred_at.
+- Required fields: id, organization_id, action_type, outcome, occurred_at.
+- Optional fields: actor_user_id, target_type, target_id, ip_address, user_agent, event_payload_json.
+- Unique constraints: none.
+- Check constraints: outcome limited to approved values such as success, failure, denied, pending.
+- Suggested indexes: btree(organization_id, occurred_at desc), btree(actor_user_id, occurred_at desc), btree(action_type), btree(target_type, target_id).
+- Tenant-isolation behavior: directly organization-scoped.
+- Data-retention considerations: strong retention priority.
+- Relationships: cross-references users, connectors, documents, sessions, and generated SQL indirectly through target_type and target_id.
+
+#### application_events
+
+- Purpose: Store operational failures, warnings, and system events.
+- Primary key: id UUID.
+- Foreign keys: organization_id -> organizations.id nullable, connector_id -> connectors.id nullable, ingestion_job_id -> ingestion_jobs.id nullable, connector_sync_job_id -> connector_sync_jobs.id nullable.
+- Important columns: event_type, severity, source_component, correlation_id, message, details_json, occurred_at.
+- Required fields: id, event_type, severity, source_component, occurred_at.
+- Optional fields: organization_id, connector_id, ingestion_job_id, connector_sync_job_id, correlation_id, message, details_json.
+- Unique constraints: none.
+- Check constraints: severity limited to approved values.
+- Suggested indexes: btree(occurred_at desc), btree(severity, occurred_at desc), btree(organization_id, occurred_at desc), btree(correlation_id).
+- Tenant-isolation behavior: organization_id is present for tenant-specific events and null only for truly global operational events.
+- Data-retention considerations: can be retained for a shorter period than audit_logs or exported externally later.
+- Relationships: provides operational traceability for sync, ingestion, and runtime issues.
+
+## Deferred Tables and Trigger Conditions
+
+Deferred table count: 10.
+
+#### invitations
+
+- Why deferred: first-release onboarding can be handled with direct user creation by administrators.
+- Add later when: the product needs email-driven self-service invites, invite acceptance tracking, or secure invite expiration workflows.
+
+#### permissions
+
+- Why deferred: first-release access control can rely on a small fixed role set.
+- Add later when: roles are no longer enough and resource-level authorization decisions must be modeled explicitly.
+
+#### role_permissions
+
+- Why deferred: it only becomes necessary once permissions exists as a real authorization layer.
+- Add later when: permission catalogs are introduced and roles must map to reusable permission sets.
+
+#### connector_credentials as a separate table
+
+- Why deferred: the first release can keep a minimal encrypted_secret_reference and credential state directly on connectors.
+- Add later when: secret rotation history, multiple credential versions, or connector-specific secret lifecycle tracking becomes necessary.
+
+#### connector_sync_events
+
+- Why deferred: summary-level sync tracking is sufficient at first.
+- Add later when: item-level diagnostics, replay support, or detailed sync troubleshooting becomes operationally necessary.
+
+#### document_access_rules
+
+- Why deferred: Version 1 does not implement full source permission synchronization.
+- Add later when: document-level permission sync or restricted retrieval requires principal-level allow or deny rules.
+
+#### ai_requests
+
+- Why deferred: initial model and latency metrics can be stored on messages and generated_queries.
+- Add later when: the platform needs request-level tracing across prompts, retrieval, tool usage, and model execution.
+
+#### model_usage
+
+- Why deferred: first-release usage visibility can stay embedded in messages or generated_queries.
+- Add later when: billing, cost attribution, or detailed usage analytics requires a normalized usage ledger.
+
+#### retrieval_events
+
+- Why deferred: retrieval quality can be debugged initially through chat outcomes and citations.
+- Add later when: retrieval tuning, ranking experiments, or explainability workflows need structured retrieval telemetry.
+
+#### user_feedback
+
+- Why deferred: first-release feedback can be collected outside the core schema if necessary.
+- Add later when: answer-level ratings and feedback loops become part of the product learning cycle.
+
+## Architectural Review and Challenge
+
+### Tables That Were Removed From the Immediate Set
+
+- invitations
+- permissions
+- role_permissions
+- connector_credentials as a separate table
+- connector_sync_events
+- document_access_rules
+- ai_requests
+- model_usage
+- retrieval_events
+- user_feedback
+
+These were removed from the immediate set because they add structure without being necessary to launch the first secure working release.
+
+### Tables That Should Stay Combined for Now
+
+- Credential state should stay on connectors for the first release.
+- Token and model usage can stay on messages and generated_queries for the first release.
+- Application and error telemetry should stay combined in application_events.
+
+### Tables That Must Stay Separate Even in the Minimum Schema
+
+- documents, document_versions, and document_chunks must stay separate.
+- connectors must stay separate from google_drive_sources and database_sources.
+- chat_sessions, messages, and message_citations must stay separate.
+- generated_queries must stay separate from audit_logs.
+
+### Areas Still Sensitive to Over-Engineering
+
+- Adding too many connector-specific metadata tables before more connectors exist.
+- Building a full permission graph before the product needs it.
+- Creating AI telemetry tables that duplicate data already available on messages and generated_queries.
+
+### Areas That Must Not Be Omitted
+
+- organization_id on every organization-scoped table.
+- document versioning as a separate layer.
+- structured citations.
+- generated query auditing.
+- sync job checkpoint tracking.
+- audit logs for sensitive actions.
+
+## Important Risks and Mitigations
+
+- Risk: cross-tenant data leakage through missing query filters.
+  Mitigation: require organization_id in every organization-scoped table, enforce server-side tenant context, and add mandatory cross-tenant automated tests.
+- Risk: credential handling becomes unsafe.
+  Mitigation: store only encrypted_secret_reference and credential state in the first release, never raw secrets.
+- Risk: future permission sync becomes harder.
+  Mitigation: keep document ownership and connector source identity clean so document_access_rules can be added later.
+- Risk: document re-indexing corrupts retrieval history.
+  Mitigation: use immutable document_versions and version-scoped document_chunks.
+- Risk: SQL generation becomes difficult to audit.
+  Mitigation: keep generated_queries as a first-release table with validation, execution, and token metadata.
+
+## Recommended Table Creation Order for the First Release
+
+1. industries
+2. organizations
+3. organization_settings
+4. roles
+5. users
+6. user_roles
+7. authentication_sessions
+8. connectors
+9. google_drive_sources
+10. database_sources
+11. connector_sync_jobs
+12. ingestion_jobs
+13. documents
+14. document_versions
+15. document_chunks
+16. chat_sessions
+17. messages
+18. message_citations
+19. generated_queries
+20. audit_logs
+21. application_events
+
+## Final Recommendation
+
+The first implementation should start with the 21-table minimum secure schema described here. That set is enough to support tenancy, authentication sessions, role assignment, the two first-release connector types, document ingestion and vector retrieval, chat with citations, generated SQL auditing, and basic operational and security observability.
+
+The deferred tables remain architecturally valid, but they should only be added when concrete business or operational conditions justify them.

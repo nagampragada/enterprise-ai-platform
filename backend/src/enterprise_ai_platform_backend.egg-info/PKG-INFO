@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: enterprise-ai-platform-backend
+Version: 0.1.0
+Summary: Backend foundation for the Enterprise AI Platform
+Requires-Python: >=3.12
+Requires-Dist: SQLAlchemy<3.0,>=2.0
+Requires-Dist: alembic<2.0,>=1.13
+Requires-Dist: psycopg[binary]<4.0,>=3.2

@@ -1,0 +1,6 @@
+app
+application
+domain
+infrastructure
+integrations
+interfaces

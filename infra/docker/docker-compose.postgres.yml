@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: enterprise-ai-platform-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: enterprise_ai_platform
+      POSTGRES_USER: enterprise_ai_platform
+      POSTGRES_PASSWORD: enterprise_ai_platform
+    ports:
+      - "127.0.0.1:15432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U enterprise_ai_platform -d enterprise_ai_platform"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
