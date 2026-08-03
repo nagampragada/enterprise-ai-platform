@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.api.v1.auth.schemas import (
+    AuthenticatedUserResponse,
     AuthenticationTokensResponse,
     LoginRequest,
     LoginResponse,
@@ -17,11 +18,21 @@ from app.api.v1.auth.schemas import (
     MessageResponse,
     RefreshRequest,
 )
-from app.dependencies import get_authentication_service, get_db_session
+from app.dependencies import CurrentUser, get_authentication_service, get_current_user, get_db_session
 from application.services.authentication_service import AuthenticationService
 
 
 auth_router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+@auth_router.get("/me", response_model=AuthenticatedUserResponse)
+def me(current_user: CurrentUser = Depends(get_current_user)) -> AuthenticatedUserResponse:
+    return AuthenticatedUserResponse(
+        user_id=current_user.user_id,
+        organization_id=current_user.organization_id,
+        email=current_user.email,
+        display_name=current_user.display_name,
+    )
 
 
 @auth_router.post("/login", response_model=LoginResponse)
