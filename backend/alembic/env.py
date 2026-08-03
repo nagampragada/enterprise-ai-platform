@@ -16,8 +16,12 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-settings = get_settings()
-config.set_main_option("sqlalchemy.url", settings.database_url)
+# Keep explicit Alembic config URLs (e.g., test overrides) and only fall back
+# to application settings when no URL was provided.
+configured_url = config.get_main_option("sqlalchemy.url")
+if not configured_url:
+    settings = get_settings()
+    config.set_main_option("sqlalchemy.url", settings.database_url)
 
 target_metadata = Base.metadata
 
@@ -30,6 +34,7 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
+        version_table_schema="public",
     )
 
     with context.begin_transaction():
@@ -48,6 +53,7 @@ def run_migrations_online() -> None:
             connection=connection,
             target_metadata=target_metadata,
             compare_type=True,
+            version_table_schema="public",
         )
 
         with context.begin_transaction():

@@ -286,67 +286,202 @@ Immediate table count: 21.
 - Data-retention considerations: update in place; important changes should be mirrored in audit_logs.
 - Relationships: exactly one settings row per organization.
 
-### B. Identity
+### B. Identity and Authentication
 
-#### users
+This is the next migration slice after the two live reference tables. The recommended design keeps roles simple and global, users scoped to one organization, role assignments explicit for tenant enforcement, and refresh-token state hashed and revocable.
 
-- Purpose: Store user identities within an organization.
-- Primary key: id UUID.
-- Foreign keys: organization_id -> organizations.id.
-- Important columns: email, full_name, password_hash or external_subject_id, auth_provider, status, last_login_at, created_at, updated_at, deleted_at.
-- Required fields: id, organization_id, email, auth_provider, status, created_at, updated_at.
-- Optional fields: full_name, password_hash, external_subject_id, last_login_at, deleted_at.
-- Unique constraints: unique(organization_id, email).
-- Check constraints: status limited to approved values; auth configuration must be internally consistent.
-- Suggested indexes: unique(organization_id, email), btree(status), btree(last_login_at).
-- Tenant-isolation behavior: directly organization-scoped.
-- Data-retention considerations: soft deletion preferred for audit continuity.
-- Relationships: one-to-many with user_roles, authentication_sessions, chat_sessions, messages, and audit_logs.
+```mermaid
+erDiagram
+    INDUSTRIES ||--o{ ORGANIZATIONS : classifies
+    ORGANIZATIONS ||--|| ORGANIZATION_SETTINGS : configures
+    ORGANIZATIONS ||--o{ USERS : owns
+  ROLES ||--o{ USER_ROLES : grants
+    USERS ||--o{ USER_ROLES : assigned
+    USERS ||--o{ AUTHENTICATION_SESSIONS : opens
+```
+
+#### organization_settings
+
+- Purpose: Store one organization-wide configuration row for locale, retention, and default AI behavior.
+- Columns: organization_id, default_locale, timezone, retention_days, ai_model_name, created_at, updated_at.
+- PostgreSQL data types: UUID, VARCHAR(32), VARCHAR(64), INTEGER, VARCHAR(128), TIMESTAMPTZ, TIMESTAMPTZ.
+- Required versus nullable fields: organization_id, default_locale, timezone, retention_days, created_at, updated_at are required; ai_model_name is nullable.
+- Defaults: default_locale = 'en-US'; timezone = 'UTC'; retention_days = 365; created_at and updated_at default to now(); ai_model_name has no database default because the application can supply a system default.
+- Primary keys: organization_id.
+- Foreign keys: organization_id -> organizations.id ON DELETE CASCADE.
+- Unique constraints: primary key on organization_id.
+- Check constraints: retention_days must be within a reasonable positive range, for example 1 through 3650; default_locale and timezone must not be blank; if ai_model_name is present it must not be blank.
+- Indexes: primary key only.
+- Delete behavior: delete with the organization; no separate lifecycle is needed.
+- Tenant-isolation behavior: one row per organization; directly tenant-scoped by organization_id.
+- Security considerations: keep only low-entropy configuration here; do not store branding assets, secrets, or arbitrary JSON blobs.
+- Fields deferred for later: branding metadata, notification preferences, feature flags, SSO configuration, and arbitrary settings JSON.
 
 #### roles
 
-- Purpose: Define coarse first-release access roles such as organization_admin and employee.
-- Primary key: id UUID.
-- Foreign keys: none.
-- Important columns: code, name, description, is_system, created_at.
-- Required fields: id, code, name, is_system, created_at.
-- Optional fields: description.
-- Unique constraints: unique(code).
-- Check constraints: code must be non-empty.
-- Suggested indexes: unique(code).
-- Tenant-isolation behavior: global reference table.
-- Data-retention considerations: roles should be stable and rarely deleted.
-- Relationships: many-to-many with users through user_roles.
+- Purpose: Define a small fixed set of platform roles for Version 1.
+- Columns: id, name, description, is_system_role, created_at, updated_at.
+- PostgreSQL data types: UUID, VARCHAR(128), TEXT, BOOLEAN, TIMESTAMPTZ, TIMESTAMPTZ.
+- Required versus nullable fields: id, name, is_system_role, created_at, updated_at are required; description is nullable.
+- Defaults: is_system_role = true; created_at and updated_at default to now().
+- Primary keys: id.
+- Foreign keys: none in Version 1 because roles are purely global.
+- Unique constraints: unique(name).
+- Check constraints: name must not be blank; optionally enforce lower(name) = name if names are stored in a normalized form, but the required rule is simply non-blank names.
+- Indexes: unique(name); optional index on is_system_role for admin tooling.
+- Delete behavior: roles should be treated as immutable seed/reference rows; if deletion is ever allowed, restrict it when user_roles references exist.
+- Tenant-isolation behavior: global reference table in Version 1; not tenant-scoped.
+- Security considerations: global fixed roles simplify review and reduce customization risk; platform_admin should not be modeled here and should be handled in the deployment/identity plane separately.
+- Fields deferred for later: organization-specific custom roles, permission mappings, role hierarchies, and role-scoped capabilities.
+
+#### users
+
+- Purpose: Store user identities for exactly one organization in Version 1.
+- Columns: id, organization_id, email, normalized_email, password_hash, first_name, last_name, display_name, status, email_verified_at, last_login_at, created_at, updated_at.
+- PostgreSQL data types: UUID, UUID, VARCHAR(320), VARCHAR(320), TEXT, VARCHAR(100), VARCHAR(100), VARCHAR(200), VARCHAR(32), TIMESTAMPTZ, TIMESTAMPTZ, TIMESTAMPTZ, TIMESTAMPTZ.
+- Required versus nullable fields: id, organization_id, email, normalized_email, password_hash, display_name, status, created_at, updated_at are required; first_name, last_name, email_verified_at, and last_login_at are nullable.
+- Defaults: status = 'active'; created_at and updated_at default to now().
+- Primary keys: id.
+- Foreign keys: organization_id -> organizations.id ON DELETE CASCADE.
+- Unique constraints: unique(organization_id, normalized_email); unique(organization_id, id).
+- Check constraints: normalized_email must equal lower(btrim(email)); status must be one of active, suspended, disabled; password_hash must not be blank.
+- Indexes: unique(organization_id, normalized_email); unique(organization_id, id); btree(organization_id, status); btree(organization_id, last_login_at).
+- Delete behavior: Version 1 should prefer disabling users by status rather than soft deletion; if hard delete is used for administrative cleanup, dependent sessions and role assignments can cascade.
+- Tenant-isolation behavior: directly organization-scoped; every query for users must include organization_id.
+- Security considerations: password_hash must never be returned through APIs; email login is case-insensitive because normalized_email is stored and indexed; the hash should be Argon2id or bcrypt, generated outside the database; password_hash must not be nullable for local-password users in Version 1.
+- Fields deferred for later: deleted_at, external identity provider columns, MFA state, password reset metadata, lockout counters, authentication_identities for OAuth/SSO, and other auth-provider linkage fields.
 
 #### user_roles
 
-- Purpose: Assign roles to users within an organization.
-- Primary key: id UUID.
-- Foreign keys: organization_id -> organizations.id, user_id -> users.id, role_id -> roles.id, assigned_by_user_id -> users.id nullable.
-- Important columns: assigned_at, expires_at.
-- Required fields: id, organization_id, user_id, role_id, assigned_at.
-- Optional fields: assigned_by_user_id, expires_at.
+- Purpose: Record which fixed roles are assigned to which users in a specific organization.
+- Columns: id, organization_id, user_id, role_id, assigned_at, assigned_by_user_id.
+- PostgreSQL data types: UUID, UUID, UUID, UUID, TIMESTAMPTZ, UUID.
+- Required versus nullable fields: id, organization_id, user_id, role_id, assigned_at are required; assigned_by_user_id is nullable.
+- Defaults: assigned_at defaults to now().
+- Primary keys: surrogate UUID id is recommended.
+- Foreign keys: organization_id -> organizations.id ON DELETE CASCADE; composite foreign key (organization_id, user_id) -> users(organization_id, id) ON DELETE CASCADE; role_id -> roles.id ON DELETE RESTRICT; assigned_by_user_id is intentionally not a database foreign key in Version 1.
 - Unique constraints: unique(organization_id, user_id, role_id).
-- Check constraints: expires_at is null or later than assigned_at.
-- Suggested indexes: btree(organization_id, user_id), btree(organization_id, role_id).
-- Tenant-isolation behavior: directly organization-scoped.
-- Data-retention considerations: keep role history if practical; otherwise rely on audit_logs for change history.
-- Relationships: joins users to roles.
+- Check constraints: organization_id must match the tenant context of the assigned user and the assignment must not be blank; this invariant is enforced by the composite foreign key and should also be checked by application code.
+- Indexes: unique(organization_id, user_id, role_id); btree(organization_id, user_id); btree(organization_id, role_id); btree(assigned_by_user_id); btree(user_id); btree(role_id).
+- Delete behavior: removing a user or organization cascades assignments; roles are restricted from deletion because they are seed/reference data.
+- Tenant-isolation behavior: store organization_id even though it is partially redundant because it is intentionally denormalized for tenant enforcement, future PostgreSQL RLS, auditing, and simpler organization-scoped queries.
+- Security considerations: this table is an assignment record rather than a pure join table, so a surrogate UUID avoids changing the primary key later when revocation or history fields are added.
+- Service-layer validation rule for assigned_by_user_id in Version 1: assigned_by_user_id is a nullable UUID audit field, and Version 1 intentionally does not add a database foreign key for it. A simple users.id foreign key could allow cross-tenant references because it does not bind organization context. A tenant-aware composite foreign key with ON DELETE SET NULL is awkward here because organization_id must remain required on the row while only assigned_by_user_id is cleared. Version 1 therefore enforces same-organization validation in application logic, and a stronger database-level constraint can be introduced later if the assignment model evolves.
+- Fields deferred for later: revoked_at, expires_at, grant_reason, source, granted_via, and assignment history/versioning fields.
 
 #### authentication_sessions
 
-- Purpose: Track authenticated sessions and refresh-token state.
-- Primary key: id UUID.
-- Foreign keys: organization_id -> organizations.id, user_id -> users.id.
-- Important columns: refresh_token_hash, session_status, issued_at, expires_at, last_seen_at, revoked_at, ip_address, user_agent.
-- Required fields: id, organization_id, user_id, refresh_token_hash, session_status, issued_at, expires_at.
-- Optional fields: last_seen_at, revoked_at, ip_address, user_agent.
+- Purpose: Track secure web sessions using hashed refresh tokens.
+- Columns: id, organization_id, user_id, refresh_token_hash, created_at, expires_at, revoked_at, last_used_at, ip_address, user_agent.
+- PostgreSQL data types: UUID, UUID, UUID, BYTEA, TIMESTAMPTZ, TIMESTAMPTZ, TIMESTAMPTZ, TIMESTAMPTZ, INET, TEXT.
+- Required versus nullable fields: id, organization_id, user_id, refresh_token_hash, created_at, expires_at are required; revoked_at, last_used_at, ip_address, and user_agent are nullable.
+- Defaults: created_at defaults to now(); revoked_at and last_used_at are initially null.
+- Primary keys: id.
+- Foreign keys: composite foreign key (organization_id, user_id) -> users(organization_id, id) ON DELETE CASCADE; organization_id -> organizations.id ON DELETE CASCADE if desired for direct tenant cleanup, though the composite user foreign key is the primary tenant-consistency guard.
 - Unique constraints: unique(refresh_token_hash).
-- Check constraints: expires_at > issued_at; revoked_at null or revoked_at >= issued_at.
-- Suggested indexes: btree(organization_id, user_id), btree(session_status, expires_at).
+- Check constraints: expires_at must be greater than created_at; revoked_at must be null or later than created_at; last_used_at must be null or later than created_at when present.
+- Indexes: unique(refresh_token_hash); btree(organization_id, user_id, revoked_at, expires_at DESC); btree(expires_at); btree(organization_id, expires_at); btree(organization_id, user_id, revoked_at); partial index on active sessions where revoked_at IS NULL.
+- Delete behavior: delete with the user or organization; operational cleanup can also remove expired revoked rows.
 - Tenant-isolation behavior: directly organization-scoped.
-- Data-retention considerations: retain recent revoked sessions for security investigations, purge older rows later.
-- Relationships: one user to many authentication sessions.
+- Security considerations: never store raw refresh tokens; store only a keyed hash of the refresh token; include IP and user-agent for anomaly detection and session forensics; keep these fields nullable to avoid breaking API clients that do not supply them; use refresh-token rotation so issuing a new token can revoke the previous session row.
+- Fields deferred for later: session family IDs, token lineage/reuse tracking, device labels, MFA challenge state, auth-provider session linkage, and risk-scoring metadata.
+
+#### Design Decisions for This Slice
+
+- Roles should be purely global in Version 1, with no organization_id column.
+- organization_settings should use organization_id as both the primary key and foreign key.
+- users should include both display_name and first_name/last_name because display_name is convenient for UI rendering while first/last names help with formal communication.
+- users should not use deleted_at in Version 1; status-based disablement is simpler and keeps the first release focused.
+- user_roles should include organization_id because it is intentionally denormalized for tenant enforcement, future PostgreSQL RLS, auditing, and simpler organization-scoped queries.
+- authentication_sessions should store IP address and user-agent as nullable forensic fields.
+- platform_admin should be handled outside this schema, either in the deployment identity plane or a separate admin boundary.
+
+#### Seed Data Recommendation
+
+- Seed the global roles table with `organization_admin` and `employee`.
+- Keep both rows marked as system roles and non-editable in Version 1.
+- Do not seed platform_admin here; it belongs in the operational/admin plane, not the tenant application schema.
+
+#### Upgrade Dependencies
+
+- organizations must already exist before organization_settings and users.
+- roles should exist before user_roles.
+- users must exist before user_roles and authentication_sessions.
+- user_roles depends on organizations, users, and roles.
+- authentication_sessions depends on organizations and users.
+
+#### Recommended Table Creation Order for This Slice
+
+1. organization_settings
+2. roles
+3. users
+4. user_roles
+5. authentication_sessions
+
+This order assumes industries and organizations already exist, which they do in the live database.
+
+#### Downgrade Order
+
+1. authentication_sessions
+2. user_roles
+3. users
+4. roles
+5. organization_settings
+
+This order removes the most dependent table first and preserves dependency safety on rollback.
+
+#### Cross-Tenant Test Cases Required Before Approval
+
+- A user from organization A cannot read or update organization B settings.
+- A user from organization A cannot be assigned a role through organization B context.
+- The same email value may not be duplicated within one organization, but lookup remains case-insensitive through normalized_email.
+- Authentication sessions from organization A cannot be resolved for organization B.
+- A user-role assignment cannot target a user from another organization.
+- Global roles remain readable as reference data, but they cannot leak tenant-specific state.
+- Login/session cleanup jobs must only touch rows for the current organization when operating in tenant-scoped mode.
+- The composite foreign key on user_roles must reject a user from organization A being paired with organization_id for organization B.
+- The composite foreign key on authentication_sessions must reject a session row whose user_id points to a user from a different organization.
+- Users from different organizations may share the same email only if the normalized_email unique constraint is scoped by organization_id.
+- Global role rows must remain readable, but they must not acquire tenant-specific foreign keys.
+
+#### Risks and Mitigations
+
+- Risk: global roles could drift into tenant customization later.
+  Mitigation: keep the initial role catalog fixed and seed-only, and defer scoped roles until there is a concrete need.
+- Risk: normalized email logic could drift between application and database.
+  Mitigation: enforce the lowercasing rule in one place and keep a uniqueness constraint on normalized_email.
+- Risk: storing IP/user-agent data could create privacy concerns.
+  Mitigation: keep those fields nullable, document retention expectations, and avoid collecting them if policy forbids it.
+- Risk: session revocation could become hard to reason about.
+  Mitigation: use a single-row session model with hashed refresh tokens, explicit revoked_at timestamps, and cleanup by expiry.
+- Risk: organization_id redundancy in user_roles could be misused.
+  Mitigation: always validate that the assignment context matches the user's organization before insert or update.
+- Risk: the composite foreign key could be omitted in implementation and tenant leakage could reappear.
+  Mitigation: make the users(organization_id, id) uniqueness rule explicit and require the composite foreign key in the first migration slice.
+
+#### Final Recommended Schema
+
+- organization_settings: one row per organization using organization_id as the primary key and foreign key.
+- roles: purely global system roles with unique role names and seed rows organization_admin and employee.
+- users: organization-scoped identities with case-insensitive login, tenant-aware uniqueness, and mandatory password_hash for local-password users.
+- user_roles: organization-scoped assignment records with a surrogate UUID primary key, organization_id denormalized for enforcement, and a composite foreign key to users.
+- authentication_sessions: organization-scoped refresh-token session records with hashed tokens, revocation timestamps, forensic metadata, and composite tenant-consistent foreign keys.
+
+#### Tables Ready for Implementation
+
+- organization_settings
+- roles
+- users
+- user_roles
+- authentication_sessions
+
+These are the next tables that can be implemented once the migration slice is approved.
+
+#### Open Questions
+
+- What exact application-level default should populate ai_model_name if the organization row leaves it null?
+- Will future OAuth or SSO require a separate identity-link table, or can it be introduced later without affecting this slice?
+- Should session cleanup be immediate on revocation or deferred to a scheduled purge job?
 
 ### C. Connectors
 
