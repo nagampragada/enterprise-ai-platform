@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 class LoginRequest(BaseModel):
     """Request payload for user login."""
 
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="forbid")
 
     organization_id: UUID = Field(description="Organization identifier for tenant-scoped authentication.")
     email: EmailStr = Field(description="User email address.")

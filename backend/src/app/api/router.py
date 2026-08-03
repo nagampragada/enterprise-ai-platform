@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
+from app.api.v1.auth.router import auth_router
 from infrastructure.db.health import check_database_connection
 
 api_router = APIRouter()
@@ -23,3 +24,6 @@ def health_with_database() -> dict[str, object]:
             "message": db_message,
         },
     }
+
+
+api_router.include_router(auth_router)
