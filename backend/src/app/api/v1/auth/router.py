@@ -5,7 +5,12 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
-from app.api.v1.auth.schemas import LoginRequest, LoginResponse
+from app.api.v1.auth.schemas import (
+    AuthenticationTokensResponse,
+    LoginRequest,
+    LoginResponse,
+    RefreshRequest,
+)
 from app.dependencies import get_authentication_service, get_db_session
 from application.services.authentication_service import AuthenticationService
 
@@ -60,4 +65,36 @@ def login(
             "token_type": "bearer",
             "expires_in_seconds": result.tokens.expires_in_seconds,
         },
+    )
+
+
+@auth_router.post("/refresh", response_model=AuthenticationTokensResponse)
+def refresh(
+    payload: RefreshRequest,
+    db_session: Session = Depends(get_db_session),
+    authentication_service: AuthenticationService = Depends(get_authentication_service),
+) -> AuthenticationTokensResponse:
+    try:
+        result = authentication_service.refresh(payload.refresh_token)
+        if result is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid refresh token",
+            )
+
+        db_session.commit()
+    except HTTPException:
+        raise
+    except Exception:
+        db_session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error",
+        )
+
+    return AuthenticationTokensResponse(
+        access_token=result.access_token,
+        refresh_token=result.refresh_token,
+        token_type="bearer",
+        expires_in_seconds=result.expires_in_seconds,
     )
