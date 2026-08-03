@@ -50,7 +50,7 @@ class RefreshRequest(BaseModel):
 class LogoutRequest(BaseModel):
     """Request payload for revoking one session."""
 
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="forbid")
 
     session_id: UUID = Field(description="Authentication session identifier to revoke.")
 

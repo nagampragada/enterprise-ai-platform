@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from uuid import UUID
+
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
@@ -9,6 +12,8 @@ from app.api.v1.auth.schemas import (
     AuthenticationTokensResponse,
     LoginRequest,
     LoginResponse,
+    LogoutRequest,
+    MessageResponse,
     RefreshRequest,
 )
 from app.dependencies import get_authentication_service, get_db_session
@@ -98,3 +103,35 @@ def refresh(
         token_type="bearer",
         expires_in_seconds=result.expires_in_seconds,
     )
+
+
+@auth_router.post("/logout", response_model=MessageResponse)
+def logout(
+    organization_id: UUID,
+    payload: LogoutRequest,
+    db_session: Session = Depends(get_db_session),
+    authentication_service: AuthenticationService = Depends(get_authentication_service),
+) -> MessageResponse:
+    try:
+        was_revoked = authentication_service.logout(
+            organization_id=organization_id,
+            session_id=payload.session_id,
+            revoked_at=datetime.now(timezone.utc),
+        )
+        if not was_revoked:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Session not found",
+            )
+
+        db_session.commit()
+    except HTTPException:
+        raise
+    except Exception:
+        db_session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error",
+        )
+
+    return MessageResponse(message="Logged out successfully")
