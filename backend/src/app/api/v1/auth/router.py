@@ -12,6 +12,7 @@ from app.api.v1.auth.schemas import (
     AuthenticationTokensResponse,
     LoginRequest,
     LoginResponse,
+    LogoutAllRequest,
     LogoutRequest,
     MessageResponse,
     RefreshRequest,
@@ -135,3 +136,28 @@ def logout(
         )
 
     return MessageResponse(message="Logged out successfully")
+
+
+@auth_router.post("/logout-all", response_model=MessageResponse)
+def logout_all(
+    organization_id: UUID,
+    payload: LogoutAllRequest,
+    db_session: Session = Depends(get_db_session),
+    authentication_service: AuthenticationService = Depends(get_authentication_service),
+) -> MessageResponse:
+    try:
+        affected_count = authentication_service.logout_all(
+            organization_id=organization_id,
+            user_id=payload.user_id,
+            revoked_at=datetime.now(timezone.utc),
+        )
+        if affected_count > 0:
+            db_session.commit()
+    except Exception:
+        db_session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error",
+        )
+
+    return MessageResponse(message="Logged out from all sessions")

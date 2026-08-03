@@ -58,7 +58,7 @@ class LogoutRequest(BaseModel):
 class LogoutAllRequest(BaseModel):
     """Request payload for revoking all user sessions."""
 
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="forbid")
 
     user_id: UUID = Field(description="User identifier whose sessions should be revoked.")
 
