@@ -1,0 +1,1 @@
+"""Markdown extractor tests package."""
