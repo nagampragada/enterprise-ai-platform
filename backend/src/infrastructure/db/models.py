@@ -74,6 +74,57 @@ class Organization(Base):
     industry: Mapped[Industry | None] = relationship(back_populates="organizations")
     settings: Mapped[OrganizationSettings | None] = relationship(back_populates="organization", uselist=False)
     users: Mapped[list["User"]] = relationship(back_populates="organization")
+    documents: Mapped[list["Document"]] = relationship(back_populates="organization")
+
+
+class Document(Base):
+    __tablename__ = "documents"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_documents"),
+        ForeignKeyConstraint(
+            ["organization_id"],
+            ["organizations.id"],
+            name="fk_documents_organization_id_organizations",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "organization_id",
+            "source_type",
+            "source_document_key",
+            name="uq_documents_organization_id_source_type_source_document_key",
+        ),
+        CheckConstraint("btrim(source_type) <> ''", name="documents_source_type_not_blank"),
+        CheckConstraint("btrim(title) <> ''", name="documents_title_not_blank"),
+        CheckConstraint(
+            "status IN ('pending', 'processing', 'ready', 'failed')",
+            name="documents_status_valid",
+        ),
+        Index("ix_documents_organization_id_status", "organization_id", "status"),
+        Index("ix_documents_organization_id_source_type", "organization_id", "source_type"),
+        Index("ix_documents_organization_id_deleted_at", "organization_id", "deleted_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    source_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_document_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mime_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    checksum_latest: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'pending'"))
+    source_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    source_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    organization: Mapped[Organization] = relationship(back_populates="documents")
 
 
 class OrganizationSettings(Base):

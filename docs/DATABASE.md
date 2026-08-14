@@ -562,6 +562,8 @@ These are the next tables that can be implemented once the migration slice is ap
 - Data-retention considerations: soft deletion recommended.
 - Relationships: one document to many versions; one document to many citations.
 
+The initial documents persistence migration intentionally implements only the fields and organization foreign key that are safe with the currently existing schema. Connector, ingestion-job, and creator-user foreign keys remain deferred until their persistence tables exist; no unvalidated connector UUID is stored in this slice.
+
 #### document_versions
 
 - Purpose: Store immutable document versions produced by upload or synchronization.
