@@ -42,6 +42,7 @@ def _service(pages, page_size=2):
     ingestion = Mock()
     ingestion.ingest.return_value = _ingestion_summary(organization_id, document_id)
     repository = Mock()
+    repository.flush_pending = Mock()
     if callable(pages):
         repository.list_page_for_document.side_effect = pages
     else:
@@ -69,6 +70,8 @@ def test_indexes_all_pages_and_aggregates_results():
     assert repository.list_page_for_document.call_args_list[1].kwargs["after_chunk_index"] == 499
     assert repository.list_page_for_document.call_args_list[2].kwargs["after_chunk_index"] == 999
     assert embedding.embed_chunks.call_count == 3
+    repository.flush_pending.assert_called_once()
+    assert repository.flush_pending.call_count == 1
 
 
 def test_empty_page_and_sparse_indexes_are_supported():
@@ -106,6 +109,37 @@ def test_invalid_page_size_rejected_before_collaborators(page_size):
         service.index(organization_id, "local_folder", "file.txt", Path("file.txt"), page_size=page_size)
     ingestion.ingest.assert_not_called()
     repository.list_page_for_document.assert_not_called()
+    repository.flush_pending.assert_not_called()
+
+
+def test_flush_happens_once_before_pagination():
+    service, organization_id, _, ingestion, repository, embedding = _service(
+        [DocumentChunkPage((), 500, False, None)]
+    )
+    service.index(organization_id, "local_folder", "file.txt", Path("file.txt"))
+    repository.flush_pending.assert_called_once()
+    repository.list_page_for_document.assert_called_once()
+    embedding.embed_chunks.assert_not_called()
+
+
+def test_flush_failure_stops_pagination_and_embedding():
+    service, organization_id, _, ingestion, repository, embedding = _service([])
+    repository.flush_pending.side_effect = RuntimeError("flush failure")
+    with pytest.raises(RuntimeError, match="flush failure"):
+        service.index(organization_id, "local_folder", "file.txt", Path("file.txt"))
+    repository.list_page_for_document.assert_not_called()
+    embedding.embed_chunks.assert_not_called()
+    repository.flush_pending.assert_called_once()
+
+
+def test_ingestion_failure_prevents_flush_and_pagination():
+    service, organization_id, _, ingestion, repository, embedding = _service([])
+    ingestion.ingest.side_effect = RuntimeError("ingestion failure")
+    with pytest.raises(RuntimeError, match="ingestion failure"):
+        service.index(organization_id, "local_folder", "file.txt", Path("file.txt"))
+    repository.flush_pending.assert_not_called()
+    repository.list_page_for_document.assert_not_called()
+    embedding.embed_chunks.assert_not_called()
 
 
 def test_provider_failure_prevents_later_pages_and_transactions_are_caller_owned():
@@ -124,5 +158,6 @@ def test_provider_failure_prevents_later_pages_and_transactions_are_caller_owned
     with pytest.raises(RuntimeError, match="provider failure"):
         service.index(organization_id, "local_folder", "file.txt", Path("file.txt"))
     assert repository.list_page_for_document.call_count == 1
+    repository.flush_pending.assert_called_once()
     embedding.commit.assert_not_called()
     embedding.rollback.assert_not_called()

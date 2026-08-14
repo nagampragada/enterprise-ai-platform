@@ -79,6 +79,7 @@ class LocalDocumentIndexingService:
                 mime_type=mime_type,
             )
         )
+        self._chunk_repository.flush_pending()
 
         embedded_ids: list[UUID] = []
         chunks_embedded = 0

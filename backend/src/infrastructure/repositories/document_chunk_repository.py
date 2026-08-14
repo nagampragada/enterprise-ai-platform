@@ -33,6 +33,10 @@ class DocumentChunkRepository:
     def __init__(self, session: Session) -> None:
         self._session = session
 
+    def flush_pending(self) -> None:
+        """Flush pending session writes without committing or rolling back."""
+        self._session.flush()
+
     def add_many(
         self,
         organization_id: UUID,
