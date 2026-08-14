@@ -119,6 +119,8 @@ Version 1 can enforce tenancy at the application layer first, but the schema sho
 
 ## pgvector Strategy
 
+- The PostgreSQL `vector` extension is enabled by a dedicated migration before any vector columns or indexes are introduced.
+- The extension migration is idempotent and its downgrade intentionally leaves the extension installed because it is shared database infrastructure.
 - Store one embedding per document chunk in document_chunks.
 - Filter retrieval by organization_id and document state before vector ranking.
 - Re-index by creating a new document_version and new document_chunks rows rather than overwriting prior versions.
