@@ -20,6 +20,7 @@ from sqlalchemy import (
     func,
 )
 from sqlalchemy.dialects.postgresql import BYTEA, INET, UUID
+from pgvector.sqlalchemy import Vector
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from infrastructure.db.base import Base
@@ -93,6 +94,7 @@ class Document(Base):
             "source_document_key",
             name="uq_documents_organization_id_source_type_source_document_key",
         ),
+        UniqueConstraint("organization_id", "id", name="uq_documents_organization_id_id"),
         CheckConstraint("btrim(source_type) <> ''", name="documents_source_type_not_blank"),
         CheckConstraint("btrim(title) <> ''", name="documents_title_not_blank"),
         CheckConstraint(
@@ -125,6 +127,68 @@ class Document(Base):
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     organization: Mapped[Organization] = relationship(back_populates="documents")
+    chunks: Mapped[list["DocumentChunk"]] = relationship(back_populates="document")
+
+
+class DocumentChunk(Base):
+    __tablename__ = "document_chunks"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_document_chunks"),
+        ForeignKeyConstraint(
+            ["organization_id"],
+            ["organizations.id"],
+            name="fk_document_chunks_organization_id_organizations",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "document_id"],
+            ["documents.organization_id", "documents.id"],
+            name="fk_document_chunks_organization_id_document_id_documents",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "organization_id",
+            "document_id",
+            "chunk_index",
+            name="uq_document_chunks_organization_id_document_id_chunk_index",
+        ),
+        CheckConstraint("chunk_index >= 0", name="document_chunks_chunk_index_nonnegative"),
+        CheckConstraint(
+            "token_count IS NULL OR token_count >= 0",
+            name="document_chunks_token_count_nonnegative",
+        ),
+        CheckConstraint("btrim(chunk_text) <> ''", name="document_chunks_chunk_text_not_blank"),
+        CheckConstraint("btrim(content_hash) <> ''", name="document_chunks_content_hash_not_blank"),
+        CheckConstraint(
+            "embedding_model IS NULL OR btrim(embedding_model) <> ''",
+            name="document_chunks_embedding_model_not_blank",
+        ),
+        CheckConstraint(
+            "(embedding IS NULL AND embedding_model IS NULL) OR "
+            "(embedding IS NOT NULL AND embedding_model IS NOT NULL)",
+            name="document_chunks_embedding_model_pair",
+        ),
+        Index("ix_document_chunks_organization_id_document_id", "organization_id", "document_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    document_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    chunk_text: Mapped[str] = mapped_column(Text, nullable=False)
+    token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    content_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(1536), nullable=True)
+    embedding_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    document: Mapped[Document] = relationship(back_populates="chunks")
 
 
 class OrganizationSettings(Base):
