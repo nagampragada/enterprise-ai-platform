@@ -5,6 +5,7 @@ import subprocess
 import uuid
 from pathlib import Path
 from uuid import UUID
+from unittest.mock import Mock
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -184,6 +185,51 @@ def test_listing_is_ordered_and_bounded(db_session: Session) -> None:
     found = repository.list_for_document(organization_id, document.id, limit=MAX_CHUNK_LIST_LIMIT + 10)
     assert len(found) == MAX_CHUNK_LIST_LIMIT
     assert [chunk.chunk_index for chunk in found] == list(range(MAX_CHUNK_LIST_LIMIT))
+
+
+def test_keyset_pages_cover_sparse_chunks_without_duplicates(db_session: Session) -> None:
+    organization_id = _create_organization(db_session, name="Page Org", slug="page-org")
+    document = _create_document(db_session, organization_id)
+    other_document = _create_document(db_session, organization_id, key="other.txt")
+    other_organization = _create_organization(db_session, name="Other Page Org", slug="other-page-org")
+    other_tenant_document = _create_document(db_session, other_organization, key="other-tenant.txt")
+    repository = DocumentChunkRepository(db_session)
+    chunks = [_build_chunk(organization_id, document.id, index) for index in (0, 3, 9, 20)]
+    repository.add_many(organization_id, document.id, chunks)
+    repository.add_many(organization_id, other_document.id, [_build_chunk(organization_id, other_document.id, 3)])
+    repository.add_many(other_organization, other_tenant_document.id, [_build_chunk(other_organization, other_tenant_document.id, 3)])
+    db_session.commit()
+
+    first = repository.list_page_for_document(organization_id, document.id, limit=2)
+    middle = repository.list_page_for_document(
+        organization_id, document.id, limit=2, after_chunk_index=first.next_after_chunk_index
+    )
+    final = repository.list_page_for_document(organization_id, document.id, limit=2, after_chunk_index=20)
+    assert [chunk.chunk_index for chunk in first.items] == [0, 3]
+    assert first.has_more is True and first.next_after_chunk_index == 3
+    assert [chunk.chunk_index for chunk in middle.items] == [9, 20]
+    assert middle.has_more is False and middle.next_after_chunk_index is None
+    assert final.items == ()
+    assert final.has_more is False and final.next_after_chunk_index is None
+
+
+def test_keyset_page_limit_validation_and_transaction_ownership(db_session: Session) -> None:
+    organization_id = _create_organization(db_session, name="Limit Org", slug="limit-org")
+    document = _create_document(db_session, organization_id)
+    repository = DocumentChunkRepository(db_session)
+    repository.add_many(organization_id, document.id, [_build_chunk(organization_id, document.id, 0)])
+    db_session.commit()
+    for limit in (0, -1, MAX_CHUNK_LIST_LIMIT + 1, True):
+        with pytest.raises(ValueError):
+            repository.list_page_for_document(organization_id, document.id, limit=limit)
+    for cursor in (-1, True):
+        with pytest.raises(ValueError):
+            repository.list_page_for_document(organization_id, document.id, limit=1, after_chunk_index=cursor)
+    repository.commit = Mock()
+    repository.rollback = Mock()
+    repository.list_page_for_document(organization_id, document.id, limit=1)
+    repository.commit.assert_not_called()
+    repository.rollback.assert_not_called()
 
 
 def test_delete_is_scoped_to_tenant_and_document(db_session: Session) -> None:
