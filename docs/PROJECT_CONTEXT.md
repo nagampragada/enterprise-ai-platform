@@ -6,11 +6,11 @@ A multi-tenant, Glean-like AI knowledge and operations platform for small and me
 
 ## Current Phase
 
-Database infrastructure verification.
+Document-ingestion vertical-slice preparation.
 
 ## Current Sprint
 
-Sprint 01: Database foundation design.
+Sprint 02: Secure Document Ingestion Foundation.
 
 ## Important Architecture Decisions
 
@@ -33,22 +33,37 @@ Sprint 01: Database foundation design.
 - Foundation documentation and repository guidance files created
 - Version 1 vision, roadmap, and sprint planning documentation prepared
 - Database architecture reviewed and simplified into a minimum secure first-release schema
-- Database engine, session, and health infrastructure implemented
-- First migration validated against the local PostgreSQL development container
+- PostgreSQL engine, session, health, and Alembic infrastructure implemented
+- Organization, role, user, and authentication-session models implemented
+- Migrations for industries, organizations, identity, roles, and authentication sessions created
+- Password hashing, JWT access tokens, hashed refresh tokens, and session management implemented
+- Login, refresh, logout, logout-all, and authenticated `/me` endpoints implemented
+- Admin-user bootstrap script implemented
+- Connector domain contracts and a local-folder connector implemented
+- Content-extraction contracts plus TXT and Markdown extractors implemented
+- Related backend tests added for the implemented foundation
 
 ## Current Task
 
-Database infrastructure verification.
+Documentation alignment and preparation for the document-ingestion vertical slice.
 
-## Next Tasks
+## Next Milestone
 
-- Review the identity and organization schema slice next
-- Confirm that database session usage patterns are ready for repository work
-- Continue schema rollout with the first-release tenant and identity tables
+Secure, tenant-scoped document ingestion.
+
+Immediate sequence:
+
+1. Authentication security review
+2. Document persistence
+3. PDF and DOCX extraction
+4. Chunking
+5. Embedding generation
+6. pgvector storage
+7. Tenant-scoped retrieval
 
 ## Implementation Status
 
-Database infrastructure exists; no application endpoints, auth flows, or business features have been implemented.
+The backend foundation and authentication flows are implemented. Connector contracts, a local-folder connector, content-extraction contracts, and TXT/Markdown extraction are also implemented. Document persistence, PDF/DOCX extraction, chunking, embedding generation, pgvector storage, tenant-scoped retrieval, chat, Google Drive synchronization, the PostgreSQL intelligence connector, administration APIs, audit logging, and workflow automation remain unimplemented.
 
 ## Known Risks
 
@@ -59,4 +74,4 @@ Database infrastructure exists; no application endpoints, auth flows, or busines
 
 ## Last Updated
 
-2026-08-02
+2026-08-14

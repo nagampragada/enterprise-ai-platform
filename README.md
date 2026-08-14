@@ -34,13 +34,22 @@ scripts/         Repository and operational scripts
 workers/         Background worker foundation
 ```
 
-## Local Development Status
+## Current Development Status
 
-- Repository scaffold is in place
-- Documentation foundation is being established
-- Dependencies are not installed yet
-- Application code has not been generated yet
+The repository has moved beyond the initial scaffold and database-foundation phase. The following foundation work is implemented:
 
-## Foundation Setup Note
+- PostgreSQL engine, sessions, health checks, and Alembic integration
+- Organization, role, user, and authentication-session models and migrations
+- Argon2 password hashing and JWT access tokens
+- Hashed, rotating refresh tokens with authentication-session management
+- Login, refresh, logout, logout-all, and authenticated `/me` endpoints
+- Admin-user bootstrap script
+- Connector domain contracts and a security-conscious local-folder connector
+- Content-extraction contracts with TXT and Markdown extractors
+- Backend tests for the implemented foundation, authentication, connector, and extraction behavior
 
-This project is currently in the foundation setup phase. The present goal is to establish repository structure, documentation, and working conventions before implementing business features.
+The project is entering the document-ingestion vertical-slice phase. The next milestone is secure, tenant-scoped document ingestion, including document persistence, PDF and DOCX extraction, deterministic chunking, embedding generation, pgvector storage, and organization-scoped retrieval.
+
+The following capabilities are not implemented yet: document and document-chunk persistence, PDF and DOCX extraction, chunking, embeddings, pgvector indexing and retrieval, search, citations, AI chat, Google Drive synchronization, the read-only PostgreSQL intelligence connector, administration APIs, audit logging, and workflow automation.
+
+The long-term product vision remains a multi-tenant AI knowledge and operations platform with connected enterprise sources, controlled retrieval and workflows, and future industry-specific modules. Version 1 remains intentionally focused on secure document retrieval, organization-scoped AI chat, a first Google Drive connector, and one read-only PostgreSQL intelligence workflow. Broader connectors, complex workflow automation, billing, Kubernetes, and other explicitly documented non-goals remain outside that boundary.
