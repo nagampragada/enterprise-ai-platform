@@ -2,6 +2,7 @@
 
 from domain.embeddings.exceptions import (
     EmbeddingError,
+    EmbeddingProviderAuthenticationError,
     InvalidEmbeddingConfigurationError,
     InvalidEmbeddingInputError,
     InvalidEmbeddingResultError,
@@ -14,6 +15,7 @@ from domain.embeddings.validation import validate_embedding_inputs, validate_emb
 
 __all__ = [
     "EmbeddingError",
+    "EmbeddingProviderAuthenticationError",
     "EmbeddingProfile",
     "EmbeddingProvider",
     "EmbeddingRequest",

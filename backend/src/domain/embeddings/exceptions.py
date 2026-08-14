@@ -23,3 +23,7 @@ class RetryableEmbeddingProviderError(EmbeddingError):
 
 class PermanentEmbeddingProviderError(EmbeddingError):
     """Raised for provider failures that should not be retried automatically."""
+
+
+class EmbeddingProviderAuthenticationError(PermanentEmbeddingProviderError):
+    """Raised when provider credentials or permissions are rejected."""
