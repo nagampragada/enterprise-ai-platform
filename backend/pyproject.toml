@@ -12,6 +12,7 @@ dependencies = [
     "PyJWT>=2.9,<3.0",
     "pgvector>=0.3,<1.0",
     "openai>=1.0,<2.0",
+    "python-docx>=1.1,<2.0",
     "psycopg[binary]>=3.2,<4.0",
 ]
 
