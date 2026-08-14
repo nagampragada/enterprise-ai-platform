@@ -336,6 +336,7 @@ def test_logout_returns_true_when_revoked(repos_and_service) -> None:
 
     result = service.logout(
         organization_id=organization_id,
+        user_id=uuid4(),
         session_id=session_id,
         revoked_at=revoked_at,
     )
@@ -351,6 +352,7 @@ def test_logout_returns_false_when_session_not_found(repos_and_service) -> None:
 
     result = service.logout(
         organization_id=organization_id,
+        user_id=uuid4(),
         session_id=session_id,
         revoked_at=datetime.now(timezone.utc),
     )
@@ -431,6 +433,7 @@ def test_login_and_logout_preserve_tenant_scope(monkeypatch: pytest.MonkeyPatch,
     )
     _ = service.logout(
         organization_id=organization_id,
+        user_id=user.id,
         session_id=session_id,
         revoked_at=datetime.now(timezone.utc),
     )
@@ -472,7 +475,12 @@ def test_service_does_not_commit_or_rollback_across_flows(
 
     _ = service.login(organization_id=organization_id, email="user@example.com", password="password")
     _ = service.refresh("refresh-token")
-    _ = service.logout(organization_id=organization_id, session_id=uuid4(), revoked_at=datetime.now(timezone.utc))
+    _ = service.logout(
+        organization_id=organization_id,
+        user_id=user.id,
+        session_id=uuid4(),
+        revoked_at=datetime.now(timezone.utc),
+    )
     _ = service.logout_all(organization_id=organization_id, user_id=user.id, revoked_at=datetime.now(timezone.utc))
 
     user_repository.commit.assert_not_called()

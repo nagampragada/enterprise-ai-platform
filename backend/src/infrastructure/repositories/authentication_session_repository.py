@@ -40,6 +40,7 @@ class AuthenticationSessionRepository:
     def revoke(
         self,
         organization_id: UUID,
+        user_id: UUID,
         session_id: UUID,
         revoked_at: datetime,
     ) -> AuthenticationSession | None:
@@ -48,6 +49,7 @@ class AuthenticationSessionRepository:
             update(AuthenticationSession)
             .where(
                 AuthenticationSession.organization_id == organization_id,
+                AuthenticationSession.user_id == user_id,
                 AuthenticationSession.id == session_id,
             )
             .values(revoked_at=revoked_at)

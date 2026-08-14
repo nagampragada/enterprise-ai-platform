@@ -10,7 +10,6 @@ from app.api.v1.auth.schemas import (
     AuthenticationTokensResponse,
     LoginRequest,
     LoginResponse,
-    LogoutAllRequest,
     LogoutRequest,
     MessageResponse,
     RefreshRequest,
@@ -95,19 +94,6 @@ def test_logout_request_valid_uuid_succeeds() -> None:
 def test_logout_request_invalid_uuid_fails() -> None:
     with pytest.raises(ValidationError):
         LogoutRequest(session_id="not-a-uuid")
-
-
-def test_logout_all_request_valid_uuid_succeeds() -> None:
-    user_id = uuid4()
-
-    model = LogoutAllRequest(user_id=user_id)
-
-    assert model.user_id == user_id
-
-
-def test_logout_all_request_invalid_uuid_fails() -> None:
-    with pytest.raises(ValidationError):
-        LogoutAllRequest(user_id="not-a-uuid")
 
 
 def test_authentication_tokens_response_valid_succeeds() -> None:

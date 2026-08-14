@@ -163,9 +163,10 @@ class AuthenticationService:
             expires_in_seconds=int(access_expires_delta.total_seconds()),
         )
 
-    def logout(self, organization_id: UUID, session_id: UUID, revoked_at: datetime) -> bool:
+    def logout(self, organization_id: UUID, user_id: UUID, session_id: UUID, revoked_at: datetime) -> bool:
         revoked_session = self._authentication_session_repository.revoke(
             organization_id=organization_id,
+            user_id=user_id,
             session_id=session_id,
             revoked_at=revoked_at,
         )

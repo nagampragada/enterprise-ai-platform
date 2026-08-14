@@ -327,6 +327,7 @@ def test_revoke_sets_revoked_at_for_correct_organization(db_session: Session) ->
     repository = AuthenticationSessionRepository(db_session)
     revoked_session = repository.revoke(
         organization_id=organization_id,
+        user_id=user.id,
         session_id=auth_session.id,
         revoked_at=revoked_at,
     )
@@ -358,12 +359,48 @@ def test_revoke_returns_none_for_wrong_organization(db_session: Session) -> None
     repository = AuthenticationSessionRepository(db_session)
     revoked = repository.revoke(
         organization_id=org_b,
+        user_id=user.id,
         session_id=auth_session.id,
         revoked_at=datetime.now(timezone.utc),
     )
 
     assert revoked is None
 
+    db_session.refresh(auth_session)
+    assert auth_session.revoked_at is None
+
+
+def test_revoke_returns_none_for_wrong_user_in_same_organization(db_session: Session) -> None:
+    organization_id = _create_organization(db_session, name="Lambda Two Org", slug="lambda-two-org")
+    owner = _create_user(
+        db_session,
+        organization_id=organization_id,
+        email="owner@lambda-two.example",
+        display_name="Owner",
+    )
+    other_user = _create_user(
+        db_session,
+        organization_id=organization_id,
+        email="other@lambda-two.example",
+        display_name="Other",
+    )
+    auth_session = _build_authentication_session(
+        organization_id=organization_id,
+        user_id=owner.id,
+        refresh_token_hash="hash-revoke-wrong-user",
+    )
+    db_session.add(auth_session)
+    db_session.commit()
+
+    repository = AuthenticationSessionRepository(db_session)
+    revoked = repository.revoke(
+        organization_id=organization_id,
+        user_id=other_user.id,
+        session_id=auth_session.id,
+        revoked_at=datetime.now(timezone.utc),
+    )
+
+    assert revoked is None
     db_session.refresh(auth_session)
     assert auth_session.revoked_at is None
 

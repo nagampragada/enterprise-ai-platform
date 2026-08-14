@@ -55,14 +55,6 @@ class LogoutRequest(BaseModel):
     session_id: UUID = Field(description="Authentication session identifier to revoke.")
 
 
-class LogoutAllRequest(BaseModel):
-    """Request payload for revoking all user sessions."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    user_id: UUID = Field(description="User identifier whose sessions should be revoked.")
-
-
 class AuthenticationTokensResponse(BaseModel):
     """Response payload containing issued authentication tokens."""
 

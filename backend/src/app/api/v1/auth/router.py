@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from uuid import UUID
-
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
@@ -13,7 +11,6 @@ from app.api.v1.auth.schemas import (
     AuthenticationTokensResponse,
     LoginRequest,
     LoginResponse,
-    LogoutAllRequest,
     LogoutRequest,
     MessageResponse,
     RefreshRequest,
@@ -119,14 +116,15 @@ def refresh(
 
 @auth_router.post("/logout", response_model=MessageResponse)
 def logout(
-    organization_id: UUID,
     payload: LogoutRequest,
+    current_user: CurrentUser = Depends(get_current_user),
     db_session: Session = Depends(get_db_session),
     authentication_service: AuthenticationService = Depends(get_authentication_service),
 ) -> MessageResponse:
     try:
         was_revoked = authentication_service.logout(
-            organization_id=organization_id,
+            organization_id=current_user.organization_id,
+            user_id=current_user.user_id,
             session_id=payload.session_id,
             revoked_at=datetime.now(timezone.utc),
         )
@@ -151,15 +149,14 @@ def logout(
 
 @auth_router.post("/logout-all", response_model=MessageResponse)
 def logout_all(
-    organization_id: UUID,
-    payload: LogoutAllRequest,
+    current_user: CurrentUser = Depends(get_current_user),
     db_session: Session = Depends(get_db_session),
     authentication_service: AuthenticationService = Depends(get_authentication_service),
 ) -> MessageResponse:
     try:
         affected_count = authentication_service.logout_all(
-            organization_id=organization_id,
-            user_id=payload.user_id,
+            organization_id=current_user.organization_id,
+            user_id=current_user.user_id,
             revoked_at=datetime.now(timezone.utc),
         )
         if affected_count > 0:

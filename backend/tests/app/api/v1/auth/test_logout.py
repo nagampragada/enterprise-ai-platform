@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
-from app.dependencies import get_authentication_service, get_db_session
+from app.dependencies import CurrentUser, get_authentication_service, get_current_user, get_db_session
 from app.main import app
 
 
@@ -39,6 +39,16 @@ def _override_dependencies(service_mock: Mock, fake_session: FakeSession) -> Non
 
     app.dependency_overrides[get_db_session] = _db_session_override
     app.dependency_overrides[get_authentication_service] = _authentication_service_override
+    app.dependency_overrides[get_current_user] = lambda: CurrentUser(
+        user_id=AUTHENTICATED_USER_ID,
+        organization_id=AUTHENTICATED_ORGANIZATION_ID,
+        email="user@example.com",
+        display_name="Example User",
+    )
+
+
+AUTHENTICATED_USER_ID = uuid4()
+AUTHENTICATED_ORGANIZATION_ID = uuid4()
 
 
 def _build_valid_payload() -> dict[str, str]:
@@ -84,25 +94,23 @@ def test_successful_logout_response_message_is_exact() -> None:
     assert response.json() == {"message": "Logged out successfully"}
 
 
-def test_service_receives_query_organization_id() -> None:
+def test_service_receives_authenticated_organization_and_user_ids() -> None:
     service_mock = Mock()
     fake_session = FakeSession()
     _override_dependencies(service_mock=service_mock, fake_session=fake_session)
 
     service_mock.logout.return_value = True
-    organization_id = uuid4()
-
     with TestClient(app) as client:
         response = client.post(
             "/api/v1/auth/logout",
-            params={"organization_id": str(organization_id)},
             json=_build_valid_payload(),
         )
 
     app.dependency_overrides.clear()
 
     assert response.status_code == 200
-    assert service_mock.logout.call_args.kwargs["organization_id"] == organization_id
+    assert service_mock.logout.call_args.kwargs["organization_id"] == AUTHENTICATED_ORGANIZATION_ID
+    assert service_mock.logout.call_args.kwargs["user_id"] == AUTHENTICATED_USER_ID
 
 
 def test_service_receives_payload_session_id() -> None:
@@ -206,7 +214,7 @@ def test_missing_session_does_not_commit() -> None:
     assert fake_session.commit_calls == 0
 
 
-def test_invalid_organization_id_returns_422() -> None:
+def test_query_organization_id_does_not_control_logout() -> None:
     service_mock = Mock()
     fake_session = FakeSession()
     _override_dependencies(service_mock=service_mock, fake_session=fake_session)
@@ -220,8 +228,8 @@ def test_invalid_organization_id_returns_422() -> None:
 
     app.dependency_overrides.clear()
 
-    assert response.status_code == 422
-    service_mock.logout.assert_not_called()
+    assert response.status_code == 200
+    assert service_mock.logout.call_args.kwargs["organization_id"] == AUTHENTICATED_ORGANIZATION_ID
 
 
 def test_invalid_session_id_returns_422() -> None:
@@ -353,3 +361,25 @@ def test_openapi_logout_request_body_references_logout_request_schema() -> None:
     logout_post = openapi.json()["paths"]["/api/v1/auth/logout"]["post"]
     request_schema = logout_post["requestBody"]["content"]["application/json"]["schema"]
     assert request_schema == {"$ref": "#/components/schemas/LogoutRequest"}
+
+
+def test_unauthenticated_logout_returns_401() -> None:
+    service_mock = Mock()
+    fake_session = FakeSession()
+
+    def _db_session_override():
+        try:
+            yield fake_session
+        finally:
+            fake_session.close()
+
+    app.dependency_overrides[get_db_session] = _db_session_override
+    app.dependency_overrides[get_authentication_service] = lambda: service_mock
+
+    with TestClient(app) as client:
+        response = client.post("/api/v1/auth/logout", json=_build_valid_payload())
+
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 401
+    service_mock.logout.assert_not_called()
