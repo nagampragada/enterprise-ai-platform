@@ -10,6 +10,15 @@ from fastapi import Depends, Header, HTTPException, status
 from sqlalchemy.orm import Session
 
 from application.services.authentication_service import AuthenticationService
+from application.services.document_chunk_embedding_service import DocumentChunkEmbeddingService
+from application.services.local_document_indexing_service import LocalDocumentIndexingService
+from application.services.local_document_ingestion_service import LocalDocumentIngestionService
+from domain.embeddings.exceptions import EmbeddingProviderAuthenticationError
+from infrastructure.content_chunking.text_chunker import DeterministicTextChunker
+from infrastructure.content_extraction.registry import create_default_content_extractor_registry
+from infrastructure.embeddings.openai import OpenAIEmbeddingProvider
+from infrastructure.repositories.document_chunk_repository import DocumentChunkRepository
+from infrastructure.repositories.document_repository import DocumentRepository
 from infrastructure.db.session import SessionLocal
 from infrastructure.repositories.authentication_session_repository import AuthenticationSessionRepository
 from infrastructure.repositories.user_repository import UserRepository
@@ -43,6 +52,34 @@ def get_authentication_service(db_session: Session = Depends(get_db_session)) ->
     return AuthenticationService(
         user_repository=user_repository,
         authentication_session_repository=authentication_session_repository,
+    )
+
+
+def get_local_document_indexing_service(
+    db_session: Session = Depends(get_db_session),
+) -> LocalDocumentIndexingService:
+    """Build the authenticated local-document indexing composition."""
+    try:
+        embedding_provider = OpenAIEmbeddingProvider()
+    except EmbeddingProviderAuthenticationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Embedding provider is unavailable",
+        ) from exc
+
+    chunk_repository = DocumentChunkRepository(db_session)
+    return LocalDocumentIndexingService(
+        ingestion_service=LocalDocumentIngestionService(
+            extractor_registry=create_default_content_extractor_registry(),
+            content_chunker=DeterministicTextChunker(),
+            document_repository=DocumentRepository(db_session),
+            document_chunk_repository=chunk_repository,
+        ),
+        chunk_repository=chunk_repository,
+        embedding_service=DocumentChunkEmbeddingService(
+            embedding_provider=embedding_provider,
+            document_chunk_repository=chunk_repository,
+        ),
     )
 
 
