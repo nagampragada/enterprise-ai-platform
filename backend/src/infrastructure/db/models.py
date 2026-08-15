@@ -176,6 +176,249 @@ class Team(Base):
     memberships: Mapped[list["TeamMembership"]] = relationship(back_populates="team")
 
 
+class KnowledgeSpace(Base):
+    __tablename__ = "knowledge_spaces"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_knowledge_spaces"),
+        ForeignKeyConstraint(
+            ["organization_id"],
+            ["organizations.id"],
+            name="fk_knowledge_spaces_organization_id_organizations",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("organization_id", "id", name="uq_knowledge_spaces_organization_id_id"),
+        UniqueConstraint("organization_id", "slug", name="uq_knowledge_spaces_organization_id_slug"),
+        CheckConstraint("btrim(name) <> ''", name="knowledge_spaces_name_not_blank"),
+        CheckConstraint("slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$'", name="knowledge_spaces_slug_kebab_case"),
+        CheckConstraint("status IN ('active', 'inactive', 'archived')", name="knowledge_spaces_status_valid"),
+        CheckConstraint(
+            "(status = 'archived' AND archived_at IS NOT NULL) OR "
+            "(status <> 'archived' AND archived_at IS NULL)",
+            name="knowledge_spaces_archived_at_consistent",
+        ),
+        Index("ix_knowledge_spaces_organization_id_status", "organization_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    slug: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'active'"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class KnowledgeSpaceOrganizationGrant(Base):
+    __tablename__ = "knowledge_space_organization_grants"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_knowledge_space_organization_grants"),
+        ForeignKeyConstraint(
+            ["organization_id"],
+            ["organizations.id"],
+            name="fk_ks_organization_grants_organization",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "knowledge_space_id"],
+            ["knowledge_spaces.organization_id", "knowledge_spaces.id"],
+            name="fk_ks_organization_grants_space_tenant",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "granted_by_user_id"],
+            ["users.organization_id", "users.id"],
+            name="fk_ks_organization_grants_creator",
+            ondelete="SET NULL (granted_by_user_id)",
+        ),
+        UniqueConstraint("organization_id", "knowledge_space_id", name="uq_ks_organization_grants_space"),
+        CheckConstraint(
+            "permission_level IN ('viewer', 'contributor', 'manager')",
+            name="p_valid",
+        ),
+        CheckConstraint(
+            "expires_at IS NULL OR expires_at > granted_at",
+            name="expiry_after_granted",
+        ),
+        CheckConstraint(
+            "revoked_at IS NULL OR revoked_at >= granted_at",
+            name="revoked_after_granted",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    knowledge_space_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    permission_level: Mapped[str] = mapped_column(String(32), nullable=False)
+    granted_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    granted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class KnowledgeSpaceDepartmentGrant(Base):
+    __tablename__ = "knowledge_space_department_grants"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_knowledge_space_department_grants"),
+        ForeignKeyConstraint(
+            ["organization_id"],
+            ["organizations.id"],
+            name="fk_ks_department_grants_organization",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "knowledge_space_id"],
+            ["knowledge_spaces.organization_id", "knowledge_spaces.id"],
+            name="fk_ks_department_grants_space_tenant",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "department_id"],
+            ["departments.organization_id", "departments.id"],
+            name="fk_ks_department_grants_department_tenant",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "granted_by_user_id"],
+            ["users.organization_id", "users.id"],
+            name="fk_ks_department_grants_creator",
+            ondelete="SET NULL (granted_by_user_id)",
+        ),
+        UniqueConstraint(
+            "organization_id", "knowledge_space_id", "department_id", name="uq_ks_department_grants_space_department"
+        ),
+        CheckConstraint("permission_level IN ('viewer', 'contributor', 'manager')", name="p_valid"),
+        CheckConstraint("expires_at IS NULL OR expires_at > granted_at", name="expiry_after_granted"),
+        CheckConstraint("revoked_at IS NULL OR revoked_at >= granted_at", name="revoked_after_granted"),
+        Index("ix_ks_department_grants_org_department", "organization_id", "department_id", "knowledge_space_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    knowledge_space_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    department_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    permission_level: Mapped[str] = mapped_column(String(32), nullable=False)
+    granted_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    granted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class KnowledgeSpaceTeamGrant(Base):
+    __tablename__ = "knowledge_space_team_grants"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_knowledge_space_team_grants"),
+        ForeignKeyConstraint(
+            ["organization_id"],
+            ["organizations.id"],
+            name="fk_ks_team_grants_organization",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "knowledge_space_id"],
+            ["knowledge_spaces.organization_id", "knowledge_spaces.id"],
+            name="fk_ks_team_grants_space_tenant",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "team_id"],
+            ["teams.organization_id", "teams.id"],
+            name="fk_ks_team_grants_team_tenant",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "granted_by_user_id"],
+            ["users.organization_id", "users.id"],
+            name="fk_ks_team_grants_creator",
+            ondelete="SET NULL (granted_by_user_id)",
+        ),
+        UniqueConstraint("organization_id", "knowledge_space_id", "team_id", name="uq_ks_team_grants_space_team"),
+        CheckConstraint("permission_level IN ('viewer', 'contributor', 'manager')", name="p_valid"),
+        CheckConstraint("expires_at IS NULL OR expires_at > granted_at", name="expiry_after_granted"),
+        CheckConstraint("revoked_at IS NULL OR revoked_at >= granted_at", name="revoked_after_granted"),
+        Index("ix_ks_team_grants_org_team", "organization_id", "team_id", "knowledge_space_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    knowledge_space_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    team_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    permission_level: Mapped[str] = mapped_column(String(32), nullable=False)
+    granted_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    granted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class KnowledgeSpaceUserGrant(Base):
+    __tablename__ = "knowledge_space_user_grants"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_knowledge_space_user_grants"),
+        ForeignKeyConstraint(
+            ["organization_id"],
+            ["organizations.id"],
+            name="fk_ks_user_grants_organization",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "knowledge_space_id"],
+            ["knowledge_spaces.organization_id", "knowledge_spaces.id"],
+            name="fk_ks_user_grants_space_tenant",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "user_id"],
+            ["users.organization_id", "users.id"],
+            name="fk_ks_user_grants_user_tenant",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "granted_by_user_id"],
+            ["users.organization_id", "users.id"],
+            name="fk_ks_user_grants_creator",
+            ondelete="SET NULL (granted_by_user_id)",
+        ),
+        UniqueConstraint("organization_id", "knowledge_space_id", "user_id", name="uq_ks_user_grants_space_user"),
+        CheckConstraint("permission_level IN ('viewer', 'contributor', 'manager')", name="p_valid"),
+        CheckConstraint("expires_at IS NULL OR expires_at > granted_at", name="expiry_after_granted"),
+        CheckConstraint("revoked_at IS NULL OR revoked_at >= granted_at", name="revoked_after_granted"),
+        Index("ix_ks_user_grants_org_user", "organization_id", "user_id", "knowledge_space_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    knowledge_space_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    permission_level: Mapped[str] = mapped_column(String(32), nullable=False)
+    granted_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    granted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
 class Document(Base):
     __tablename__ = "documents"
     __table_args__ = (

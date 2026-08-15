@@ -557,6 +557,12 @@ Department and team memberships are current relationship records with tenant-saf
 
 Platform roles remain application-capability roles and do not grant document access. These tables do not introduce knowledge-space or document-permission behavior. Knowledge spaces and typed grants are the next planned authorization slice.
 
+### Knowledge Space Slice
+
+Knowledge spaces are organization-owned platform content boundaries. The platform persists current organization-wide, department, team, and direct-user grants in four typed grant tables; there are no polymorphic principals or role grants. Permissions are `viewer`, `contributor`, and `manager`.
+
+Platform roles do not grant document visibility. Grant effectiveness will depend on grant timestamps, active knowledge-space state, and active target state where applicable. This slice does not implement authorization queries or services, and does not assign connectors or documents to knowledge spaces. Immutable audit persistence is required before management APIs expose grant mutations.
+
 #### documents
 
 - Purpose: Store the stable logical identity of uploaded or synchronized documents.
