@@ -72,7 +72,7 @@ erDiagram
     ORGANIZATIONS ||--o{ DOCUMENTS : owns
     ORGANIZATIONS ||--o{ INGESTION_JOBS : runs
     ORGANIZATIONS ||--o{ CHAT_SESSIONS : owns
-    ORGANIZATIONS ||--o{ AUDIT_LOGS : owns
+    ORGANIZATIONS ||--o{ AUDIT_EVENTS : owns
     ORGANIZATIONS ||--o{ APPLICATION_EVENTS : owns
 
     USERS ||--o{ USER_ROLES : assigned
@@ -226,7 +226,7 @@ Checkpoint metadata can be stored as JSON to hold a cursor, sync token, or high-
 
 #### Operations
 
-- audit_logs
+- audit_events
 - application_events
 
 Immediate table count: 21.
@@ -285,7 +285,7 @@ Immediate table count: 21.
 - Check constraints: retention_policy_days >= 0 when present.
 - Suggested indexes: primary key only.
 - Tenant-isolation behavior: organization-scoped by organization_id.
-- Data-retention considerations: update in place; important changes should be mirrored in audit_logs.
+- Data-retention considerations: update in place; important changes should be mirrored in audit_events.
 - Relationships: exactly one settings row per organization.
 
 ### B. Identity and Authentication
@@ -689,20 +689,15 @@ The initial documents persistence migration intentionally implements only the fi
 
 ### F. Operations
 
-#### audit_logs
+#### audit_events
 
-- Purpose: Store auditable records of sensitive user and system actions.
-- Primary key: id UUID.
-- Foreign keys: organization_id -> organizations.id, actor_user_id -> users.id nullable.
-- Important columns: action_type, target_type, target_id, outcome, ip_address, user_agent, event_payload_json, occurred_at.
-- Required fields: id, organization_id, action_type, outcome, occurred_at.
-- Optional fields: actor_user_id, target_type, target_id, ip_address, user_agent, event_payload_json.
-- Unique constraints: none.
-- Check constraints: outcome limited to approved values such as success, failure, denied, pending.
-- Suggested indexes: btree(organization_id, occurred_at desc), btree(actor_user_id, occurred_at desc), btree(action_type), btree(target_type, target_id).
-- Tenant-isolation behavior: directly organization-scoped.
-- Data-retention considerations: strong retention priority.
-- Relationships: cross-references users, connectors, documents, sessions, and generated SQL indirectly through target_type and target_id.
+- Purpose: Append-oriented historical evidence for sensitive user, system, and service actions. It is separate from operational application events, provider errors, metrics, and traces.
+- Actor model: actor_type is `user`, `system`, or `service`. User actors tenant-safely reference users; system and service actors record a nonblank safe reference.
+- Historical targets: resource_type and resource_id deliberately have no polymorphic foreign key, so an event survives independently represented target deletion.
+- Retention: organization_settings.retention_days defines ordinary retention and legal hold may override it. A future explicit purge/export workflow must remove eligible audit events before an organization or referenced actor can be hard-deleted.
+- Delete behavior: organization and actor-user foreign keys use `RESTRICT`, unlike ordinary organization-owned operational tables. This prevents silent audit-history removal; normal lifecycle disables users and organizations.
+- JSON safety: change_summary and context must contain sanitized objects. Future writers must reject or redact passwords, password hashes, API keys, OAuth and refresh tokens, connector secrets, document or chunk content, embeddings, database credentials, and raw exception traces.
+- Integration status: audit persistence exists, but audit repository, service, and API integration do not yet exist.
 
 #### application_events
 
@@ -716,7 +711,7 @@ The initial documents persistence migration intentionally implements only the fi
 - Check constraints: severity limited to approved values.
 - Suggested indexes: btree(occurred_at desc), btree(severity, occurred_at desc), btree(organization_id, occurred_at desc), btree(correlation_id).
 - Tenant-isolation behavior: organization_id is present for tenant-specific events and null only for truly global operational events.
-- Data-retention considerations: can be retained for a shorter period than audit_logs or exported externally later.
+- Data-retention considerations: can be retained for a shorter period than audit_events or exported externally later.
 - Relationships: provides operational traceability for sync, ingestion, and runtime issues.
 
 ## Deferred Tables and Trigger Conditions
@@ -801,7 +796,7 @@ These were removed from the immediate set because they add structure without bei
 - documents, document_versions, and document_chunks must stay separate.
 - connectors must stay separate from google_drive_sources and database_sources.
 - chat_sessions, messages, and message_citations must stay separate.
-- generated_queries must stay separate from audit_logs.
+- generated_queries must stay separate from audit_events.
 
 ### Areas Still Sensitive to Over-Engineering
 
@@ -852,7 +847,7 @@ These were removed from the immediate set because they add structure without bei
 17. messages
 18. message_citations
 19. generated_queries
-20. audit_logs
+20. audit_events
 21. application_events
 
 ## Final Recommendation

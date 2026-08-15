@@ -13,13 +13,14 @@ from sqlalchemy import (
     Index,
     Integer,
     PrimaryKeyConstraint,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
     text,
     func,
 )
-from sqlalchemy.dialects.postgresql import BYTEA, INET, UUID
+from sqlalchemy.dialects.postgresql import BYTEA, INET, JSONB, UUID
 from pgvector.sqlalchemy import Vector
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -750,6 +751,68 @@ class TeamMembership(Base):
 
     team: Mapped[Team] = relationship(back_populates="memberships")
     user: Mapped[User] = relationship(back_populates="team_memberships", foreign_keys=[user_id])
+
+
+class AuditEvent(Base):
+    __tablename__ = "audit_events"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_audit_events"),
+        ForeignKeyConstraint(
+            ["organization_id"],
+            ["organizations.id"],
+            name="fk_audit_events_organization_id_organizations",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "actor_user_id"],
+            ["users.organization_id", "users.id"],
+            name="fk_audit_events_actor_user_tenant",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("actor_type IN ('user', 'system', 'service')", name="actor_type_valid"),
+        CheckConstraint(
+            "(actor_type = 'user' AND actor_user_id IS NOT NULL) OR "
+            "(actor_type IN ('system', 'service') AND actor_user_id IS NULL "
+            "AND actor_reference IS NOT NULL AND btrim(actor_reference) <> '')",
+            name="actor_consistent",
+        ),
+        CheckConstraint("btrim(action) <> ''", name="action_not_blank"),
+        CheckConstraint("btrim(resource_type) <> ''", name="resource_type_not_blank"),
+        CheckConstraint("outcome IN ('success', 'failure', 'denied')", name="outcome_valid"),
+        CheckConstraint("reason IS NULL OR btrim(reason) <> ''", name="reason_not_blank"),
+        CheckConstraint("request_id IS NULL OR btrim(request_id) <> ''", name="request_id_not_blank"),
+        CheckConstraint("actor_reference IS NULL OR btrim(actor_reference) <> ''", name="actor_reference_not_blank"),
+        CheckConstraint("schema_version > 0", name="schema_version_positive"),
+        CheckConstraint("jsonb_typeof(change_summary) = 'object'", name="change_summary_object"),
+        CheckConstraint("jsonb_typeof(context) = 'object'", name="context_object"),
+        Index("ix_audit_events_organization_id_occurred_at", "organization_id", "occurred_at"),
+        Index("ix_audit_events_org_actor_occurred", "organization_id", "actor_user_id", "occurred_at"),
+        Index("ix_audit_events_org_resource_occurred", "organization_id", "resource_type", "resource_id", "occurred_at"),
+        Index("ix_audit_events_org_action_occurred", "organization_id", "action", "occurred_at"),
+        Index(
+            "ix_audit_events_org_correlation",
+            "organization_id",
+            "correlation_id",
+            postgresql_where=text("correlation_id IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    actor_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    actor_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    actor_reference: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    action: Mapped[str] = mapped_column(String(128), nullable=False)
+    resource_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    resource_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    outcome: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    request_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    correlation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    change_summary: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    context: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("1"))
 
 
 class UserRole(Base):
