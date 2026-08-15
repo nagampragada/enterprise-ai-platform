@@ -420,6 +420,142 @@ class KnowledgeSpaceUserGrant(Base):
     )
 
 
+class Connector(Base):
+    __tablename__ = "connectors"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_connectors"),
+        ForeignKeyConstraint(
+            ["organization_id"], ["organizations.id"],
+            name="fk_connectors_organization_id_organizations", ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "created_by_user_id"], ["users.organization_id", "users.id"],
+            name="fk_connectors_creator_tenant", ondelete="SET NULL (created_by_user_id)",
+        ),
+        UniqueConstraint("organization_id", "id", name="uq_connectors_organization_id_id"),
+        UniqueConstraint("organization_id", "slug", name="uq_connectors_organization_id_slug"),
+        CheckConstraint("connector_type ~ '^[a-z][a-z0-9_]*$'", name="type_code_valid"),
+        CheckConstraint("btrim(display_name) <> ''", name="display_name_not_blank"),
+        CheckConstraint("slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$'", name="slug_kebab_case"),
+        CheckConstraint(
+            "status IN ('draft', 'validating', 'active', 'degraded', 'auth_failed', 'paused', 'archived')",
+            name="status_valid",
+        ),
+        CheckConstraint("acl_support IN ('none', 'partial', 'complete')", name="acl_support_valid"),
+        CheckConstraint(
+            "credential_status IN ('not_configured', 'validating', 'valid', 'expiring', 'expired', 'revoked', 'invalid')",
+            name="credential_status_valid",
+        ),
+        CheckConstraint("jsonb_typeof(capabilities) = 'object'", name="capabilities_object"),
+        CheckConstraint("jsonb_typeof(safe_config) = 'object'", name="safe_config_object"),
+        CheckConstraint("config_schema_version > 0", name="config_version_positive"),
+        CheckConstraint("secret_reference IS NULL OR btrim(secret_reference) <> ''", name="secret_reference_not_blank"),
+        CheckConstraint(
+            "(status = 'archived' AND archived_at IS NOT NULL) OR "
+            "(status <> 'archived' AND archived_at IS NULL)",
+            name="archive_consistent",
+        ),
+        CheckConstraint(
+            "credential_expires_at IS NULL OR credential_expires_at > created_at",
+            name="credential_expiry_after_created",
+        ),
+        Index("ix_connectors_organization_id_status", "organization_id", "status"),
+        Index("ix_connectors_org_type_status", "organization_id", "connector_type", "status"),
+        Index("ix_connectors_org_credential_status", "organization_id", "credential_status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    slug: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'draft'"))
+    acl_support: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'none'"))
+    capabilities: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    safe_config: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    config_schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("1"))
+    secret_reference: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    credential_status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'not_configured'"))
+    credential_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    last_validated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ConnectorScope(Base):
+    __tablename__ = "connector_scopes"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_connector_scopes"),
+        ForeignKeyConstraint(
+            ["organization_id"], ["organizations.id"],
+            name="fk_connector_scopes_organization", ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "connector_id"], ["connectors.organization_id", "connectors.id"],
+            name="fk_connector_scopes_connector_tenant", ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "knowledge_space_id"],
+            ["knowledge_spaces.organization_id", "knowledge_spaces.id"],
+            name="fk_connector_scopes_space_tenant", ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "created_by_user_id"], ["users.organization_id", "users.id"],
+            name="fk_connector_scopes_creator_tenant", ondelete="SET NULL (created_by_user_id)",
+        ),
+        UniqueConstraint("organization_id", "id", name="uq_connector_scopes_organization_id_id"),
+        UniqueConstraint("organization_id", "connector_id", "slug", name="uq_connector_scopes_connector_slug"),
+        UniqueConstraint(
+            "organization_id", "connector_id", "external_scope_key",
+            name="uq_connector_scopes_connector_external_key",
+        ),
+        CheckConstraint("btrim(display_name) <> ''", name="display_name_not_blank"),
+        CheckConstraint("slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$'", name="slug_kebab_case"),
+        CheckConstraint("scope_type ~ '^[a-z][a-z0-9_]*$'", name="type_code_valid"),
+        CheckConstraint("btrim(external_scope_key) <> ''", name="external_key_not_blank"),
+        CheckConstraint(
+            "access_mode IN ('platform_managed', 'source_acl', 'hybrid')", name="access_mode_valid"
+        ),
+        CheckConstraint(
+            "status IN ('draft', 'validating', 'active', 'invalid', 'paused', 'removed')", name="status_valid"
+        ),
+        CheckConstraint("jsonb_typeof(safe_config) = 'object'", name="safe_config_object"),
+        CheckConstraint("config_schema_version > 0", name="config_version_positive"),
+        CheckConstraint(
+            "(status = 'removed' AND removed_at IS NOT NULL) OR "
+            "(status <> 'removed' AND removed_at IS NULL)",
+            name="removal_consistent",
+        ),
+        Index("ix_connector_scopes_org_connector_status", "organization_id", "connector_id", "status"),
+        Index("ix_connector_scopes_org_space_status", "organization_id", "knowledge_space_id", "status"),
+        Index("ix_connector_scopes_org_access_status", "organization_id", "access_mode", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    knowledge_space_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    slug: Mapped[str] = mapped_column(String(255), nullable=False)
+    scope_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    external_scope_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    access_mode: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'draft'"))
+    safe_config: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    config_schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("1"))
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    last_validated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class Document(Base):
     __tablename__ = "documents"
     __table_args__ = (

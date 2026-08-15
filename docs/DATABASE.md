@@ -489,18 +489,19 @@ These are the next tables that can be implemented once the migration slice is ap
 
 #### connectors
 
-- Purpose: Store connector registrations and minimal credential state for the first release.
-- Primary key: id UUID.
-- Foreign keys: organization_id -> organizations.id, created_by_user_id -> users.id nullable.
-- Important columns: connector_type, display_name, status, is_enabled, encrypted_secret_reference, credential_status, credential_updated_at, last_sync_at, last_successful_sync_at, created_at, updated_at.
-- Required fields: id, organization_id, connector_type, display_name, status, is_enabled, credential_status, created_at, updated_at.
-- Optional fields: created_by_user_id, encrypted_secret_reference, credential_updated_at, last_sync_at, last_successful_sync_at.
-- Unique constraints: unique(organization_id, connector_type, display_name).
-- Check constraints: connector_type limited to google_drive and postgresql in the first release; credential_status limited to approved values.
-- Suggested indexes: btree(organization_id, connector_type), btree(organization_id, status), btree(last_successful_sync_at).
-- Tenant-isolation behavior: directly organization-scoped.
-- Data-retention considerations: keep historical connector rows when used operationally.
-- Relationships: one-to-one with google_drive_sources or database_sources; one-to-many with connector_sync_jobs.
+- Purpose: Store one configured integration instance. Connector type remains an extensible normalized code rather than a provider enum.
+- Security: `safe_config` and the capability snapshot contain only non-secret JSON objects. Credentials, tokens, API keys, private keys, and passwords must never be persisted there; `secret_reference` contains only a reference to externally managed secret material. A future connector service must validate provider-specific schemas and reject secret-like configuration keys.
+- ACL declaration: `acl_support` is the typed security-relevant declaration (`none`, `partial`, or `complete`). Capability JSON is descriptive and is not authoritative for access security.
+- Lifecycle: connectors progress through draft, validation, active/degraded/auth-failed/paused, and archived states. Hard deletion cascades owned scopes, while normal behavior archives connectors.
+- Integration status: connector instance and scope persistence exist, but repositories, services, APIs, synchronization, source items, and document relationships are not implemented by this slice.
+
+#### connector_scopes
+
+- Purpose: Store a selected folder, repository, branch, drive, bucket, or path within one connector.
+- Content boundary: every scope has exactly one required knowledge space. `access_mode` exists only on this table and is `platform_managed`, `source_acl`, or `hybrid`; Local Folder uses `platform_managed`.
+- Lifecycle: scopes progress through draft, validation, active/invalid/paused, and removed states. Normal behavior removes a scope before hard-deleting its knowledge space; the database rejects deletion of a referenced knowledge space.
+- Service invariants: an active scope must reference an active connector and active knowledge space. `source_acl` and `hybrid` require connector `acl_support = complete`. These cross-row rules cannot be safely expressed as ordinary checks and must be enforced by a future connector service.
+- Safe configuration: `safe_config` contains only non-secret scope selection data. Provider-specific service validation must reject secret payloads before persistence.
 
 #### connector_sync_jobs
 
