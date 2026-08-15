@@ -549,6 +549,14 @@ These are the next tables that can be implemented once the migration slice is ap
 
 ### D. Documents
 
+### Organization Structure Slice
+
+Departments and teams are optional organization structure. Organizations may use neither, either, or both; no artificial default department or team is created. Departments may be hierarchical through a tenant-safe self-reference. Teams are independent flexible groups and do not reference departments in this slice.
+
+Department and team memberships are current relationship records with tenant-safe composite foreign keys to the organization, user, and target structure. Department responsibilities are `member` and `manager`; team responsibilities are `member`, `lead`, `manager`, and `owner`. Membership status, effective/expiry timestamps, and revocation consistency are database-enforced.
+
+Platform roles remain application-capability roles and do not grant document access. These tables do not introduce knowledge-space or document-permission behavior. Knowledge spaces and typed grants are the next planned authorization slice.
+
 #### documents
 
 - Purpose: Store the stable logical identity of uploaded or synchronized documents.

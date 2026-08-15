@@ -76,6 +76,104 @@ class Organization(Base):
     settings: Mapped[OrganizationSettings | None] = relationship(back_populates="organization", uselist=False)
     users: Mapped[list["User"]] = relationship(back_populates="organization")
     documents: Mapped[list["Document"]] = relationship(back_populates="organization")
+    departments: Mapped[list["Department"]] = relationship(back_populates="organization")
+    teams: Mapped[list["Team"]] = relationship(back_populates="organization")
+
+
+class Department(Base):
+    __tablename__ = "departments"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_departments"),
+        ForeignKeyConstraint(
+            ["organization_id"],
+            ["organizations.id"],
+            name="fk_departments_organization_id_organizations",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "parent_department_id"],
+            ["departments.organization_id", "departments.id"],
+            name="fk_departments_organization_id_parent_department_id_departments",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint("organization_id", "id", name="uq_departments_organization_id_id"),
+        UniqueConstraint("organization_id", "slug", name="uq_departments_organization_id_slug"),
+        CheckConstraint("btrim(name) <> ''", name="departments_name_not_blank"),
+        CheckConstraint(
+            "slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$'",
+            name="departments_slug_kebab_case",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'inactive', 'archived')",
+            name="departments_status_valid",
+        ),
+        CheckConstraint(
+            "parent_department_id IS NULL OR parent_department_id <> id",
+            name="departments_parent_not_self",
+        ),
+        CheckConstraint(
+            "(status = 'archived' AND archived_at IS NOT NULL) OR "
+            "(status <> 'archived' AND archived_at IS NULL)",
+            name="departments_archived_at_consistent",
+        ),
+        Index("ix_departments_organization_id_status", "organization_id", "status"),
+        Index("ix_departments_organization_id_parent_department_id", "organization_id", "parent_department_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    parent_department_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    slug: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'active'"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    organization: Mapped[Organization] = relationship(back_populates="departments")
+    memberships: Mapped[list["DepartmentMembership"]] = relationship(back_populates="department")
+
+
+class Team(Base):
+    __tablename__ = "teams"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_teams"),
+        ForeignKeyConstraint(
+            ["organization_id"],
+            ["organizations.id"],
+            name="fk_teams_organization_id_organizations",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("organization_id", "id", name="uq_teams_organization_id_id"),
+        UniqueConstraint("organization_id", "slug", name="uq_teams_organization_id_slug"),
+        CheckConstraint("btrim(name) <> ''", name="teams_name_not_blank"),
+        CheckConstraint("slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$'", name="teams_slug_kebab_case"),
+        CheckConstraint("status IN ('active', 'inactive', 'archived')", name="teams_status_valid"),
+        CheckConstraint(
+            "(status = 'archived' AND archived_at IS NOT NULL) OR "
+            "(status <> 'archived' AND archived_at IS NULL)",
+            name="teams_archived_at_consistent",
+        ),
+        Index("ix_teams_organization_id_status", "organization_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    slug: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'active'"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    organization: Mapped[Organization] = relationship(back_populates="teams")
+    memberships: Mapped[list["TeamMembership"]] = relationship(back_populates="team")
 
 
 class Document(Base):
@@ -294,6 +392,121 @@ class User(Base):
     organization: Mapped[Organization] = relationship(back_populates="users", foreign_keys=[organization_id])
     role_assignments: Mapped[list["UserRole"]] = relationship(back_populates="user", foreign_keys="UserRole.user_id")
     auth_sessions: Mapped[list["AuthenticationSession"]] = relationship(back_populates="user", foreign_keys="AuthenticationSession.user_id")
+    department_memberships: Mapped[list["DepartmentMembership"]] = relationship(
+        back_populates="user", foreign_keys="DepartmentMembership.user_id"
+    )
+    team_memberships: Mapped[list["TeamMembership"]] = relationship(
+        back_populates="user", foreign_keys="TeamMembership.user_id"
+    )
+
+
+class DepartmentMembership(Base):
+    __tablename__ = "department_memberships"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_department_memberships"),
+        ForeignKeyConstraint(
+            ["organization_id"], ["organizations.id"],
+            name="fk_department_memberships_organization_id_organizations", ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "department_id"], ["departments.organization_id", "departments.id"],
+            name="fk_department_memberships_department_tenant", ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "user_id"], ["users.organization_id", "users.id"],
+            name="fk_department_memberships_organization_id_user_id_users", ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "created_by_user_id"], ["users.organization_id", "users.id"],
+            name="fk_department_memberships_creator_tenant", ondelete="SET NULL (created_by_user_id)",
+        ),
+        UniqueConstraint(
+            "organization_id", "department_id", "user_id",
+            name="uq_department_memberships_entity_user",
+        ),
+        CheckConstraint("responsibility IN ('member', 'manager')", name="department_memberships_responsibility_valid"),
+        CheckConstraint("status IN ('active', 'inactive', 'revoked')", name="department_memberships_status_valid"),
+        CheckConstraint("expires_at IS NULL OR expires_at > effective_from", name="department_memberships_expiry_after_effective"),
+        CheckConstraint("revoked_at IS NULL OR revoked_at >= effective_from", name="department_memberships_revoked_after_effective"),
+        CheckConstraint(
+            "(status = 'revoked' AND revoked_at IS NOT NULL) OR "
+            "(status <> 'revoked' AND revoked_at IS NULL)",
+            name="department_memberships_revocation_consistent",
+        ),
+        Index("ix_department_memberships_organization_id_user_id_status", "organization_id", "user_id", "status"),
+        Index("ix_department_memberships_organization_id_department_id_status", "organization_id", "department_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    department_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    responsibility: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'active'"))
+    effective_from: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+    department: Mapped[Department] = relationship(back_populates="memberships")
+    user: Mapped[User] = relationship(back_populates="department_memberships", foreign_keys=[user_id])
+
+
+class TeamMembership(Base):
+    __tablename__ = "team_memberships"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_team_memberships"),
+        ForeignKeyConstraint(
+            ["organization_id"], ["organizations.id"],
+            name="fk_team_memberships_organization_id_organizations", ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "team_id"], ["teams.organization_id", "teams.id"],
+            name="fk_team_memberships_team_tenant", ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "user_id"], ["users.organization_id", "users.id"],
+            name="fk_team_memberships_organization_id_user_id_users", ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "created_by_user_id"], ["users.organization_id", "users.id"],
+            name="fk_team_memberships_creator_tenant", ondelete="SET NULL (created_by_user_id)",
+        ),
+        UniqueConstraint("organization_id", "team_id", "user_id", name="uq_team_memberships_entity_user"),
+        CheckConstraint("responsibility IN ('member', 'lead', 'manager', 'owner')", name="team_memberships_responsibility_valid"),
+        CheckConstraint("status IN ('active', 'inactive', 'revoked')", name="team_memberships_status_valid"),
+        CheckConstraint("expires_at IS NULL OR expires_at > effective_from", name="team_memberships_expiry_after_effective"),
+        CheckConstraint("revoked_at IS NULL OR revoked_at >= effective_from", name="team_memberships_revoked_after_effective"),
+        CheckConstraint(
+            "(status = 'revoked' AND revoked_at IS NOT NULL) OR "
+            "(status <> 'revoked' AND revoked_at IS NULL)",
+            name="team_memberships_revocation_consistent",
+        ),
+        Index("ix_team_memberships_organization_id_user_id_status", "organization_id", "user_id", "status"),
+        Index("ix_team_memberships_organization_id_team_id_status", "organization_id", "team_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    team_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    responsibility: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'active'"))
+    effective_from: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+    team: Mapped[Team] = relationship(back_populates="memberships")
+    user: Mapped[User] = relationship(back_populates="team_memberships", foreign_keys=[user_id])
 
 
 class UserRole(Base):
