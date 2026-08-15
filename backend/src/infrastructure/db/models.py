@@ -704,6 +704,7 @@ class ConnectorSyncRun(Base):
         ForeignKeyConstraint(["organization_id", "connector_id", "connector_scope_id", "parent_run_id"], ["connector_sync_runs.organization_id", "connector_sync_runs.connector_id", "connector_sync_runs.connector_scope_id", "connector_sync_runs.id"], name="fk_sync_runs_parent_tenant", ondelete="SET NULL (parent_run_id)"),
         ForeignKeyConstraint(["organization_id", "initiated_by_user_id"], ["users.organization_id", "users.id"], name="fk_sync_runs_initiator_tenant", ondelete="SET NULL (initiated_by_user_id)"),
         UniqueConstraint("organization_id", "connector_id", "connector_scope_id", "id", name="uq_sync_runs_scope_id"),
+        UniqueConstraint("organization_id", "id", name="uq_sync_runs_organization_id_id"),
         CheckConstraint("mode IN ('initial', 'incremental', 'retry', 'reconciliation')", name="mode_valid"),
         CheckConstraint("trigger_type IN ('manual', 'scheduled', 'webhook', 'retry', 'system')", name="trigger_valid"),
         CheckConstraint("status IN ('queued', 'running', 'cancelling', 'cancelled', 'completed', 'completed_with_errors', 'failed')", name="status_valid"),
@@ -860,6 +861,299 @@ class ConnectorSyncCursor(Base):
     source_watermark_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     activated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class DocumentVersion(Base):
+    __tablename__ = "document_versions"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_document_versions"),
+        ForeignKeyConstraint(
+            ["organization_id", "connector_id", "source_item_id"],
+            ["source_items.organization_id", "source_items.connector_id", "source_items.id"],
+            name="fk_document_versions_source_item_tenant",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("organization_id", "id", name="uq_document_versions_organization_id_id"),
+        UniqueConstraint(
+            "organization_id", "source_item_id", "version_number",
+            name="uq_document_versions_source_version",
+        ),
+        CheckConstraint("version_number > 0", name="version_number_positive"),
+        CheckConstraint(
+            "provider_version_id IS NULL OR btrim(provider_version_id) <> ''",
+            name="provider_version_not_blank",
+        ),
+        CheckConstraint(
+            "(content_checksum IS NULL AND checksum_algorithm IS NULL) OR "
+            "(content_checksum IS NOT NULL AND btrim(content_checksum) <> '' "
+            "AND checksum_algorithm IS NOT NULL)",
+            name="checksum_pair_valid",
+        ),
+        CheckConstraint(
+            "checksum_algorithm IS NULL OR checksum_algorithm ~ '^[a-z][a-z0-9_]*$'",
+            name="checksum_algorithm_valid",
+        ),
+        CheckConstraint("source_size_bytes IS NULL OR source_size_bytes >= 0", name="size_nonnegative"),
+        CheckConstraint("content_type IS NULL OR btrim(content_type) <> ''", name="content_type_not_blank"),
+        CheckConstraint("file_extension IS NULL OR btrim(file_extension) <> ''", name="extension_not_blank"),
+        CheckConstraint(
+            "version_cause IN ('discovered', 'content_changed', 'metadata_changed', 'restored', 'tombstone', 'manual_backfill')",
+            name="cause_valid",
+        ),
+        CheckConstraint("lifecycle IN ('available', 'unavailable', 'deleted')", name="lifecycle_valid"),
+        CheckConstraint(
+            "version_cause <> 'tombstone' OR "
+            "(lifecycle IN ('unavailable', 'deleted') AND content_checksum IS NULL "
+            "AND checksum_algorithm IS NULL AND source_size_bytes IS NULL)",
+            name="tombstone_consistent",
+        ),
+        CheckConstraint("jsonb_typeof(version_metadata) = 'object'", name="metadata_object"),
+        CheckConstraint("metadata_schema_version > 0", name="metadata_version_positive"),
+        Index(
+            "uq_document_versions_current_source",
+            "organization_id", "source_item_id",
+            unique=True,
+            postgresql_where=text("is_current"),
+        ),
+        Index("ix_document_versions_org_source_number", "organization_id", "source_item_id", "version_number"),
+        Index("ix_document_versions_org_checksum", "organization_id", "content_checksum"),
+        Index("ix_document_versions_org_provider_version", "organization_id", "provider_version_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    source_item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    version_number: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    provider_version_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    content_checksum: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    checksum_algorithm: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_modified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    source_size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    content_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    file_extension: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    version_cause: Mapped[str] = mapped_column(String(32), nullable=False)
+    lifecycle: Mapped[str] = mapped_column(String(32), nullable=False)
+    is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    version_metadata: Mapped[dict[str, object]] = mapped_column(
+        "metadata", JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    metadata_schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("1"))
+
+
+class DocumentVersionDocument(Base):
+    __tablename__ = "document_version_documents"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_document_version_documents"),
+        ForeignKeyConstraint(
+            ["organization_id", "document_version_id"],
+            ["document_versions.organization_id", "document_versions.id"],
+            name="fk_version_documents_version_tenant",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "document_id"],
+            ["documents.organization_id", "documents.id"],
+            name="fk_version_documents_document_tenant",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "organization_id", "document_version_id", name="uq_version_documents_version"
+        ),
+        UniqueConstraint("organization_id", "document_id", name="uq_version_documents_document"),
+        Index("ix_version_documents_org_document", "organization_id", "document_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    document_version_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    document_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    linked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class DocumentIndexingState(Base):
+    __tablename__ = "document_indexing_states"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_document_indexing_states"),
+        ForeignKeyConstraint(
+            ["organization_id", "document_version_id"],
+            ["document_versions.organization_id", "document_versions.id"],
+            name="fk_indexing_states_version_tenant",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("organization_id", "id", name="uq_indexing_states_organization_id_id"),
+        UniqueConstraint(
+            "organization_id", "document_version_id", "profile_fingerprint",
+            name="uq_indexing_states_version_profile",
+        ),
+        CheckConstraint(
+            "extraction_profile ~ '^[a-z0-9][a-z0-9._:/-]*$' AND "
+            "extraction_version ~ '^[a-z0-9][a-z0-9._:/-]*$' AND "
+            "chunking_profile ~ '^[a-z0-9][a-z0-9._:/-]*$' AND "
+            "chunking_version ~ '^[a-z0-9][a-z0-9._:/-]*$' AND "
+            "embedding_provider ~ '^[a-z0-9][a-z0-9._:/-]*$' AND "
+            "embedding_model ~ '^[a-z0-9][a-z0-9._:/-]*$' AND "
+            "profile_fingerprint ~ '^[a-z0-9][a-z0-9._:/-]*$'",
+            name="profile_identifiers_valid",
+        ),
+        CheckConstraint("embedding_dimensions > 0", name="embedding_dimensions_positive"),
+        CheckConstraint("desired_generation > 0", name="desired_generation_positive"),
+        CheckConstraint(
+            "indexed_generation IS NULL OR "
+            "(indexed_generation > 0 AND indexed_generation <= desired_generation)",
+            name="indexed_generation_valid",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'processing', 'indexed', 'stale', 'failed', 'cancelled')",
+            name="status_valid",
+        ),
+        CheckConstraint(
+            "reason IN ('new_version', 'content_changed', 'profile_changed', "
+            "'embedding_model_changed', 'manual_backfill', 'repair')",
+            name="reason_valid",
+        ),
+        CheckConstraint("attempt_count >= 0", name="attempt_count_nonnegative"),
+        CheckConstraint(
+            "(last_error_category IS NULL AND last_error_code IS NULL) OR "
+            "(last_error_category ~ '^[a-z][a-z0-9_]*$' "
+            "AND last_error_code ~ '^[a-z][a-z0-9_]*$')",
+            name="error_pair_valid",
+        ),
+        CheckConstraint(
+            "(status = 'pending' AND started_at IS NULL AND completed_at IS NULL) OR "
+            "(status = 'processing' AND started_at IS NOT NULL AND completed_at IS NULL) OR "
+            "(status = 'indexed' AND completed_at IS NOT NULL "
+            "AND indexed_generation = desired_generation AND next_retry_at IS NULL) OR "
+            "(status = 'failed' AND completed_at IS NOT NULL "
+            "AND last_error_category IS NOT NULL AND last_error_code IS NOT NULL) OR "
+            "status IN ('stale', 'cancelled')",
+            name="status_state_valid",
+        ),
+        CheckConstraint(
+            "next_retry_at IS NULL OR status IN ('pending', 'failed')",
+            name="retry_status_valid",
+        ),
+        CheckConstraint(
+            "completed_at IS NULL OR started_at IS NULL OR completed_at >= started_at",
+            name="completed_order_valid",
+        ),
+        Index("ix_indexing_states_org_status_requested", "organization_id", "status", "requested_at"),
+        Index("ix_indexing_states_org_retry", "organization_id", "next_retry_at"),
+        Index("ix_indexing_states_org_profile", "organization_id", "profile_fingerprint", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    document_version_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    extraction_profile: Mapped[str] = mapped_column(String(128), nullable=False)
+    extraction_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    chunking_profile: Mapped[str] = mapped_column(String(128), nullable=False)
+    chunking_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    embedding_provider: Mapped[str] = mapped_column(String(128), nullable=False)
+    embedding_model: Mapped[str] = mapped_column(String(255), nullable=False)
+    embedding_dimensions: Mapped[int] = mapped_column(Integer, nullable=False)
+    profile_fingerprint: Mapped[str] = mapped_column(String(255), nullable=False)
+    desired_generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    indexed_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'pending'"))
+    reason: Mapped[str] = mapped_column(String(32), nullable=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    last_error_category: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class DocumentIndexingAttempt(Base):
+    __tablename__ = "document_indexing_attempts"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_document_indexing_attempts"),
+        ForeignKeyConstraint(
+            ["organization_id", "indexing_state_id"],
+            ["document_indexing_states.organization_id", "document_indexing_states.id"],
+            name="fk_indexing_attempts_state_tenant",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "connector_sync_run_id"],
+            ["connector_sync_runs.organization_id", "connector_sync_runs.id"],
+            name="fk_indexing_attempts_run_tenant",
+            ondelete="SET NULL (connector_sync_run_id)",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "connector_sync_run_id", "connector_sync_item_id"],
+            ["connector_sync_items.organization_id", "connector_sync_items.sync_run_id", "connector_sync_items.id"],
+            name="fk_indexing_attempts_item_tenant",
+            ondelete="SET NULL (connector_sync_item_id)",
+        ),
+        UniqueConstraint(
+            "organization_id", "indexing_state_id", "attempt_number",
+            name="uq_indexing_attempts_state_number",
+        ),
+        CheckConstraint("attempt_number > 0", name="attempt_number_positive"),
+        CheckConstraint(
+            "connector_sync_item_id IS NULL OR connector_sync_run_id IS NOT NULL",
+            name="item_requires_run",
+        ),
+        CheckConstraint(
+            "trigger_type IN ('sync', 'retry', 'manual_backfill', 'scheduled_backfill', 'repair')",
+            name="trigger_valid",
+        ),
+        CheckConstraint(
+            "status IN ('running', 'succeeded', 'failed', 'cancelled')", name="status_valid"
+        ),
+        CheckConstraint("worker_reference IS NULL OR btrim(worker_reference) <> ''", name="worker_not_blank"),
+        CheckConstraint(
+            "(error_category IS NULL AND error_code IS NULL) OR "
+            "(error_category ~ '^[a-z][a-z0-9_]*$' AND error_code ~ '^[a-z][a-z0-9_]*$')",
+            name="error_pair_valid",
+        ),
+        CheckConstraint(
+            "(status = 'running' AND completed_at IS NULL) OR "
+            "(status IN ('succeeded', 'failed', 'cancelled') AND completed_at IS NOT NULL)",
+            name="completion_matches_status",
+        ),
+        CheckConstraint(
+            "status <> 'succeeded' OR (error_category IS NULL AND error_code IS NULL)",
+            name="success_has_no_error",
+        ),
+        CheckConstraint(
+            "status <> 'failed' OR (error_category IS NOT NULL AND error_code IS NOT NULL)",
+            name="failure_has_error",
+        ),
+        CheckConstraint("completed_at IS NULL OR completed_at >= started_at", name="completed_order_valid"),
+        CheckConstraint("jsonb_typeof(summary) = 'object'", name="summary_object"),
+        CheckConstraint("summary_schema_version > 0", name="summary_version_positive"),
+        Index("ix_indexing_attempts_org_state_number", "organization_id", "indexing_state_id", "attempt_number"),
+        Index("ix_indexing_attempts_org_sync_run", "organization_id", "connector_sync_run_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    indexing_state_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_sync_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    connector_sync_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    trigger_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    worker_reference: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_category: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    retryable: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    summary: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    summary_schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("1"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 

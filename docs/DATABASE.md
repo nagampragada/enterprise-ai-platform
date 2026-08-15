@@ -587,33 +587,33 @@ The initial documents persistence migration intentionally implements only the fi
 
 #### document_versions
 
-- Purpose: Store immutable document versions produced by upload or synchronization.
-- Primary key: id UUID.
-- Foreign keys: organization_id -> organizations.id, document_id -> documents.id, ingestion_job_id -> ingestion_jobs.id nullable.
-- Important columns: version_number, content_checksum, storage_uri, extracted_text_uri or extracted_text, extraction_status, chunk_count, token_count, is_current, created_at.
-- Required fields: id, organization_id, document_id, version_number, content_checksum, extraction_status, is_current, created_at.
-- Optional fields: ingestion_job_id, storage_uri, extracted_text_uri, extracted_text, chunk_count, token_count.
-- Unique constraints: unique(document_id, version_number); only one current version per document.
-- Check constraints: version_number > 0; chunk_count and token_count >= 0 when present.
-- Suggested indexes: btree(organization_id, document_id), btree(document_id, is_current), btree(content_checksum).
-- Tenant-isolation behavior: directly organization-scoped.
-- Data-retention considerations: keep version history for auditability and re-indexing.
-- Relationships: one version to many chunks.
+- Purpose: Store immutable observations of one canonical connector `source_item`. Versions retain provider version/checksum, safe content metadata, lifecycle, cause, and discovery time without storing source content.
+- Identity: version numbers are positive and unique per source item; future services allocate monotonically increasing values. A partial unique index permits at most one current version without deleting historical rows.
+- Lifecycle: available versions may be indexed; unavailable/deleted tombstones cannot claim checksum or size-bearing indexable content. Source-item administrative purge cascades its version and indexing history.
+- Existing document mapping: `document_version_documents` is a narrow one-to-one current-materialization association. A version can exist before a document does, and one mutable logical document cannot silently represent multiple versions. Re-indexing moves the association transactionally without mutating immutable version observations. Existing manual-upload documents are not migrated or given mandatory connector fields.
+
+#### document_indexing_states and document_indexing_attempts
+
+- Durable state: one mutable state exists per document version and deterministic profile fingerprint. Profile identity records extraction and chunking profile/version plus embedding provider/model/dimensions. Profile or model changes create a distinct state for backfill rather than destroying earlier profile history.
+- Generations: desired and successfully indexed generations track whether the materialized document/chunks are current. Status/timestamp/generation checks cover pending, processing, indexed, stale, failed, and cancelled work; retry scheduling is limited to pending or failed state.
+- Attempts: append-oriented attempts retain positive attempt numbers, trigger/status, safe worker reference, retryability, and safe summary JSON. Optional sync-run/item attribution is tenant-safe and is cleared when operational sync rows are purged.
+- Safety: state and attempt rows contain no source content, extracted text, chunks, vectors, credentials, tokens, provider payloads, or stack traces.
+- Service responsibilities: automatic version allocation, checksum comparison, profile fingerprint construction, bounded indexing transactions, retries, association replacement, extraction, chunking, embeddings, scheduling, and workers are not implemented by this slice.
 
 #### document_chunks
 
 - Purpose: Store retrieval chunks and embeddings.
 - Primary key: id UUID.
-- Foreign keys: organization_id -> organizations.id, document_id -> documents.id, document_version_id -> document_versions.id.
+- Foreign keys: organization_id -> organizations.id and document_id -> documents.id. The live chunk schema remains tied to the mutable indexed document and does not yet carry a version FK.
 - Important columns: chunk_index, chunk_text, token_count, embedding, embedding_model, embedding_dimension, content_hash, page_number_start, page_number_end, created_at.
-- Required fields: id, organization_id, document_id, document_version_id, chunk_index, chunk_text, embedding, embedding_model, embedding_dimension, created_at.
+- Required fields: id, organization_id, document_id, chunk_index, chunk_text, content_hash, created_at.
 - Optional fields: token_count, content_hash, page_number_start, page_number_end.
 - Unique constraints: unique(document_version_id, chunk_index).
 - Check constraints: chunk_index >= 0; embedding_dimension > 0; token_count >= 0 when present.
 - Suggested indexes: btree(organization_id, document_id), btree(document_version_id), vector index on embedding.
 - Tenant-isolation behavior: directly organization-scoped.
 - Data-retention considerations: tied to version history; purge only if historical versions are intentionally removed.
-- Relationships: belongs to one document version; referenced by message_citations.
+- Relationships: belongs to one logical document. Version materialization is represented by `document_version_documents`; existing chunk replacement behavior is unchanged.
 
 #### ingestion_jobs
 
