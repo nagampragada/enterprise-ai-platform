@@ -514,18 +514,13 @@ These are the next tables that can be implemented once the migration slice is ap
 
 #### connector_sync_jobs
 
-- Purpose: Track initial and incremental sync runs at a summary level.
-- Primary key: id UUID.
-- Foreign keys: organization_id -> organizations.id, connector_id -> connectors.id, started_by_user_id -> users.id nullable.
-- Important columns: sync_mode, status, started_at, completed_at, discovered_count, processed_count, failed_count, last_error, checkpoint_metadata, created_at.
-- Required fields: id, organization_id, connector_id, sync_mode, status, started_at, created_at.
-- Optional fields: started_by_user_id, completed_at, discovered_count, processed_count, failed_count, last_error, checkpoint_metadata.
-- Unique constraints: none.
-- Check constraints: counts >= 0; completed_at null or completed_at >= started_at; sync_mode limited to initial or incremental.
-- Suggested indexes: btree(organization_id, connector_id, started_at desc), btree(status), btree(sync_mode).
-- Tenant-isolation behavior: directly organization-scoped.
-- Data-retention considerations: retain for operational history and support.
-- Relationships: one connector to many sync jobs; ingestion_jobs may optionally reference a sync job.
+Synchronization operations are persisted as `connector_sync_runs`, `connector_sync_items`, `connector_sync_errors`, and `connector_sync_cursors`. Every run belongs to exactly one tenant-safe connector scope. Runs hold operational status and nonnegative summary counters; they do not prove counter totals or all legal state transitions.
+
+Items hold per-source-key change and processing outcomes so one malformed item need not fail a future run. Errors are repeatable safe summaries that survive item deletion by clearing only their optional item reference. Error messages and JSON details must exclude credentials, document content, embeddings, raw provider responses, and stack traces. Future services must use bounded item or bounded-batch transactions and own commit/rollback behavior.
+
+Cursors are versioned per scope. Exactly one safe JSON object or protected `secret_reference` is stored, and only one cursor may be active. Sensitive delta/page tokens must use secret references. Future services must atomically supersede the old cursor when activating its replacement and advance cursors only after successful bounded work.
+
+Cursor retention deliberately blocks deletion of its creating run; purge cursors before deleting retained runs, connectors, scopes, or organizations. Without retained cursors or audit events, operational rows cascade with their owning connector/scope/organization. No synchronization repository, service, scheduler, retry loop, worker, source orchestration, document linkage, or total-count query exists yet.
 
 #### google_drive_sources
 

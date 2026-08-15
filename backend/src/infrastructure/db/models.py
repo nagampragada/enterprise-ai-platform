@@ -694,6 +694,175 @@ class SourceItemScopeMembership(Base):
     )
 
 
+class ConnectorSyncRun(Base):
+    __tablename__ = "connector_sync_runs"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_connector_sync_runs"),
+        ForeignKeyConstraint(["organization_id"], ["organizations.id"], name="fk_sync_runs_organization", ondelete="CASCADE"),
+        ForeignKeyConstraint(["organization_id", "connector_id"], ["connectors.organization_id", "connectors.id"], name="fk_sync_runs_connector_tenant", ondelete="CASCADE"),
+        ForeignKeyConstraint(["organization_id", "connector_id", "connector_scope_id"], ["connector_scopes.organization_id", "connector_scopes.connector_id", "connector_scopes.id"], name="fk_sync_runs_scope_tenant", ondelete="CASCADE"),
+        ForeignKeyConstraint(["organization_id", "connector_id", "connector_scope_id", "parent_run_id"], ["connector_sync_runs.organization_id", "connector_sync_runs.connector_id", "connector_sync_runs.connector_scope_id", "connector_sync_runs.id"], name="fk_sync_runs_parent_tenant", ondelete="SET NULL (parent_run_id)"),
+        ForeignKeyConstraint(["organization_id", "initiated_by_user_id"], ["users.organization_id", "users.id"], name="fk_sync_runs_initiator_tenant", ondelete="SET NULL (initiated_by_user_id)"),
+        UniqueConstraint("organization_id", "connector_id", "connector_scope_id", "id", name="uq_sync_runs_scope_id"),
+        CheckConstraint("mode IN ('initial', 'incremental', 'retry', 'reconciliation')", name="mode_valid"),
+        CheckConstraint("trigger_type IN ('manual', 'scheduled', 'webhook', 'retry', 'system')", name="trigger_valid"),
+        CheckConstraint("status IN ('queued', 'running', 'cancelling', 'cancelled', 'completed', 'completed_with_errors', 'failed')", name="status_valid"),
+        CheckConstraint(
+            "(status = 'queued' AND started_at IS NULL AND finished_at IS NULL) OR "
+            "(status = 'running' AND started_at IS NOT NULL AND finished_at IS NULL) OR "
+            "(status = 'cancelling' AND started_at IS NOT NULL AND cancel_requested_at IS NOT NULL AND finished_at IS NULL) OR "
+            "(status IN ('cancelled', 'completed', 'completed_with_errors', 'failed') AND started_at IS NOT NULL AND finished_at IS NOT NULL)",
+            name="timestamps_match_status",
+        ),
+        CheckConstraint("finished_at IS NULL OR finished_at >= started_at", name="finished_order_valid"),
+        CheckConstraint("heartbeat_at IS NULL OR started_at IS NULL OR heartbeat_at >= started_at", name="heartbeat_order_valid"),
+        CheckConstraint("cancel_requested_at IS NULL OR (started_at IS NOT NULL AND cancel_requested_at >= started_at)", name="cancel_order_valid"),
+        CheckConstraint("error_summary IS NULL OR btrim(error_summary) <> ''", name="error_summary_not_blank"),
+        CheckConstraint("jsonb_typeof(run_metadata) = 'object'", name="metadata_object"),
+        CheckConstraint("items_discovered >= 0 AND items_new >= 0 AND items_changed >= 0 AND items_unchanged >= 0 AND items_deleted >= 0 AND items_skipped >= 0 AND items_succeeded >= 0 AND items_failed >= 0", name="counters_nonnegative"),
+        CheckConstraint("parent_run_id IS NULL OR parent_run_id <> id", name="parent_not_self"),
+        Index("ix_sync_runs_org_scope_created", "organization_id", "connector_scope_id", "created_at"),
+        Index("ix_sync_runs_org_connector_status", "organization_id", "connector_id", "status"),
+        Index("ix_sync_runs_org_status_created", "organization_id", "status", "created_at"),
+        Index("uq_sync_runs_org_scope_active", "organization_id", "connector_scope_id", unique=True, postgresql_where=text("status IN ('running', 'cancelling')")),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_scope_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    parent_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    mode: Mapped[str] = mapped_column(String(32), nullable=False)
+    trigger_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'queued'"))
+    initiated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    run_metadata: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    items_discovered: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    items_new: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    items_changed: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    items_unchanged: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    items_deleted: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    items_skipped: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    items_succeeded: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    items_failed: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class ConnectorSyncItem(Base):
+    __tablename__ = "connector_sync_items"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_connector_sync_items"),
+        ForeignKeyConstraint(["organization_id", "connector_id", "connector_scope_id", "sync_run_id"], ["connector_sync_runs.organization_id", "connector_sync_runs.connector_id", "connector_sync_runs.connector_scope_id", "connector_sync_runs.id"], name="fk_sync_items_run_tenant", ondelete="CASCADE"),
+        ForeignKeyConstraint(["organization_id", "connector_id", "source_item_id"], ["source_items.organization_id", "source_items.connector_id", "source_items.id"], name="fk_sync_items_source_tenant", ondelete="SET NULL (source_item_id)"),
+        UniqueConstraint("organization_id", "sync_run_id", "id", name="uq_sync_items_run_id"),
+        UniqueConstraint("organization_id", "sync_run_id", "source_item_key", name="uq_sync_items_run_key"),
+        CheckConstraint("btrim(source_item_key) <> ''", name="key_not_blank"),
+        CheckConstraint("change_type IN ('new', 'changed', 'unchanged', 'deleted', 'unknown')", name="change_type_valid"),
+        CheckConstraint("processing_status IN ('pending', 'processing', 'succeeded', 'skipped', 'failed')", name="status_valid"),
+        CheckConstraint("previous_checksum IS NULL OR btrim(previous_checksum) <> ''", name="previous_checksum_not_blank"),
+        CheckConstraint("current_checksum IS NULL OR btrim(current_checksum) <> ''", name="current_checksum_not_blank"),
+        CheckConstraint("attempt_count >= 0", name="attempt_nonnegative"),
+        CheckConstraint("(processing_status = 'pending' AND started_at IS NULL AND finished_at IS NULL) OR (processing_status = 'processing' AND started_at IS NOT NULL AND finished_at IS NULL) OR (processing_status IN ('succeeded', 'skipped', 'failed') AND started_at IS NOT NULL AND finished_at IS NOT NULL)", name="timestamps_match_status"),
+        CheckConstraint("finished_at IS NULL OR finished_at >= started_at", name="finished_order_valid"),
+        Index("ix_sync_items_org_run_status", "organization_id", "sync_run_id", "processing_status"),
+        Index("ix_sync_items_org_source", "organization_id", "source_item_id"),
+        Index("ix_sync_items_org_scope_key", "organization_id", "connector_scope_id", "source_item_key"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_scope_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    sync_run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    source_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    source_item_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    change_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    processing_status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'pending'"))
+    previous_checksum: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    current_checksum: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class ConnectorSyncError(Base):
+    __tablename__ = "connector_sync_errors"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_connector_sync_errors"),
+        ForeignKeyConstraint(["organization_id", "connector_id", "connector_scope_id", "sync_run_id"], ["connector_sync_runs.organization_id", "connector_sync_runs.connector_id", "connector_sync_runs.connector_scope_id", "connector_sync_runs.id"], name="fk_sync_errors_run_tenant", ondelete="CASCADE"),
+        ForeignKeyConstraint(["organization_id", "sync_run_id", "sync_item_id"], ["connector_sync_items.organization_id", "connector_sync_items.sync_run_id", "connector_sync_items.id"], name="fk_sync_errors_item_tenant", ondelete="SET NULL (sync_item_id)"),
+        CheckConstraint("error_category IN ('configuration', 'authentication', 'authorization', 'rate_limit', 'source_read', 'extraction', 'persistence', 'embedding', 'permission', 'internal')", name="category_valid"),
+        CheckConstraint("error_code ~ '^[a-z][a-z0-9_]*$'", name="code_valid"),
+        CheckConstraint("btrim(message) <> ''", name="message_not_blank"),
+        CheckConstraint("attempt_number > 0", name="attempt_positive"),
+        CheckConstraint("jsonb_typeof(details) = 'object'", name="details_object"),
+        CheckConstraint("retry_after_at IS NULL OR retry_after_at >= occurred_at", name="retry_order_valid"),
+        CheckConstraint("resolved_at IS NULL OR resolved_at >= occurred_at", name="resolved_order_valid"),
+        Index("ix_sync_errors_org_run_occurred", "organization_id", "sync_run_id", "occurred_at"),
+        Index("ix_sync_errors_org_item_occurred", "organization_id", "sync_item_id", "occurred_at"),
+        Index("ix_sync_errors_org_retry_resolved", "organization_id", "retryable", "resolved_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_scope_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    sync_run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    sync_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    error_category: Mapped[str] = mapped_column(String(32), nullable=False)
+    error_code: Mapped[str] = mapped_column(String(128), nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    retryable: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    details: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    retry_after_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class ConnectorSyncCursor(Base):
+    __tablename__ = "connector_sync_cursors"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_connector_sync_cursors"),
+        ForeignKeyConstraint(["organization_id", "connector_id", "connector_scope_id", "created_by_run_id"], ["connector_sync_runs.organization_id", "connector_sync_runs.connector_id", "connector_sync_runs.connector_scope_id", "connector_sync_runs.id"], name="fk_sync_cursors_run_tenant", ondelete="RESTRICT"),
+        UniqueConstraint("organization_id", "connector_scope_id", "cursor_version", name="uq_sync_cursors_scope_version"),
+        CheckConstraint("cursor_version > 0", name="version_positive"),
+        CheckConstraint("cursor_type ~ '^[a-z][a-z0-9_]*$'", name="type_code_valid"),
+        CheckConstraint("state IN ('active', 'superseded', 'invalid')", name="state_valid"),
+        CheckConstraint("(safe_cursor IS NOT NULL AND secret_reference IS NULL) OR (safe_cursor IS NULL AND secret_reference IS NOT NULL)", name="storage_exactly_one"),
+        CheckConstraint("safe_cursor IS NULL OR jsonb_typeof(safe_cursor) = 'object'", name="safe_cursor_object"),
+        CheckConstraint("secret_reference IS NULL OR btrim(secret_reference) <> ''", name="secret_reference_not_blank"),
+        CheckConstraint("(state = 'active' AND retired_at IS NULL) OR (state IN ('superseded', 'invalid') AND retired_at IS NOT NULL)", name="retirement_matches_state"),
+        CheckConstraint("retired_at IS NULL OR retired_at >= activated_at", name="retired_order_valid"),
+        Index("uq_sync_cursors_org_scope_active", "organization_id", "connector_scope_id", unique=True, postgresql_where=text("state = 'active'")),
+        Index("ix_sync_cursors_org_scope_version", "organization_id", "connector_scope_id", "cursor_version"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_scope_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    created_by_run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    cursor_version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    cursor_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    safe_cursor: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
+    secret_reference: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    source_watermark_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    activated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
 class Document(Base):
     __tablename__ = "documents"
     __table_args__ = (
