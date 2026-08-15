@@ -7,6 +7,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     Boolean,
+    BigInteger,
     CheckConstraint,
     DateTime,
     ForeignKeyConstraint,
@@ -508,6 +509,9 @@ class ConnectorScope(Base):
             name="fk_connector_scopes_creator_tenant", ondelete="SET NULL (created_by_user_id)",
         ),
         UniqueConstraint("organization_id", "id", name="uq_connector_scopes_organization_id_id"),
+        UniqueConstraint(
+            "organization_id", "connector_id", "id", name="uq_connector_scopes_org_connector_id"
+        ),
         UniqueConstraint("organization_id", "connector_id", "slug", name="uq_connector_scopes_connector_slug"),
         UniqueConstraint(
             "organization_id", "connector_id", "external_scope_key",
@@ -554,6 +558,140 @@ class ConnectorScope(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
     removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SourceItem(Base):
+    __tablename__ = "source_items"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_source_items"),
+        ForeignKeyConstraint(
+            ["organization_id"], ["organizations.id"],
+            name="fk_source_items_organization", ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "connector_id"], ["connectors.organization_id", "connectors.id"],
+            name="fk_source_items_connector_tenant", ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "organization_id", "connector_id", "id", name="uq_source_items_connector_id"
+        ),
+        UniqueConstraint(
+            "organization_id", "connector_id", "source_item_key", name="uq_source_items_connector_key"
+        ),
+        CheckConstraint("btrim(source_item_key) <> ''", name="key_not_blank"),
+        CheckConstraint(
+            "parent_source_item_key IS NULL OR btrim(parent_source_item_key) <> ''",
+            name="parent_key_not_blank",
+        ),
+        CheckConstraint(
+            "parent_source_item_key IS NULL OR parent_source_item_key <> source_item_key",
+            name="parent_key_not_self",
+        ),
+        CheckConstraint("source_item_type ~ '^[a-z][a-z0-9_]*$'", name="type_code_valid"),
+        CheckConstraint("btrim(title) <> ''", name="title_not_blank"),
+        CheckConstraint("source_url IS NULL OR btrim(source_url) <> ''", name="url_not_blank"),
+        CheckConstraint("mime_type IS NULL OR btrim(mime_type) <> ''", name="mime_type_not_blank"),
+        CheckConstraint(
+            "source_checksum IS NULL OR btrim(source_checksum) <> ''", name="checksum_not_blank"
+        ),
+        CheckConstraint(
+            "source_version IS NULL OR btrim(source_version) <> ''", name="version_not_blank"
+        ),
+        CheckConstraint("size_bytes IS NULL OR size_bytes >= 0", name="size_nonnegative"),
+        CheckConstraint("last_seen_at >= first_seen_at", name="seen_order_valid"),
+        CheckConstraint("status IN ('active', 'deleted', 'unavailable')", name="status_valid"),
+        CheckConstraint(
+            "(status = 'deleted' AND deleted_at IS NOT NULL) OR "
+            "(status <> 'deleted' AND deleted_at IS NULL)",
+            name="deletion_consistent",
+        ),
+        CheckConstraint("jsonb_typeof(metadata) = 'object'", name="metadata_object"),
+        CheckConstraint("metadata_schema_version > 0", name="metadata_version_positive"),
+        Index("ix_source_items_org_connector_status", "organization_id", "connector_id", "status"),
+        Index("ix_source_items_org_connector_type", "organization_id", "connector_id", "source_item_type"),
+        Index("ix_source_items_org_connector_seen", "organization_id", "connector_id", "last_seen_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    source_item_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    parent_source_item_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    source_item_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(String(1024), nullable=False)
+    source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mime_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    source_checksum: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    source_version: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    source_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    source_modified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'active'"))
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    source_metadata: Mapped[dict[str, object]] = mapped_column(
+        "metadata", JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    metadata_schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("1"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class SourceItemScopeMembership(Base):
+    __tablename__ = "source_item_scope_memberships"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_source_item_scope_memberships"),
+        ForeignKeyConstraint(
+            ["organization_id"], ["organizations.id"],
+            name="fk_source_scope_memberships_organization", ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "connector_id", "source_item_id"],
+            ["source_items.organization_id", "source_items.connector_id", "source_items.id"],
+            name="fk_source_scope_memberships_item_tenant", ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "connector_id", "connector_scope_id"],
+            ["connector_scopes.organization_id", "connector_scopes.connector_id", "connector_scopes.id"],
+            name="fk_source_scope_memberships_scope_tenant", ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "organization_id", "source_item_id", "connector_scope_id",
+            name="uq_source_scope_memberships_item_scope",
+        ),
+        CheckConstraint("status IN ('active', 'removed')", name="status_valid"),
+        CheckConstraint("last_seen_at >= first_discovered_at", name="seen_order_valid"),
+        CheckConstraint(
+            "(status = 'removed' AND removed_at IS NOT NULL) OR "
+            "(status <> 'removed' AND removed_at IS NULL)",
+            name="removal_consistent",
+        ),
+        Index(
+            "ix_source_scope_memberships_org_scope_status",
+            "organization_id", "connector_scope_id", "status",
+        ),
+        Index(
+            "ix_source_scope_memberships_org_item_status",
+            "organization_id", "source_item_id", "status",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    source_item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_scope_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'active'"))
+    first_discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
 
 
 class Document(Base):

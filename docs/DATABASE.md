@@ -503,6 +503,15 @@ These are the next tables that can be implemented once the migration slice is ap
 - Service invariants: an active scope must reference an active connector and active knowledge space. `source_acl` and `hybrid` require connector `acl_support = complete`. These cross-row rules cannot be safely expressed as ordinary checks and must be enforced by a future connector service.
 - Safe configuration: `safe_config` contains only non-secret scope selection data. Provider-specific service validation must reject secret payloads before persistence.
 
+#### source_items and source_item_scope_memberships
+
+- Canonical identity: a source item is the connector-native object identified case-sensitively by `(organization_id, connector_id, source_item_key)`. It is not yet an indexed document, and scope ID is deliberately excluded from identity.
+- Scope discovery: `source_item_scope_memberships` records the current relationship between one canonical item and each scope that discovered it. One item may belong to multiple scopes without duplication; removing one membership does not remove the item or its other memberships.
+- Lifecycle: `active` means currently reachable, `deleted` means provider-reported deletion, and `unavailable` means access is currently unavailable without proven deletion. Scope membership removal affects only that relationship. Future service policy determines item state when every membership is removed.
+- Provider metadata: stable typed identity, lifecycle, timestamps, size, checksum, and version fields remain columns. JSONB metadata is limited to safe non-security provider data and must never contain credentials, secrets, document content, embeddings, ACLs, or permission data.
+- Parent limitation: `parent_source_item_key` stores one primary provider-reported parent without a foreign key. Multi-parent or graph sources may later require a dedicated relationship table.
+- Deferred behavior: this slice does not implement incremental comparison, sync outcomes, rename detection, document linkage, extraction, ACL persistence, permission filtering, repositories, services, or APIs. Local Folder rename remains delete-plus-create unless future stable identity proves continuity.
+
 #### connector_sync_jobs
 
 - Purpose: Track initial and incremental sync runs at a summary level.
