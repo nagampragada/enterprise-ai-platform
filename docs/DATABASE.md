@@ -633,6 +633,7 @@ The initial documents persistence migration intentionally implements only the fi
 - Identity: version numbers are positive and unique per source item; future services allocate monotonically increasing values. A partial unique index permits at most one current version without deleting historical rows.
 - Lifecycle: available versions may be indexed; unavailable/deleted tombstones cannot claim checksum or size-bearing indexable content. Source-item administrative purge cascades its version and indexing history.
 - Existing document mapping: `document_version_documents` is a narrow one-to-one current-materialization association. A version can exist before a document does, and one mutable logical document cannot silently represent multiple versions. Re-indexing moves the association transactionally without mutating immutable version observations. Existing manual-upload documents are not migrated or given mandatory connector fields.
+- Repository operations: `DocumentVersionRepository` serializes monotonic version allocation by locking the tenant-owned source item, demotes and flushes the prior current row before inserting its replacement, and exposes bounded keyset history. Materialization replacement locks the source, selected version/document, and conflicting associations; it changes only the association and never deletes version history, documents, or chunks.
 
 #### document_indexing_states and document_indexing_attempts
 
@@ -640,7 +641,9 @@ The initial documents persistence migration intentionally implements only the fi
 - Generations: desired and successfully indexed generations track whether the materialized document/chunks are current. Status/timestamp/generation checks cover pending, processing, indexed, stale, failed, and cancelled work; retry scheduling is limited to pending or failed state.
 - Attempts: append-oriented attempts retain positive attempt numbers, trigger/status, safe worker reference, retryability, and safe summary JSON. Optional sync-run/item attribution is tenant-safe and is cleared when operational sync rows are purged.
 - Safety: state and attempt rows contain no source content, extracted text, chunks, vectors, credentials, tokens, provider payloads, or stack traces.
-- Service responsibilities: automatic version allocation, checksum comparison, profile fingerprint construction, bounded indexing transactions, retries, association replacement, extraction, chunking, embeddings, scheduling, and workers are not implemented by this slice.
+- Repository operations: `DocumentIndexingRepository` provides profile-specific state initialization, bounded work/history pages, explicit controlled state persistence, monotonic generation requests, and append-oriented attempts. State locks serialize generation and attempt allocation; attempt completion accepts only safe terminal fields and summary objects.
+- Transactions: both repositories use injected sessions and flush only for immediate constraints, current-row ordering, association replacement, and attempt allocation. They never commit, roll back, retry, create sessions, or claim work. A future service must coordinate source, document, chunk, embedding, indexing, materialization, sync, and cursor changes in one caller-owned transaction.
+- Service responsibilities: checksum/content equivalence, profile fingerprint construction, transition and retry policy, extraction, chunking, embeddings, scheduling, workers, and Local Folder orchestration remain outside this slice.
 
 #### document_chunks
 
