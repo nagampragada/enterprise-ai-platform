@@ -558,6 +558,12 @@ Cursors are versioned per scope. Exactly one safe JSON object or protected `secr
 
 Cursor retention deliberately blocks deletion of its creating run; purge cursors before deleting retained runs, connectors, scopes, or organizations. Without retained cursors or audit events, operational rows cascade with their owning connector/scope/organization. No synchronization repository, service, scheduler, retry loop, worker, source orchestration, document linkage, or total-count query exists yet.
 
+`SourceItemRepository` persists canonical case-sensitive source identity, tenant/connector-safe row locks, bounded `(created_at, id)` keyset pages, explicit scope-membership removal/reactivation, and controlled provider metadata/lifecycle updates. It does not classify changes, reconcile missing items, or create document versions.
+
+`ConnectorSyncRepository` persists runs, items, append-only safe errors, and versioned cursors. Run/item lookups and locks require complete tenant and parent identity. Counter increments use atomic SQL arithmetic with an explicit counter allowlist. Cursor promotion locks the active scope cursor, supersedes and flushes it, then inserts the higher active version while preserving history. Cursor state is either safe JSON or an external secret reference, never both.
+
+Both repositories use injected caller-owned sessions, flush only for immediate constraint/default ordering, and never commit, roll back, retry, call providers, or access filesystems. Safe exceptions omit source keys, paths, cursor payloads, error details, SQL, and secrets. Future synchronization services remain responsible for change classification, lifecycle transition policy, retries, missing-item reconciliation, cursor interpretation/promotion eligibility, document-version creation, indexing, and audit events. Document-version/indexing repositories and Local Folder orchestration remain deferred.
+
 #### google_drive_sources
 
 - Purpose: Store Google Drive-specific configuration for approved folders.
