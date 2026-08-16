@@ -512,6 +512,20 @@ These are the next tables that can be implemented once the migration slice is ap
 - Parent limitation: `parent_source_item_key` stores one primary provider-reported parent without a foreign key. Multi-parent or graph sources may later require a dedicated relationship table.
 - Deferred behavior: this slice does not implement incremental comparison, sync outcomes, rename detection, document linkage, extraction, ACL persistence, permission filtering, repositories, services, or APIs. Local Folder rename remains delete-plus-create unless future stable identity proves continuity.
 
+#### External identities, directories, and source ACLs
+
+Platform authorization and content authorization are separate. Global platform roles control application capabilities such as tenant, connector, and user administration; they never grant document visibility. Knowledge-space grants control `platform_managed` content. A `source_acl` scope requires a complete current source ACL, while `hybrid` requires both the applicable platform grant and source ACL to allow access.
+
+`external_principals` stores case-sensitive connector-native users, groups, domains, anyone principals, and service accounts. `user_external_identity_links` stores explicit pending, verified, or revoked mappings to platform users; email similarity never creates a link automatically, and only verified links may later authorize direct-user access. Principal type validation for links remains service-enforced.
+
+`external_directory_states` retains the last completed positive directory generation while a later generation is built or fails. `external_group_memberships` supports direct and nested group edges, but future authorization must read only membership facts from the last atomically completed generation. Parent-group/member type validation, recursive cycle detection, generation promotion, and transitive closure remain service responsibilities.
+
+`source_acl_snapshots` stores immutable versioned ACL captures per source item. Only a complete snapshot with complete inheritance can be current, and promotion must atomically demote the prior current snapshot. Failed, partial, stale, building, or missing ACL data never grants access; a failed refresh leaves the last complete current snapshot intact. `source_acl_entries` stores normalized allow/deny facts against external principals. Deny and unknown permissions cannot grant read, and expiration must be checked at query time.
+
+Permission-aware retrieval is not implemented. Future retrieval must fail closed: deny when a `source_acl` or `hybrid` item lacks a complete current snapshot, deny unmapped external users, ignore incomplete directory generations, and never infer access from unknown principal or permission types. ACL entries reference principals with `RESTRICT`, so administrative purge removes ACL entries before principals; source-item and connector purge cascade their owned ACL/directory data. Optional sync attribution is cleared without deleting ACL history. Audit retention may still block tenant or actor deletion.
+
+Metadata and evidence JSON must contain only sanitized summaries. Credentials, passwords, OAuth/access/refresh tokens, cookies, secret payloads, raw provider responses, source content, chunks, vectors, and stack traces are forbidden. Provider SDKs, directory/ACL synchronization, identity linking automation, ACL inheritance resolution, snapshot promotion, permission evaluation, retrieval filters, repositories, workers, APIs, and UI remain future work.
+
 #### connector_sync_jobs
 
 Synchronization operations are persisted as `connector_sync_runs`, `connector_sync_items`, `connector_sync_errors`, and `connector_sync_cursors`. Every run belongs to exactly one tenant-safe connector scope. Runs hold operational status and nonnegative summary counters; they do not prove counter totals or all legal state transitions.

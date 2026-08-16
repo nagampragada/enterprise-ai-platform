@@ -705,6 +705,7 @@ class ConnectorSyncRun(Base):
         ForeignKeyConstraint(["organization_id", "initiated_by_user_id"], ["users.organization_id", "users.id"], name="fk_sync_runs_initiator_tenant", ondelete="SET NULL (initiated_by_user_id)"),
         UniqueConstraint("organization_id", "connector_id", "connector_scope_id", "id", name="uq_sync_runs_scope_id"),
         UniqueConstraint("organization_id", "id", name="uq_sync_runs_organization_id_id"),
+        UniqueConstraint("organization_id", "connector_id", "id", name="uq_sync_runs_org_connector_id"),
         CheckConstraint("mode IN ('initial', 'incremental', 'retry', 'reconciliation')", name="mode_valid"),
         CheckConstraint("trigger_type IN ('manual', 'scheduled', 'webhook', 'retry', 'system')", name="trigger_valid"),
         CheckConstraint("status IN ('queued', 'running', 'cancelling', 'cancelled', 'completed', 'completed_with_errors', 'failed')", name="status_valid"),
@@ -762,6 +763,10 @@ class ConnectorSyncItem(Base):
         ForeignKeyConstraint(["organization_id", "connector_id", "connector_scope_id", "sync_run_id"], ["connector_sync_runs.organization_id", "connector_sync_runs.connector_id", "connector_sync_runs.connector_scope_id", "connector_sync_runs.id"], name="fk_sync_items_run_tenant", ondelete="CASCADE"),
         ForeignKeyConstraint(["organization_id", "connector_id", "source_item_id"], ["source_items.organization_id", "source_items.connector_id", "source_items.id"], name="fk_sync_items_source_tenant", ondelete="SET NULL (source_item_id)"),
         UniqueConstraint("organization_id", "sync_run_id", "id", name="uq_sync_items_run_id"),
+        UniqueConstraint(
+            "organization_id", "connector_id", "sync_run_id", "id",
+            name="uq_sync_items_org_connector_run_id",
+        ),
         UniqueConstraint("organization_id", "sync_run_id", "source_item_key", name="uq_sync_items_run_key"),
         CheckConstraint("btrim(source_item_key) <> ''", name="key_not_blank"),
         CheckConstraint("change_type IN ('new', 'changed', 'unchanged', 'deleted', 'unknown')", name="change_type_valid"),
@@ -1154,6 +1159,231 @@ class DocumentIndexingAttempt(Base):
     retryable: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     summary: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
     summary_schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("1"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class ExternalPrincipal(Base):
+    __tablename__ = "external_principals"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_external_principals"),
+        ForeignKeyConstraint(["organization_id", "connector_id"], ["connectors.organization_id", "connectors.id"], name="fk_external_principals_connector", ondelete="CASCADE"),
+        UniqueConstraint("organization_id", "connector_id", "id", name="uq_external_principals_connector_id"),
+        UniqueConstraint("organization_id", "connector_id", "principal_key", name="uq_external_principals_connector_key"),
+        CheckConstraint("btrim(principal_key) <> ''", name="key_not_blank"),
+        CheckConstraint("principal_type IN ('user', 'group', 'domain', 'anyone', 'service_account')", name="type_valid"),
+        CheckConstraint("normalized_email IS NULL OR normalized_email = lower(btrim(normalized_email))", name="email_normalized"),
+        CheckConstraint("normalized_domain IS NULL OR normalized_domain = lower(btrim(normalized_domain))", name="domain_normalized"),
+        CheckConstraint("provider_login IS NULL OR btrim(provider_login) <> ''", name="login_not_blank"),
+        CheckConstraint("principal_type <> 'anyone' OR (normalized_email IS NULL AND normalized_domain IS NULL AND provider_login IS NULL)", name="anyone_fields_empty"),
+        CheckConstraint("principal_type <> 'domain' OR (normalized_domain IS NOT NULL AND normalized_email IS NULL)", name="domain_fields_valid"),
+        CheckConstraint("lifecycle IN ('active', 'disabled', 'deleted', 'unknown')", name="lifecycle_valid"),
+        CheckConstraint("(lifecycle = 'deleted' AND deleted_at IS NOT NULL) OR (lifecycle <> 'deleted' AND deleted_at IS NULL)", name="deletion_consistent"),
+        CheckConstraint("last_seen_at >= first_seen_at", name="seen_order_valid"),
+        CheckConstraint("jsonb_typeof(principal_metadata) = 'object'", name="metadata_object"),
+        CheckConstraint("metadata_schema_version > 0", name="metadata_version_positive"),
+        Index("ix_external_principals_org_connector_email", "organization_id", "connector_id", "normalized_email"),
+        Index("ix_external_principals_org_connector_lifecycle", "organization_id", "connector_id", "lifecycle"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    principal_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    principal_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    display_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    normalized_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    normalized_domain: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    provider_login: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    lifecycle: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'active'"))
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    provider_modified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    principal_metadata: Mapped[dict[str, object]] = mapped_column("metadata", JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    metadata_schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("1"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class UserExternalIdentityLink(Base):
+    __tablename__ = "user_external_identity_links"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_user_external_identity_links"),
+        ForeignKeyConstraint(["organization_id", "user_id"], ["users.organization_id", "users.id"], name="fk_identity_links_user_tenant", ondelete="CASCADE"),
+        ForeignKeyConstraint(["organization_id", "connector_id", "external_principal_id"], ["external_principals.organization_id", "external_principals.connector_id", "external_principals.id"], name="fk_identity_links_principal_tenant", ondelete="CASCADE"),
+        ForeignKeyConstraint(["organization_id", "created_by_user_id"], ["users.organization_id", "users.id"], name="fk_identity_links_creator_tenant", ondelete="SET NULL (created_by_user_id)"),
+        UniqueConstraint("organization_id", "user_id", "external_principal_id", name="uq_identity_links_user_principal"),
+        CheckConstraint("verification_method IN ('admin', 'sso_subject', 'verified_email', 'provider_identity')", name="method_valid"),
+        CheckConstraint("status IN ('pending', 'verified', 'revoked')", name="status_valid"),
+        CheckConstraint("(status = 'pending' AND verified_at IS NULL AND revoked_at IS NULL) OR (status = 'verified' AND verified_at IS NOT NULL AND revoked_at IS NULL) OR (status = 'revoked' AND revoked_at IS NOT NULL)", name="timestamps_match_status"),
+        CheckConstraint("evidence IS NULL OR jsonb_typeof(evidence) = 'object'", name="evidence_object"),
+        CheckConstraint("evidence_schema_version > 0", name="evidence_version_positive"),
+        Index("uq_identity_links_verified_principal", "organization_id", "external_principal_id", unique=True, postgresql_where=text("status = 'verified'")),
+        Index("ix_identity_links_org_user_verified", "organization_id", "user_id", postgresql_where=text("status = 'verified'")),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    external_principal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    verification_method: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'pending'"))
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    evidence: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
+    evidence_schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("1"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class ExternalDirectoryState(Base):
+    __tablename__ = "external_directory_states"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_external_directory_states"),
+        ForeignKeyConstraint(["organization_id", "connector_id"], ["connectors.organization_id", "connectors.id"], name="fk_directory_states_connector", ondelete="CASCADE"),
+        UniqueConstraint("organization_id", "connector_id", name="uq_directory_states_connector"),
+        CheckConstraint("status IN ('not_started', 'syncing', 'complete', 'stale', 'failed')", name="status_valid"),
+        CheckConstraint("current_generation IS NULL OR current_generation > 0", name="current_generation_positive"),
+        CheckConstraint("in_progress_generation IS NULL OR in_progress_generation > 0", name="progress_generation_positive"),
+        CheckConstraint("current_generation IS NULL OR in_progress_generation IS NULL OR in_progress_generation > current_generation", name="generation_order_valid"),
+        CheckConstraint("(error_category IS NULL AND error_code IS NULL) OR (error_category ~ '^[a-z][a-z0-9_]*$' AND error_code ~ '^[a-z][a-z0-9_]*$')", name="error_pair_valid"),
+        CheckConstraint("(status = 'not_started' AND current_generation IS NULL AND in_progress_generation IS NULL AND started_at IS NULL AND completed_at IS NULL) OR (status = 'syncing' AND in_progress_generation IS NOT NULL AND started_at IS NOT NULL) OR (status = 'complete' AND current_generation IS NOT NULL AND completed_at IS NOT NULL AND last_successful_at IS NOT NULL) OR (status = 'failed' AND error_category IS NOT NULL AND error_code IS NOT NULL) OR status = 'stale'", name="state_consistent"),
+        Index("ix_directory_states_org_connector_status", "organization_id", "connector_id", "status"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'not_started'"))
+    current_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    in_progress_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_successful_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_category: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class ExternalGroupMembership(Base):
+    __tablename__ = "external_group_memberships"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_external_group_memberships"),
+        ForeignKeyConstraint(["organization_id", "connector_id"], ["connectors.organization_id", "connectors.id"], name="fk_group_memberships_connector", ondelete="CASCADE"),
+        ForeignKeyConstraint(["organization_id", "connector_id", "group_principal_id"], ["external_principals.organization_id", "external_principals.connector_id", "external_principals.id"], name="fk_group_memberships_group_tenant", ondelete="CASCADE"),
+        ForeignKeyConstraint(["organization_id", "connector_id", "member_principal_id"], ["external_principals.organization_id", "external_principals.connector_id", "external_principals.id"], name="fk_group_memberships_member_tenant", ondelete="CASCADE"),
+        UniqueConstraint("organization_id", "connector_id", "group_principal_id", "member_principal_id", name="uq_group_memberships_edge"),
+        CheckConstraint("group_principal_id <> member_principal_id", name="not_self"),
+        CheckConstraint("first_seen_generation > 0 AND last_seen_generation > 0 AND last_seen_generation >= first_seen_generation", name="generation_valid"),
+        CheckConstraint("last_seen_at >= first_seen_at", name="seen_order_valid"),
+        CheckConstraint("lifecycle IN ('active', 'removed')", name="lifecycle_valid"),
+        CheckConstraint("(lifecycle = 'active' AND removed_at IS NULL) OR (lifecycle = 'removed' AND removed_at IS NOT NULL)", name="removal_consistent"),
+        CheckConstraint("jsonb_typeof(membership_metadata) = 'object'", name="metadata_object"),
+        CheckConstraint("metadata_schema_version > 0", name="metadata_version_positive"),
+        Index("ix_group_memberships_org_group_active", "organization_id", "group_principal_id", postgresql_where=text("lifecycle = 'active'")),
+        Index("ix_group_memberships_org_member", "organization_id", "member_principal_id", "lifecycle"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    group_principal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    member_principal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    first_seen_generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    last_seen_generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lifecycle: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'active'"))
+    is_direct: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    membership_metadata: Mapped[dict[str, object]] = mapped_column("metadata", JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    metadata_schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("1"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class SourceAclSnapshot(Base):
+    __tablename__ = "source_acl_snapshots"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_source_acl_snapshots"),
+        ForeignKeyConstraint(["organization_id", "connector_id", "source_item_id"], ["source_items.organization_id", "source_items.connector_id", "source_items.id"], name="fk_acl_snapshots_source_tenant", ondelete="CASCADE"),
+        ForeignKeyConstraint(["organization_id", "connector_id", "connector_sync_run_id"], ["connector_sync_runs.organization_id", "connector_sync_runs.connector_id", "connector_sync_runs.id"], name="fk_acl_snapshots_run_tenant", ondelete="SET NULL (connector_sync_run_id)"),
+        ForeignKeyConstraint(["organization_id", "connector_id", "connector_sync_run_id", "connector_sync_item_id"], ["connector_sync_items.organization_id", "connector_sync_items.connector_id", "connector_sync_items.sync_run_id", "connector_sync_items.id"], name="fk_acl_snapshots_item_tenant", ondelete="SET NULL (connector_sync_item_id)"),
+        UniqueConstraint("organization_id", "connector_id", "source_item_id", "id", name="uq_acl_snapshots_source_id"),
+        UniqueConstraint("organization_id", "source_item_id", "snapshot_version", name="uq_acl_snapshots_source_version"),
+        CheckConstraint("snapshot_version > 0", name="version_positive"),
+        CheckConstraint("status IN ('building', 'complete', 'failed', 'stale')", name="status_valid"),
+        CheckConstraint("entry_count >= 0", name="entry_count_nonnegative"),
+        CheckConstraint("inheritance_completeness IN ('complete', 'partial', 'unknown')", name="inheritance_valid"),
+        CheckConstraint("connector_sync_item_id IS NULL OR connector_sync_run_id IS NOT NULL", name="item_requires_run"),
+        CheckConstraint("(error_category IS NULL AND error_code IS NULL) OR (error_category ~ '^[a-z][a-z0-9_]*$' AND error_code ~ '^[a-z][a-z0-9_]*$')", name="error_pair_valid"),
+        CheckConstraint("(status = 'building' AND completed_at IS NULL AND captured_at IS NULL AND NOT is_current) OR (status = 'complete' AND completed_at IS NOT NULL AND captured_at IS NOT NULL AND error_category IS NULL AND error_code IS NULL AND inheritance_completeness = 'complete') OR (status = 'failed' AND completed_at IS NOT NULL AND error_category IS NOT NULL AND error_code IS NOT NULL AND NOT is_current) OR (status = 'stale' AND NOT is_current)", name="state_consistent"),
+        CheckConstraint("NOT is_current OR (status = 'complete' AND inheritance_completeness = 'complete')", name="current_complete_only"),
+        CheckConstraint("completed_at IS NULL OR completed_at >= started_at", name="completed_order_valid"),
+        CheckConstraint("captured_at IS NULL OR captured_at >= started_at", name="captured_order_valid"),
+        CheckConstraint("jsonb_typeof(summary) = 'object'", name="summary_object"),
+        CheckConstraint("summary_schema_version > 0", name="summary_version_positive"),
+        Index("uq_acl_snapshots_current_source", "organization_id", "source_item_id", unique=True, postgresql_where=text("is_current")),
+        Index("ix_acl_snapshots_org_source_version", "organization_id", "source_item_id", "snapshot_version"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    source_item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    snapshot_version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    connector_sync_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    connector_sync_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    source_revision: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    captured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    entry_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    inheritance_completeness: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'unknown'"))
+    error_category: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    summary: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    summary_schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("1"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class SourceAclEntry(Base):
+    __tablename__ = "source_acl_entries"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_source_acl_entries"),
+        ForeignKeyConstraint(["organization_id", "connector_id"], ["connectors.organization_id", "connectors.id"], name="fk_acl_entries_connector", ondelete="CASCADE"),
+        ForeignKeyConstraint(["organization_id", "connector_id", "source_item_id", "acl_snapshot_id"], ["source_acl_snapshots.organization_id", "source_acl_snapshots.connector_id", "source_acl_snapshots.source_item_id", "source_acl_snapshots.id"], name="fk_acl_entries_snapshot_tenant", ondelete="CASCADE"),
+        ForeignKeyConstraint(["organization_id", "connector_id", "external_principal_id"], ["external_principals.organization_id", "external_principals.connector_id", "external_principals.id"], name="fk_acl_entries_principal_tenant", ondelete="RESTRICT"),
+        CheckConstraint("provider_permission_key IS NULL OR btrim(provider_permission_key) <> ''", name="provider_key_not_blank"),
+        CheckConstraint("effect IN ('allow', 'deny')", name="effect_valid"),
+        CheckConstraint("permission_level IN ('viewer', 'commenter', 'editor', 'owner', 'unknown')", name="permission_valid"),
+        CheckConstraint("effect <> 'deny' OR NOT grants_read", name="deny_not_grant"),
+        CheckConstraint("permission_level <> 'unknown' OR NOT grants_read", name="unknown_not_grant"),
+        CheckConstraint("effect <> 'allow' OR permission_level = 'unknown' OR grants_read", name="known_allow_grants_read"),
+        CheckConstraint("inherited_from_source_item_key IS NULL OR btrim(inherited_from_source_item_key) <> ''", name="inherited_key_not_blank"),
+        CheckConstraint("jsonb_typeof(permission_metadata) = 'object'", name="metadata_object"),
+        CheckConstraint("metadata_schema_version > 0", name="metadata_version_positive"),
+        Index("uq_acl_entries_normalized", "organization_id", "acl_snapshot_id", "external_principal_id", "effect", "permission_level", "inherited", text("coalesce(provider_permission_key, '')"), text("coalesce(inherited_from_source_item_key, '')"), unique=True),
+        Index("ix_acl_entries_org_snapshot", "organization_id", "acl_snapshot_id"),
+        Index("ix_acl_entries_org_principal", "organization_id", "external_principal_id"),
+        Index("ix_acl_entries_current_readable", "organization_id", "source_item_id", "external_principal_id", postgresql_where=text("effect = 'allow' AND grants_read")),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    source_item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    acl_snapshot_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    external_principal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    provider_permission_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    effect: Mapped[str] = mapped_column(String(16), nullable=False)
+    permission_level: Mapped[str] = mapped_column(String(32), nullable=False)
+    grants_read: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    inherited: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    inherited_from_source_item_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    permission_metadata: Mapped[dict[str, object]] = mapped_column("metadata", JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    metadata_schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("1"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
