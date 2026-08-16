@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
 from domain.content_chunking.chunker import ContentChunker
-from domain.content_chunking.models import ChunkResult
+from domain.content_chunking.models import ChunkResult, ChunkingConfig
 from infrastructure.content_extraction.registry import ContentExtractorRegistry
 from infrastructure.db.models import Document, DocumentChunk
 from infrastructure.repositories.document_chunk_repository import DocumentChunkRepository
@@ -53,6 +54,14 @@ class LocalDocumentIngestionSummary:
     embedding_required: bool
 
 
+@dataclass(frozen=True)
+class LocalDocumentIngestionProfile:
+    extraction_profile: str
+    extraction_version: str
+    chunking_profile: str
+    chunking_version: str
+
+
 class LocalDocumentIngestionService:
     """Coordinates one local file through extraction, chunking, and persistence."""
 
@@ -67,6 +76,25 @@ class LocalDocumentIngestionService:
         self._content_chunker = content_chunker
         self._document_repository = document_repository
         self._document_chunk_repository = document_chunk_repository
+
+    @property
+    def profile(self) -> LocalDocumentIngestionProfile:
+        """Return deterministic identities for the configured extraction and chunking pipeline."""
+        extractor_signature = tuple(
+            (extension, type(extractor).__module__, type(extractor).__qualname__)
+            for extension, extractor in sorted(self._extractor_registry.extractors.items())
+        )
+        chunker_type = type(self._content_chunker)
+        chunking_signature = {
+            "implementation": f"{chunker_type.__module__}.{chunker_type.__qualname__}",
+            "config": ChunkingConfig().__dict__,
+        }
+        return LocalDocumentIngestionProfile(
+            extraction_profile="content_extraction",
+            extraction_version=_profile_hash(extractor_signature),
+            chunking_profile=_normalized_profile_name(chunker_type.__name__),
+            chunking_version=_profile_hash(chunking_signature),
+        )
 
     def ingest(self, request: LocalDocumentIngestionRequest) -> LocalDocumentIngestionSummary:
         _validate_request(request)
@@ -206,3 +234,13 @@ def _summary(
         chunks_replaced=chunks_replaced,
         embedding_required=True,
     )
+
+
+def _profile_hash(value: object) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _normalized_profile_name(value: str) -> str:
+    characters = [character.lower() if character.isalnum() else "_" for character in value]
+    return "".join(characters).strip("_")

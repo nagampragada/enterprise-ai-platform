@@ -7,7 +7,7 @@ from collections.abc import Iterable
 from uuid import UUID
 
 from domain.embeddings.exceptions import InvalidEmbeddingInputError, InvalidEmbeddingResultError
-from domain.embeddings.models import EmbeddingRequest, EmbeddingResult
+from domain.embeddings.models import EmbeddingProfile, EmbeddingRequest, EmbeddingResult
 from domain.embeddings.provider import EmbeddingProvider
 from domain.embeddings.validation import validate_embedding_results
 from infrastructure.db.models import DocumentChunk
@@ -46,6 +46,11 @@ class DocumentChunkEmbeddingService:
     ) -> None:
         self._embedding_provider = embedding_provider
         self._document_chunk_repository = document_chunk_repository
+
+    @property
+    def profile(self) -> EmbeddingProfile:
+        """Return the provider profile used for chunk persistence."""
+        return self._embedding_provider.profile
 
     def embed_chunks(
         self,

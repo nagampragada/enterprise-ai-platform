@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import hashlib
+import heapq
 import mimetypes
 import os
 from pathlib import Path
@@ -28,7 +29,7 @@ class LocalFolderConnector(Connector):
     organization_id: UUID
     connector_id: UUID
     root_path: Path
-    allowed_extensions: tuple[str, ...] = (".pdf", ".docx", ".txt", ".md", ".csv")
+    allowed_extensions: tuple[str, ...] = (".pdf", ".docx", ".txt", ".md", ".markdown")
 
     def __post_init__(self) -> None:
         self.root_path = self.root_path.resolve()
@@ -71,28 +72,27 @@ class LocalFolderConnector(Connector):
 
     def crawl(self, checkpoint: SyncCheckpoint | None = None) -> Iterable[SourceItem]:
         """Recursively yields supported file items from the configured root path."""
-        del checkpoint
         self.authenticate()
-
-        items: list[SourceItem] = []
-        for current_dir, _, file_names in os.walk(self.root_path, topdown=True, followlinks=False):
-            for file_name in file_names:
-                file_path = Path(current_dir) / file_name
-                try:
-                    item = self._build_source_item(file_path)
-                except (ConnectorContentError, ConnectorItemNotFoundError):
-                    continue
-                items.append(item)
-
-        items.sort(key=lambda item: item.external_id)
-        return items
+        after_key = checkpoint.cursor if checkpoint is not None else None
+        return self._iter_source_items(after_key)
 
     def fetch_item(self, external_id: str) -> SourceItem:
         """Fetches one supported file item using its root-relative external id."""
         self.authenticate()
 
-        file_path = self._resolve_external_id_to_path(external_id)
+        file_path = self.resolve_content_path(external_id)
         return self._build_source_item(file_path)
+
+    def resolve_content_path(self, external_id: str) -> Path:
+        """Return a validated regular-file path contained by the configured root."""
+        file_path = self._resolve_external_id_to_path(external_id)
+        if file_path.is_symlink():
+            raise ConnectorContentError("Symbolic links are not supported.")
+        if not file_path.exists() or not file_path.is_file():
+            raise ConnectorItemNotFoundError("Source item was not found.")
+        if file_path.suffix.lower() not in self.allowed_extensions:
+            raise ConnectorContentError("Unsupported source item extension.")
+        return file_path
 
     def fetch_permissions(self, external_id: str) -> tuple[SourcePermission, ...]:
         """Permissions are not supported for local folder sources."""
@@ -113,6 +113,8 @@ class LocalFolderConnector(Connector):
         return True
 
     def _build_source_item(self, file_path: Path) -> SourceItem:
+        if file_path.is_symlink():
+            raise ConnectorContentError("Symbolic links are not supported.")
         resolved_path = file_path.resolve()
         if not self._is_within_root(resolved_path):
             raise ConnectorContentError("File path is outside connector root path.")
@@ -171,6 +173,35 @@ class LocalFolderConnector(Connector):
         except ValueError:
             return False
         return True
+
+    def _iter_source_items(self, after_key: str | None) -> Iterable[SourceItem]:
+        pending: list[tuple[str, Path, bool]] = [("", self.root_path, True)]
+        while pending:
+            relative_key, path, is_directory = heapq.heappop(pending)
+            if is_directory:
+                try:
+                    entries = tuple(path.iterdir())
+                except OSError as exc:
+                    raise ConnectorContentError("Local folder discovery failed.") from exc
+                for entry in entries:
+                    if entry.is_symlink():
+                        continue
+                    relative_path = entry.relative_to(self.root_path).as_posix()
+                    try:
+                        entry_is_directory = entry.is_dir()
+                    except OSError as exc:
+                        raise ConnectorContentError("Local folder discovery failed.") from exc
+                    heapq.heappush(
+                        pending,
+                        (relative_path + "/" if entry_is_directory else relative_path, entry, entry_is_directory),
+                    )
+                continue
+            if after_key is not None and relative_key <= after_key:
+                continue
+            try:
+                yield self._build_source_item(path)
+            except (ConnectorContentError, ConnectorItemNotFoundError):
+                continue
 
     @staticmethod
     def _compute_sha256(file_path: Path) -> str:

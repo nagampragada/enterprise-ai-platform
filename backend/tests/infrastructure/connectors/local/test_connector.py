@@ -139,35 +139,36 @@ def test_crawl_returns_deterministic_ordering_by_relative_path(tmp_path: Path) -
     assert [item.external_id for item in items] == ["a/a.txt", "a/b.txt", "z/z.txt"]
 
 
-def test_crawl_accepts_checkpoint_without_failing(tmp_path: Path) -> None:
-    _write_file(tmp_path / "a.txt", b"x")
+def test_crawl_resumes_after_checkpoint_cursor(tmp_path: Path) -> None:
+    _write_file(tmp_path / "a.txt", b"a")
+    _write_file(tmp_path / "b.txt", b"b")
     connector = _make_connector(tmp_path)
-    checkpoint = SyncCheckpoint(cursor="next", last_synced_at=datetime.now(UTC))
+    checkpoint = SyncCheckpoint(cursor="a.txt", last_synced_at=datetime.now(UTC))
 
     items = list(connector.crawl(checkpoint=checkpoint))
 
-    assert len(items) == 1
+    assert [item.external_id for item in items] == ["b.txt"]
 
 
 def test_source_item_fields_are_correct(tmp_path: Path) -> None:
-    data = b"alpha,beta\n"
-    file_path = tmp_path / "data.csv"
+    data = b"# alpha\n"
+    file_path = tmp_path / "data.markdown"
     _write_file(file_path, data)
     connector = _make_connector(tmp_path)
 
-    item = connector.fetch_item("data.csv")
+    item = connector.fetch_item("data.markdown")
 
     assert item.organization_id == connector.organization_id
     assert item.connector_id == connector.connector_id
-    assert item.external_id == "data.csv"
+    assert item.external_id == "data.markdown"
     assert item.connector_type == ConnectorType.LOCAL_FOLDER
     assert item.item_type == SourceItemType.FILE
-    assert item.title == "data.csv"
+    assert item.title == "data.markdown"
     assert item.source_url == file_path.resolve().as_uri()
     assert item.mime_type == mimetypes.guess_type(file_path.name)[0]
     assert item.content is None
-    assert item.metadata["relative_path"] == "data.csv"
-    assert item.metadata["extension"] == ".csv"
+    assert item.metadata["relative_path"] == "data.markdown"
+    assert item.metadata["extension"] == ".markdown"
     assert item.metadata["size_bytes"] == len(data)
     assert item.permissions == ()
     assert item.checksum is not None
@@ -208,6 +209,17 @@ def test_fetch_item_returns_expected_supported_file(tmp_path: Path) -> None:
 
     assert item.external_id == "docs/notes.md"
     assert item.title == "notes.md"
+
+
+def test_resolve_content_path_returns_only_validated_contained_file(tmp_path: Path) -> None:
+    file_path = tmp_path / "docs" / "notes.md"
+    _write_file(file_path, b"# notes")
+    connector = _make_connector(tmp_path)
+
+    assert connector.resolve_content_path("docs/notes.md") == file_path.resolve()
+
+    with pytest.raises(ConnectorContentError):
+        connector.resolve_content_path("../outside.md")
 
 
 def test_fetch_item_rejects_missing_file(tmp_path: Path) -> None:

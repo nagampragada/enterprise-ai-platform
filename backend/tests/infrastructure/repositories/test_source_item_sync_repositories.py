@@ -6,7 +6,7 @@ from uuid import uuid4
 import pytest
 from infrastructure.db.models import SourceItem, SourceItemScopeMembership, ConnectorSyncRun, ConnectorSyncItem
 from infrastructure.repositories.connector_repository import InvalidConnectorRepositoryRequest
-from infrastructure.repositories.source_item_repository import SourceItemRepository, SourceItemPageCursor
+from infrastructure.repositories.source_item_repository import MembershipReconciliationCursor, SourceItemRepository, SourceItemPageCursor
 from infrastructure.repositories.connector_sync_repository import ConnectorSyncRepository, SafeSyncError, SyncPageCursor
 NOW=datetime(2026,8,24,tzinfo=timezone.utc)
 
@@ -39,6 +39,19 @@ def test_source_page_immutable_limit_plus_one_and_no_patch():
 
 def test_membership_validation_and_methods_never_commit():
     session=Mock();repo=SourceItemRepository(session);org,connector=uuid4(),uuid4();membership=_membership(org,connector);repo.add_membership(org,connector,membership);repo.remove_membership(org,connector,membership.connector_scope_id,membership.source_item_id,NOW);repo.reactivate_membership(org,connector,membership.connector_scope_id,membership.source_item_id,NOW);session.commit.assert_not_called();session.rollback.assert_not_called()
+
+def test_membership_reconciliation_page_is_bounded_immutable_and_tenant_scoped():
+    org,connector,scope=uuid4(),uuid4(),uuid4();memberships=[_membership(org,connector) for _ in range(3)]
+    for membership in memberships:membership.connector_scope_id=scope;membership.last_seen_at=NOW
+    session=Mock();session.execute.return_value.scalars.return_value.all.return_value=memberships;page=SourceItemRepository(session).list_active_memberships_before(org,connector,scope,NOW,limit=2)
+    statement=session.execute.call_args.args[0];sql=str(statement).upper();assert page.has_more and len(page.items)==2 and statement._limit_clause.value==3;assert "ORGANIZATION_ID" in sql and "CONNECTOR_ID" in sql and "CONNECTOR_SCOPE_ID" in sql and "LAST_SEEN_AT" in sql
+    with pytest.raises(FrozenInstanceError):page.next_cursor=MembershipReconciliationCursor(NOW,uuid4()) # type: ignore[misc]
+
+def test_membership_reconciliation_validation_and_active_existence():
+    org,connector,scope,source=uuid4(),uuid4(),uuid4(),uuid4();session=Mock();repo=SourceItemRepository(session)
+    for args,kwargs in ((("bad",connector,scope,NOW),{}),((org,connector,scope,datetime.now()),{}),((org,connector,scope,NOW),{"limit":True}),((org,connector,scope,NOW),{"cursor":MembershipReconciliationCursor(NOW,"bad")})):
+        with pytest.raises(InvalidConnectorRepositoryRequest):repo.list_active_memberships_before(*args,**kwargs)
+    session.execute.assert_not_called();session.execute.return_value.scalar_one_or_none.return_value=uuid4();assert repo.has_active_membership(org,connector,source)
 
 def test_sync_validation_locks_counters_and_pages():
     session=Mock();repo=ConnectorSyncRepository(session);org,connector,scope=uuid4(),uuid4(),uuid4();run=_run(org,connector,scope);repo.add_run(org,connector,scope,run)

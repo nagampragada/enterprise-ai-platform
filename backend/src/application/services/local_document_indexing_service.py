@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 from pathlib import Path
 from uuid import UUID
 
@@ -44,6 +46,18 @@ class LocalDocumentIndexingSummary:
     embedded_chunk_ids: tuple[UUID, ...]
 
 
+@dataclass(frozen=True)
+class LocalDocumentIndexingProfile:
+    extraction_profile: str
+    extraction_version: str
+    chunking_profile: str
+    chunking_version: str
+    embedding_provider: str
+    embedding_model: str
+    embedding_dimensions: int
+    fingerprint: str
+
+
 class LocalDocumentIndexingService:
     """Coordinate local ingestion, complete paginated retrieval, and embedding."""
 
@@ -56,6 +70,25 @@ class LocalDocumentIndexingService:
         self._ingestion_service = ingestion_service
         self._chunk_repository = chunk_repository
         self._embedding_service = embedding_service
+
+    @property
+    def profile(self) -> LocalDocumentIndexingProfile:
+        """Return the deterministic persisted identity of this indexing pipeline."""
+        ingestion = self._ingestion_service.profile
+        embedding = self._embedding_service.profile
+        values = {
+            "extraction_profile": ingestion.extraction_profile,
+            "extraction_version": ingestion.extraction_version,
+            "chunking_profile": ingestion.chunking_profile,
+            "chunking_version": ingestion.chunking_version,
+            "embedding_provider": embedding.provider_name,
+            "embedding_model": embedding.model_identifier,
+            "embedding_dimensions": embedding.dimension,
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(values, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return LocalDocumentIndexingProfile(**values, fingerprint=fingerprint)
 
     def index(
         self,

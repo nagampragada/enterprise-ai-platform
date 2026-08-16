@@ -29,6 +29,18 @@ class SourceItemPage:
     has_more: bool
     next_cursor: SourceItemPageCursor | None
 
+@dataclass(frozen=True)
+class MembershipReconciliationCursor:
+    last_seen_at: datetime
+    membership_id: UUID
+
+@dataclass(frozen=True)
+class MembershipReconciliationPage:
+    items: tuple[SourceItemScopeMembership, ...]
+    limit: int
+    has_more: bool
+    next_cursor: MembershipReconciliationCursor | None
+
 class SourceItemRepository:
     def __init__(self, session: Session) -> None: self._session = session
 
@@ -89,6 +101,17 @@ class SourceItemRepository:
     def remove_membership(self, organization_id: UUID, connector_id: UUID, scope_id: UUID, source_item_id: UUID, removed_at: datetime) -> SourceItemScopeMembership | None:
         _require_aware("removed_at", removed_at); return self._membership_update(organization_id, connector_id, scope_id, source_item_id, status="removed", removed_at=removed_at, last_seen_at=removed_at)
 
+    def list_active_memberships_before(self, organization_id: UUID, connector_id: UUID, scope_id: UUID, cutoff: datetime, *, limit: int = 100, cursor: MembershipReconciliationCursor | None = None) -> MembershipReconciliationPage:
+        _require_uuid("organization_id", organization_id); _require_uuid("connector_id", connector_id); _require_uuid("scope_id", scope_id); _require_aware("cutoff", cutoff); _require_limit(limit); _validate_membership_cursor(cursor)
+        statement = select(SourceItemScopeMembership).where(SourceItemScopeMembership.organization_id == organization_id, SourceItemScopeMembership.connector_id == connector_id, SourceItemScopeMembership.connector_scope_id == scope_id, SourceItemScopeMembership.status == "active", SourceItemScopeMembership.last_seen_at < cutoff)
+        if cursor is not None: statement = statement.where(or_(SourceItemScopeMembership.last_seen_at > cursor.last_seen_at, and_(SourceItemScopeMembership.last_seen_at == cursor.last_seen_at, SourceItemScopeMembership.id > cursor.membership_id)))
+        rows = self._all(statement.order_by(SourceItemScopeMembership.last_seen_at, SourceItemScopeMembership.id).limit(limit + 1)); items = tuple(rows[:limit]); more = len(rows) > limit; next_cursor = MembershipReconciliationCursor(items[-1].last_seen_at, items[-1].id) if more and items else None; return MembershipReconciliationPage(items, limit, more, next_cursor)
+
+    def has_active_membership(self, organization_id: UUID, connector_id: UUID, source_item_id: UUID) -> bool:
+        _require_uuid("organization_id", organization_id); _require_uuid("connector_id", connector_id); _require_uuid("source_item_id", source_item_id)
+        statement = select(SourceItemScopeMembership.id).where(SourceItemScopeMembership.organization_id == organization_id, SourceItemScopeMembership.connector_id == connector_id, SourceItemScopeMembership.source_item_id == source_item_id, SourceItemScopeMembership.status == "active").limit(1)
+        return self._one(statement) is not None
+
     def _item_query(self, org, connector):
         _require_uuid("organization_id", org); _require_uuid("connector_id", connector); return select(SourceItem).where(SourceItem.organization_id == org, SourceItem.connector_id == connector)
     def _membership_query(self, org, connector, scope, item):
@@ -122,6 +145,10 @@ def _validate_cursor(cursor):
     if cursor is None:return
     if not isinstance(cursor,SourceItemPageCursor):raise InvalidConnectorRepositoryRequest("cursor is invalid")
     _require_aware("cursor.created_at",cursor.created_at);_require_uuid("cursor.source_item_id",cursor.source_item_id)
+def _validate_membership_cursor(cursor):
+    if cursor is None:return
+    if not isinstance(cursor,MembershipReconciliationCursor):raise InvalidConnectorRepositoryRequest("cursor is invalid")
+    _require_aware("cursor.last_seen_at",cursor.last_seen_at);_require_uuid("cursor.membership_id",cursor.membership_id)
 def _validate_item(org,connector,item):
     if not isinstance(item,SourceItem) or item.organization_id!=org or item.connector_id!=connector:raise InvalidConnectorRepositoryRequest("source item context is invalid")
     _require_key(item.source_item_key);_require_code("source_item_type",item.source_item_type);_require_choice("status",item.status,SOURCE_STATUSES);_require_json_object("source_metadata",item.source_metadata);_require_positive_integer("metadata_schema_version",item.metadata_schema_version);_require_aware("first_seen_at",item.first_seen_at);_require_aware("last_seen_at",item.last_seen_at)
