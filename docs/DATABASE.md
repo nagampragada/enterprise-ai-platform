@@ -526,6 +526,20 @@ Permission-aware retrieval is not implemented. Future retrieval must fail closed
 
 Metadata and evidence JSON must contain only sanitized summaries. Credentials, passwords, OAuth/access/refresh tokens, cookies, secret payloads, raw provider responses, source content, chunks, vectors, and stack traces are forbidden. Provider SDKs, directory/ACL synchronization, identity linking automation, ACL inheritance resolution, snapshot promotion, permission evaluation, retrieval filters, repositories, workers, APIs, and UI remain future work.
 
+#### Permission-aware chunk retrieval
+
+`PermissionAwareDocumentChunkSearchRepository` performs connector chunk authorization inside one PostgreSQL statement before cosine-distance ranking and limiting. Platform roles do not grant content. Platform access is the union of valid organization, active department-membership, active team-membership, and direct-user knowledge-space grants.
+
+Scope formulas are exact: `platform_managed = platform grant`; `source_acl = source allow AND NOT source deny`; `hybrid = platform grant AND source allow AND NOT source deny`. Deny is scope-local, so an independent valid platform-managed scope may still authorize the same source item. Duplicate scope, grant, identity, and group paths are collapsed before chunk ranking.
+
+Source ACL matching requires a verified active external-user link for direct-user/domain access. Group access uses a bounded, cycle-safe recursive PostgreSQL CTE and only edges valid for the connector's last completed directory generation. Domain matching uses the verified external principal email, never the platform user's unverified email. Anyone access still requires a current complete snapshot.
+
+Missing, building, partial, failed, stale, or noncurrent snapshots deny. Unknown or expired permissions, `grants_read=false`, removed memberships, inactive resources, stale indexing states, wrong-model or missing embeddings, and matching denies also deny. Failed replacement snapshots do not invalidate a previous complete snapshot that remains current.
+
+The authorized relation joins active source-scope membership through the current available source version, one-to-one document materialization, successfully indexed model profile, and matching embedded chunks before distance is calculated. Existing manual uploads have no connector scope/materialization authorization path and are excluded without changing their current ingestion API behavior. No search/chat API, reranker, LLM integration, or cache is implemented.
+
+Performance follow-up: pgvector is enabled, but the current chunk schema has no vector index. PostgreSQL therefore scans the already-authorized candidate relation for cosine ranking. Future query-plan tuning or a vector index must preserve the same authorization-before-ranking relation.
+
 #### connector_sync_jobs
 
 Synchronization operations are persisted as `connector_sync_runs`, `connector_sync_items`, `connector_sync_errors`, and `connector_sync_cursors`. Every run belongs to exactly one tenant-safe connector scope. Runs hold operational status and nonnegative summary counters; they do not prove counter totals or all legal state transitions.
