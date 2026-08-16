@@ -503,6 +503,14 @@ These are the next tables that can be implemented once the migration slice is ap
 - Service invariants: an active scope must reference an active connector and active knowledge space. `source_acl` and `hybrid` require connector `acl_support = complete`. These cross-row rules cannot be safely expressed as ordinary checks and must be enforced by a future connector service.
 - Safe configuration: `safe_config` contains only non-secret scope selection data. Provider-specific service validation must reject secret payloads before persistence.
 
+#### Connector repositories
+
+`ConnectorRepository` and `ConnectorScopeRepository` provide tenant-scoped add, lookup, row-lock, bounded keyset-page, and controlled configuration/lifecycle persistence. Every query and mutation requires `organization_id`; cross-tenant lookups and locks return the same not-found result as absent rows. List operations use stable ascending `(created_at, id)` cursors, `limit + 1`, no offsets, and no total-count query.
+
+Repositories use injected SQLAlchemy sessions and may flush new rows for immediate constraint/default visibility, but they never create sessions, commit, roll back, retry, or call providers. The caller owns transaction completion, allowing connector and scope creation to be atomic. Persistence failures are translated to generic repository errors without exposing SQL, database locations, configuration, paths, or secret references.
+
+Only committed safe JSON configuration and external secret references are persisted. Provider-specific configuration schemas, secret-manager existence, credential validation, connector capability/scope compatibility, active connector/knowledge-space requirements, ACL-support requirements for `source_acl`/`hybrid`, lifecycle transition graphs, audit events, management authorization, and synchronization startup remain application-service responsibilities. Moving a scope between organizations, connectors, or knowledge spaces is intentionally not exposed as a generic repository update.
+
 #### source_items and source_item_scope_memberships
 
 - Canonical identity: a source item is the connector-native object identified case-sensitively by `(organization_id, connector_id, source_item_key)`. It is not yet an indexed document, and scope ID is deliberately excluded from identity.
