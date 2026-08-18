@@ -22,6 +22,7 @@ from infrastructure.db.models import ConnectorSyncRun
 from infrastructure.repositories.connector_sync_job_repository import (
     ConnectorSyncJobRepository,
     EnqueueResult,
+    SyncJobAttemptState,
     SyncJobHistoryItem,
     SyncJobLease,
 )
@@ -105,6 +106,20 @@ class ConnectorSyncExecutionService:
             lease,
             worker_id=worker_id,
             lease_duration=lease_duration,
+            now=self._now(),
+        )
+
+    def validate_attempt(
+        self,
+        lease: SyncJobLease,
+        sync_run_id: UUID,
+        *,
+        worker_id: str,
+    ) -> SyncJobAttemptState:
+        return self._repository.validate_attempt(
+            lease,
+            sync_run_id,
+            worker_id=worker_id,
             now=self._now(),
         )
 

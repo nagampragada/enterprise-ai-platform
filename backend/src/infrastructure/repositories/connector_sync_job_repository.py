@@ -147,6 +147,17 @@ class ExpiredSyncJobLease:
     cancellation_requested: bool
 
 
+@dataclass(frozen=True)
+class SyncJobAttemptState:
+    organization_id: UUID
+    job_id: UUID
+    connector_id: UUID
+    connector_scope_id: UUID
+    sync_run_id: UUID
+    attempt_number: int
+    cancellation_requested: bool
+
+
 class ConnectorSyncJobRepository:
     def __init__(
         self,
@@ -316,6 +327,53 @@ class ConnectorSyncJobRepository:
         if row is None:
             self._raise_lost_lease(lease, worker_id, cancellation=True)
         return _lease(row)
+
+    def validate_attempt(
+        self,
+        lease: SyncJobLease,
+        sync_run_id: UUID,
+        *,
+        worker_id: str,
+        now: datetime,
+    ) -> SyncJobAttemptState:
+        lease = _valid_lease(lease)
+        sync_run_id = _uuid("sync_run_id", sync_run_id)
+        worker_id = _worker_id(worker_id)
+        now = _aware("now", now)
+        statement = (
+            select(ConnectorSyncJob, ConnectorSyncRun.id)
+            .join(
+                ConnectorSyncRun,
+                and_(
+                    ConnectorSyncRun.organization_id == ConnectorSyncJob.organization_id,
+                    ConnectorSyncRun.connector_id == ConnectorSyncJob.connector_id,
+                    ConnectorSyncRun.connector_scope_id == ConnectorSyncJob.connector_scope_id,
+                    ConnectorSyncRun.sync_job_id == ConnectorSyncJob.id,
+                    ConnectorSyncRun.job_attempt_number == ConnectorSyncJob.attempt_count,
+                ),
+            )
+            .where(
+                *_ownership_predicates(lease, worker_id, now),
+                ConnectorSyncRun.id == sync_run_id,
+                ConnectorSyncRun.status == "running",
+            )
+        )
+        try:
+            row = self._session.execute(statement).one_or_none()
+        except SQLAlchemyError as exc:
+            raise SyncJobPersistenceError("synchronization attempt could not be validated") from exc
+        if row is None:
+            self._raise_lost_lease(lease, worker_id)
+        job, run_id = row
+        return SyncJobAttemptState(
+            job.organization_id,
+            job.id,
+            job.connector_id,
+            job.connector_scope_id,
+            run_id,
+            job.attempt_count,
+            job.cancel_requested_at is not None,
+        )
 
     def request_cancellation(
         self,
@@ -725,7 +783,19 @@ class ConnectorSyncJobRepository:
             result = self._session.execute(statement)
         except SQLAlchemyError as exc:
             raise SyncJobPersistenceError("synchronization attempt history could not be finalized") from exc
-        if result.rowcount != 1:
+        if result.rowcount == 1:
+            return
+        try:
+            existing_status = self._session.execute(
+                select(ConnectorSyncRun.status).where(
+                    ConnectorSyncRun.organization_id == lease.organization_id,
+                    ConnectorSyncRun.sync_job_id == lease.job_id,
+                    ConnectorSyncRun.job_attempt_number == lease.attempt_number,
+                )
+            ).scalar_one_or_none()
+        except SQLAlchemyError as exc:
+            raise SyncJobPersistenceError("synchronization attempt history could not be verified") from exc
+        if existing_status != status:
             raise SyncJobPersistenceError("synchronization attempt history could not be finalized")
 
     def _raise_lost_lease(

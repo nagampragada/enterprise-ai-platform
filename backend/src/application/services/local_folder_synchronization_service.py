@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from itertools import islice
 from pathlib import Path
+from typing import Callable
 from uuid import UUID, uuid4
 
 from application.services.document_chunk_embedding_service import DocumentChunkEmbeddingPersistenceError
@@ -153,6 +154,8 @@ class LocalFolderSynchronizationService:
         version_repository: DocumentVersionRepository,
         indexing_repository: DocumentIndexingRepository,
         indexing_service: LocalDocumentIndexingService,
+        *,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._connectors = connector_repository
         self._scopes = scope_repository
@@ -161,10 +164,11 @@ class LocalFolderSynchronizationService:
         self._versions = version_repository
         self._indexing = indexing_repository
         self._indexing_service = indexing_service
+        self._clock = clock
 
     def synchronize(self, request: LocalFolderSynchronizationRequest) -> LocalFolderSynchronizationResult:
         _validate_request(request)
-        now = datetime.now(UTC)
+        now = self._now()
         connector = self._connectors.lock_by_id(request.organization_id, request.connector_id)
         scope = self._scopes.lock_by_id(request.organization_id, request.connector_scope_id)
         root = _validate_configuration(connector, scope, request)
@@ -433,7 +437,7 @@ class LocalFolderSynchronizationService:
             )
             if indexed.content_checksum != discovered.checksum:
                 raise InvalidDocumentIndexingRequestError("source content changed during indexing")
-            completed_at = datetime.now(UTC)
+            completed_at = self._now()
             self._indexing.complete_attempt(
                 request.organization_id,
                 state.id,
@@ -744,7 +748,7 @@ class LocalFolderSynchronizationService:
         state: DocumentIndexingState | None,
         attempt: DocumentIndexingAttempt | None,
     ) -> None:
-        completed_at = datetime.now(UTC)
+        completed_at = self._now()
         if state is not None and attempt is not None:
             self._indexing.complete_attempt(
                 request.organization_id,
@@ -828,6 +832,14 @@ class LocalFolderSynchronizationService:
             finished_at=observed_at,
             error_summary="Local Folder synchronization failed",
         )
+
+    def _now(self) -> datetime:
+        value = self._clock()
+        if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+            raise InvalidLocalFolderSynchronizationRequest(
+                "synchronization clock must return a timezone-aware datetime"
+            )
+        return value
 
 
 def _validate_request(request: LocalFolderSynchronizationRequest) -> None:
