@@ -694,6 +694,209 @@ class SourceItemScopeMembership(Base):
     )
 
 
+class ConnectorSyncJob(Base):
+    __tablename__ = "connector_sync_jobs"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_connector_sync_jobs"),
+        ForeignKeyConstraint(
+            ["organization_id"], ["organizations.id"],
+            name="fk_sync_jobs_organization", ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "connector_id"],
+            ["connectors.organization_id", "connectors.id"],
+            name="fk_sync_jobs_connector_tenant", ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "connector_id", "connector_scope_id"],
+            ["connector_scopes.organization_id", "connector_scopes.connector_id", "connector_scopes.id"],
+            name="fk_sync_jobs_scope_tenant", ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "requested_by_user_id"],
+            ["users.organization_id", "users.id"],
+            name="fk_sync_jobs_requester_tenant", ondelete="SET NULL (requested_by_user_id)",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "cancel_requested_by_user_id"],
+            ["users.organization_id", "users.id"],
+            name="fk_sync_jobs_cancel_requester_tenant",
+            ondelete="SET NULL (cancel_requested_by_user_id)",
+        ),
+        UniqueConstraint("organization_id", "id", name="uq_sync_jobs_organization_id_id"),
+        UniqueConstraint(
+            "organization_id", "connector_id", "connector_scope_id", "id",
+            name="uq_sync_jobs_scope_id",
+        ),
+        UniqueConstraint("lease_id", name="uq_sync_jobs_lease_id"),
+        CheckConstraint(
+            "mode IN ('initial', 'incremental', 'reconciliation')", name="mode_valid"
+        ),
+        CheckConstraint(
+            "trigger_type IN ('manual', 'scheduled', 'webhook', 'system')", name="trigger_valid"
+        ),
+        CheckConstraint(
+            "status IN ('queued', 'running', 'retry_wait', 'succeeded', 'failed', 'cancelled')",
+            name="status_valid",
+        ),
+        CheckConstraint("attempt_count >= 0", name="attempt_count_nonnegative"),
+        CheckConstraint("max_attempts > 0", name="max_attempts_positive"),
+        CheckConstraint("attempt_count <= max_attempts", name="attempt_count_within_max"),
+        CheckConstraint("fencing_token >= 0", name="fencing_token_nonnegative"),
+        CheckConstraint("fencing_token = attempt_count", name="fencing_matches_attempt_count"),
+        CheckConstraint(
+            "(status IN ('queued', 'retry_wait') AND next_attempt_at IS NOT NULL) OR "
+            "(status NOT IN ('queued', 'retry_wait') AND next_attempt_at IS NULL)",
+            name="availability_matches_status",
+        ),
+        CheckConstraint(
+            "status <> 'retry_wait' OR (attempt_count > 0 AND attempt_count < max_attempts)",
+            name="retry_attempt_available",
+        ),
+        CheckConstraint(
+            "status <> 'running' OR attempt_count > 0", name="running_attempt_positive"
+        ),
+        CheckConstraint(
+            "status NOT IN ('succeeded', 'failed') OR attempt_count > 0",
+            name="executed_terminal_attempt_positive",
+        ),
+        CheckConstraint(
+            "(status IN ('queued', 'running', 'retry_wait') AND completed_at IS NULL) OR "
+            "(status IN ('succeeded', 'failed', 'cancelled') AND completed_at IS NOT NULL)",
+            name="completion_matches_status",
+        ),
+        CheckConstraint(
+            "(status = 'running' AND lease_owner IS NOT NULL AND lease_id IS NOT NULL "
+            "AND lease_acquired_at IS NOT NULL AND lease_expires_at IS NOT NULL "
+            "AND heartbeat_at IS NOT NULL AND fencing_token > 0) OR "
+            "(status <> 'running' AND lease_owner IS NULL AND lease_id IS NULL "
+            "AND lease_acquired_at IS NULL AND lease_expires_at IS NULL AND heartbeat_at IS NULL)",
+            name="lease_matches_status",
+        ),
+        CheckConstraint(
+            "lease_owner IS NULL OR btrim(lease_owner) <> ''", name="lease_owner_not_blank"
+        ),
+        CheckConstraint(
+            "lease_expires_at IS NULL OR lease_expires_at > lease_acquired_at",
+            name="lease_expiry_after_acquired",
+        ),
+        CheckConstraint(
+            "heartbeat_at IS NULL OR heartbeat_at >= lease_acquired_at",
+            name="heartbeat_after_acquired",
+        ),
+        CheckConstraint(
+            "heartbeat_at IS NULL OR heartbeat_at < lease_expires_at",
+            name="heartbeat_before_expiry",
+        ),
+        CheckConstraint(
+            "cancel_requested_by_user_id IS NULL OR cancel_requested_at IS NOT NULL",
+            name="cancel_requester_requires_request",
+        ),
+        CheckConstraint(
+            "cancel_reason_code IS NULL OR cancel_requested_at IS NOT NULL",
+            name="cancel_reason_requires_request",
+        ),
+        CheckConstraint(
+            "cancel_reason_code IS NULL OR cancel_reason_code ~ '^[a-z][a-z0-9_]*$'",
+            name="cancel_reason_code_valid",
+        ),
+        CheckConstraint(
+            "status <> 'cancelled' OR cancel_requested_at IS NOT NULL",
+            name="cancelled_requires_request",
+        ),
+        CheckConstraint(
+            "cancel_requested_at IS NULL OR cancel_requested_at >= created_at",
+            name="cancel_request_after_created",
+        ),
+        CheckConstraint(
+            "completed_at IS NULL OR completed_at >= created_at", name="completion_after_created"
+        ),
+        CheckConstraint(
+            "cancel_requested_at IS NULL OR completed_at IS NULL OR completed_at >= cancel_requested_at",
+            name="completion_after_cancel_request",
+        ),
+        CheckConstraint(
+            "(last_error_category IS NULL AND last_error_code IS NULL AND last_error_summary IS NULL) OR "
+            "(last_error_category IS NOT NULL AND last_error_code IS NOT NULL)",
+            name="last_error_fields_consistent",
+        ),
+        CheckConstraint(
+            "last_error_category IS NULL OR last_error_category IN "
+            "('configuration', 'authentication', 'authorization', 'rate_limit', 'source_read', "
+            "'extraction', 'persistence', 'embedding', 'permission', 'internal')",
+            name="last_error_category_valid",
+        ),
+        CheckConstraint(
+            "last_error_code IS NULL OR last_error_code ~ '^[a-z][a-z0-9_]*$'",
+            name="last_error_code_valid",
+        ),
+        CheckConstraint(
+            "last_error_summary IS NULL OR btrim(last_error_summary) <> ''",
+            name="last_error_summary_not_blank",
+        ),
+        Index(
+            "uq_sync_jobs_org_scope_nonterminal",
+            "organization_id", "connector_scope_id",
+            unique=True,
+            postgresql_where=text("status IN ('queued', 'running', 'retry_wait')"),
+        ),
+        Index(
+            "ix_sync_jobs_ready",
+            "status", "priority", "next_attempt_at", "created_at", "id",
+        ),
+        Index(
+            "ix_sync_jobs_expired_leases", "status", "lease_expires_at",
+            postgresql_where=text("status = 'running'"),
+        ),
+        Index(
+            "ix_sync_jobs_cancellation_requests", "status", "cancel_requested_at",
+            postgresql_where=text("cancel_requested_at IS NOT NULL AND completed_at IS NULL"),
+        ),
+        Index(
+            "ix_sync_jobs_org_scope_created",
+            "organization_id", "connector_scope_id", "created_at", "id",
+        ),
+        Index(
+            "ix_sync_jobs_org_connector_created",
+            "organization_id", "connector_id", "created_at", "id",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_scope_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    mode: Mapped[str] = mapped_column(String(32), nullable=False)
+    trigger_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'queued'"))
+    requested_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    priority: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("100"))
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("3"))
+    next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, server_default=func.now()
+    )
+    lease_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    lease_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    fencing_token: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    lease_acquired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancel_requested_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    cancel_reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error_category: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    last_error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_error_summary: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
 class ConnectorSyncRun(Base):
     __tablename__ = "connector_sync_runs"
     __table_args__ = (
@@ -701,11 +904,13 @@ class ConnectorSyncRun(Base):
         ForeignKeyConstraint(["organization_id"], ["organizations.id"], name="fk_sync_runs_organization", ondelete="CASCADE"),
         ForeignKeyConstraint(["organization_id", "connector_id"], ["connectors.organization_id", "connectors.id"], name="fk_sync_runs_connector_tenant", ondelete="CASCADE"),
         ForeignKeyConstraint(["organization_id", "connector_id", "connector_scope_id"], ["connector_scopes.organization_id", "connector_scopes.connector_id", "connector_scopes.id"], name="fk_sync_runs_scope_tenant", ondelete="CASCADE"),
+        ForeignKeyConstraint(["organization_id", "connector_id", "connector_scope_id", "sync_job_id"], ["connector_sync_jobs.organization_id", "connector_sync_jobs.connector_id", "connector_sync_jobs.connector_scope_id", "connector_sync_jobs.id"], name="fk_sync_runs_job_tenant", ondelete="CASCADE"),
         ForeignKeyConstraint(["organization_id", "connector_id", "connector_scope_id", "parent_run_id"], ["connector_sync_runs.organization_id", "connector_sync_runs.connector_id", "connector_sync_runs.connector_scope_id", "connector_sync_runs.id"], name="fk_sync_runs_parent_tenant", ondelete="SET NULL (parent_run_id)"),
         ForeignKeyConstraint(["organization_id", "initiated_by_user_id"], ["users.organization_id", "users.id"], name="fk_sync_runs_initiator_tenant", ondelete="SET NULL (initiated_by_user_id)"),
         UniqueConstraint("organization_id", "connector_id", "connector_scope_id", "id", name="uq_sync_runs_scope_id"),
         UniqueConstraint("organization_id", "id", name="uq_sync_runs_organization_id_id"),
         UniqueConstraint("organization_id", "connector_id", "id", name="uq_sync_runs_org_connector_id"),
+        UniqueConstraint("organization_id", "sync_job_id", "job_attempt_number", name="uq_sync_runs_job_attempt"),
         CheckConstraint("mode IN ('initial', 'incremental', 'retry', 'reconciliation')", name="mode_valid"),
         CheckConstraint("trigger_type IN ('manual', 'scheduled', 'webhook', 'retry', 'system')", name="trigger_valid"),
         CheckConstraint("status IN ('queued', 'running', 'cancelling', 'cancelled', 'completed', 'completed_with_errors', 'failed')", name="status_valid"),
@@ -723,6 +928,7 @@ class ConnectorSyncRun(Base):
         CheckConstraint("jsonb_typeof(run_metadata) = 'object'", name="metadata_object"),
         CheckConstraint("items_discovered >= 0 AND items_new >= 0 AND items_changed >= 0 AND items_unchanged >= 0 AND items_deleted >= 0 AND items_skipped >= 0 AND items_succeeded >= 0 AND items_failed >= 0", name="counters_nonnegative"),
         CheckConstraint("parent_run_id IS NULL OR parent_run_id <> id", name="parent_not_self"),
+        CheckConstraint("(sync_job_id IS NULL AND job_attempt_number IS NULL) OR (sync_job_id IS NOT NULL AND job_attempt_number IS NOT NULL AND job_attempt_number > 0)", name="job_attempt_consistent"),
         Index("ix_sync_runs_org_scope_created", "organization_id", "connector_scope_id", "created_at"),
         Index("ix_sync_runs_org_connector_status", "organization_id", "connector_id", "status"),
         Index("ix_sync_runs_org_status_created", "organization_id", "status", "created_at"),
@@ -754,6 +960,8 @@ class ConnectorSyncRun(Base):
     items_failed: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    sync_job_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    job_attempt_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class ConnectorSyncItem(Base):
