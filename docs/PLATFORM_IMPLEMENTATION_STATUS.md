@@ -39,7 +39,7 @@ This document supersedes implementation-status statements in older planning file
 |---|---|---|
 | `README.md` | Says document/chunk persistence, PDF/DOCX extraction, chunking, embeddings, pgvector retrieval, audit logging, and workflow automation are not implemented | Persistence, extraction, chunking, embeddings, audit schema, Local Folder synchronization/worker, and permission-aware retrieval repository now exist and pass tests; search/chat APIs remain absent |
 | `README.md` | Lists Redis as the caching/queue stack | Redis is not a dependency and no cache/queue implementation exists |
-| `docs/PROJECT_CONTEXT.md` | Says document persistence, PDF/DOCX, chunking, embeddings, pgvector storage, retrieval, and audit are unimplemented | Those backend layers now exist; chat, cloud connectors, management APIs, and full audit emission remain missing |
+| `docs/PROJECT_CONTEXT.md` | Says document persistence, PDF/DOCX, chunking, embeddings, pgvector storage, retrieval, and audit are unimplemented | Those backend layers and the first Local Folder management APIs now exist; chat, cloud connectors, broader management APIs, and full audit emission remain missing |
 | `docs/VISION.md` | Lists LangGraph in the intended technical foundation | This is aspirational: no LangGraph dependency, import, or runtime exists |
 | Earlier per-migration sections of `docs/DATABASE.md` | Some sections state that repositories/services/retrieval were not implemented “by this slice” | Those statements describe the historical boundary of that migration slice; later code and later sections implement repositories, retrieval, execution control, and the bounded worker |
 
@@ -56,7 +56,7 @@ The intended boundary is an organization-scoped knowledge and search platform wi
 
 Manual upload is a request-time API workflow that creates a `manual_upload` document directly. Connector synchronization is a durable operational workflow: a configured connector scope creates source items, versions, indexing attempts, and synchronization history.
 
-The current Local Folder connector reads a directory accessible to the **connector/backend host**. It does not silently access employee laptops. Regular employees do not configure arbitrary folders through the current API. Administrator authorization and connector-management APIs are not implemented. No on-premises or desktop connector agent, employee-device enrollment, or agent packaging exists.
+The current Local Folder connector reads a directory accessible to the **connector/backend host**. It does not silently access employee laptops. Regular employees cannot configure folders: the first connector-management API requires the committed `organization_admin` role in the authenticated user's active organization. No on-premises or desktop connector agent, employee-device enrollment, or agent packaging exists.
 
 ## 4. Current end-to-end architecture
 
@@ -253,7 +253,7 @@ flowchart TB
 
 Platform roles (`organization_admin`, `employee`) represent application capabilities. They are different from department responsibilities (`member`, `manager`) and team responsibilities (`member`, `lead`, `manager`, `owner`). Knowledge-space grants and source ACLs decide content visibility; a platform role does not automatically grant document access.
 
-**Gap:** current routes authenticate users but do not enforce connector-administration or other role-based permissions. There are no user/role/organization management APIs. Organization active/suspended state is persisted, but current-user resolution primarily proves active user and valid token; do not treat it as a complete tenant-policy engine.
+The connector-management routes additionally require an active organization and an active user assigned the committed `organization_admin` role in that organization. `employee`, department manager, team owner/lead/manager, and knowledge-space grant levels do not confer connector administration. There is no owner alias or cross-tenant platform administrator. Other route families do not yet have a general role/capability layer, and user/role/organization management APIs remain absent.
 
 ## 8. Organization structure
 
@@ -354,7 +354,7 @@ Operational connector implementation:
 | SQL Server | Placeholder directory only; not operational |
 | Other domain enum values (OneDrive, Slack, Jira, Confluence, GitHub, Gmail, Outlook, Dropbox, Box, S3, Azure Blob) | Contract vocabulary only |
 
-There are no connector/scope application-management services, APIs, authorization checks, secret-manager integration, or UI.
+`ConnectorManagementService` and eight authenticated API operations now support Local Folder connector creation/list/get, scope creation/list, asynchronous job enqueue, and job list/get. They are restricted to active tenant `organization_admin` users. Responses explicitly omit `safe_config`, filesystem root, secret/credential references, lease/worker data, provider payloads, and ORM state. Update/delete/archive, credential management, cancellation, secret-manager integration, cloud providers, and UI remain absent. Audit persistence exists, but no reusable audit writer exists, so connector-management audit emission remains deferred rather than implemented ad hoc.
 
 ## 14. Local Folder connector
 
@@ -379,7 +379,7 @@ Implemented behavior:
 - missing files remove only the stale scope membership; canonical availability considers other active memberships;
 - tenant, connector, and scope identity are validated.
 
-**Current operational status:** synchronization engine and bounded worker runner are implemented and tested. A continuously hosted daemon, scheduler, automatic recovery invocation, connector admin APIs, employee device enrollment, and on-prem agent packaging are not implemented.
+**Current operational status:** synchronization engine, bounded worker runner, and secure Local Folder create/read/enqueue/status APIs are implemented and tested. The HTTP enqueue operation only creates or coalesces durable work and returns `202`; it never scans the root or invokes the worker, extraction, embedding, or indexing. A continuously hosted daemon, scheduler, automatic recovery invocation, connector update/delete/cancellation/credential APIs, employee device enrollment, and on-prem agent packaging are not implemented.
 
 Current limitations include delete-plus-create rename semantics, no provider-native delta feed, no native source ACLs (`acl_support='none'`), and bounded cancellation observation rather than interruption inside one extractor/provider call.
 
@@ -530,7 +530,7 @@ Tests cover platform grants, direct/nested groups, domains, anyone, expired/revo
 
 ## 23. Current APIs
 
-Source registration verifies **8 application endpoints**. FastAPI also exposes 4 framework routes: `/openapi.json`, `/docs`, `/docs/oauth2-redirect`, and `/redoc`.
+Generated OpenAPI verifies **16 application operations across 13 paths**. FastAPI also exposes 4 framework routes: `/openapi.json`, `/docs`, `/docs/oauth2-redirect`, and `/redoc`.
 
 | Method | Route | Authentication | Purpose | Request | Response | Status |
 |---|---|---|---|---|---|---|
@@ -542,6 +542,14 @@ Source registration verifies **8 application endpoints**. FastAPI also exposes 4
 | POST | `/api/v1/auth/logout` | Bearer | Revoke one owned session | JSON session UUID | safe message | Complete |
 | POST | `/api/v1/auth/logout-all` | Bearer | Revoke all current-user sessions | None | safe message | Complete |
 | POST | `/api/v1/documents/ingest` | Bearer | Manual upload and full indexing | multipart `file` | safe indexing summary | Complete |
+| POST | `/api/v1/connectors` | Bearer + `organization_admin` | Register active Local Folder connector | strict type/name/slug; no tenant/creator/config/credentials | redacted connector | Complete |
+| GET | `/api/v1/connectors` | Bearer + `organization_admin` | Tenant connector keyset page | limit/cursor/status | redacted page | Complete |
+| GET | `/api/v1/connectors/{connector_id}` | Bearer + `organization_admin` | Tenant-safe connector detail | UUID path | redacted connector or concealed 404 | Complete |
+| POST | `/api/v1/connectors/{connector_id}/scopes` | Bearer + `organization_admin` | Create active platform-managed Local Folder scope | space/name/slug + strict Local Folder config | redacted scope | Complete |
+| GET | `/api/v1/connectors/{connector_id}/scopes` | Bearer + `organization_admin` | Connector scope keyset page | limit/cursor/status | redacted page | Complete |
+| POST | `/api/v1/connectors/{connector_id}/scopes/{scope_id}/sync-jobs` | Bearer + `organization_admin` | Enqueue/coalesce durable asynchronous work | empty optional body; execution controls forbidden | safe job + `coalesced`, HTTP 202 | Complete |
+| GET | `/api/v1/connectors/{connector_id}/scopes/{scope_id}/sync-jobs` | Bearer + `organization_admin` | Scope job-history keyset page | limit/cursor/status | redacted job page | Complete |
+| GET | `/api/v1/connectors/{connector_id}/scopes/{scope_id}/sync-jobs/{job_id}` | Bearer + `organization_admin` | Tenant-safe job detail | UUID paths | redacted job or concealed 404 | Complete |
 
 Source modules: `backend/src/app/main.py`, `backend/src/app/api/router.py`, `backend/src/app/api/v1/auth/router.py`, and `backend/src/app/api/v1/documents/router.py`.
 
@@ -549,9 +557,9 @@ Source modules: `backend/src/app/main.py`, `backend/src/app/api/router.py`, `bac
 
 | Area | Product gap |
 |---|---|
-| Connector management | Create/list/update/archive connectors; validate credentials/configuration |
-| Scope management | Configure persisted root/provider scope and knowledge-space/access mode |
-| Synchronization | Enqueue/trigger sync and manual recovery |
+| Connector management | Update/archive connectors; validation and credentials |
+| Scope management | Update/remove scopes or move content through an explicit safe workflow |
+| Synchronization | Cancellation and manual/automatic recovery invocation |
 | Cancellation | Request job cancellation |
 | Job/run operations | Current status, history, safe errors, counters |
 | Documents | List/view/delete/reprocess/version history |
@@ -581,6 +589,7 @@ All repositories and application services use caller-owned transactions unless n
 | `DocumentIndexingRepository` | Infrastructure | Profile state, generations, attempts | Worker caller | Unit/PostgreSQL tests |
 | `PermissionAwareDocumentChunkSearchRepository` | Infrastructure | Authorization-before-vector ranking | Future search service/API | Unit/PostgreSQL/query-plan tests |
 | `AuthenticationService` | Application | Login/refresh/logout flows | API | Unit/API tests |
+| `ConnectorManagementService` | Application | Admin-only Local Folder connector/scope creation, reads, enqueue, and job history | Connector API | Pure/API/PostgreSQL/concurrency tests |
 | `LocalDocumentIngestionService` | Application | Extract/chunk/document persistence | API/worker | Unit/integration tests |
 | `DocumentChunkEmbeddingService` | Application | Batch embedding and controlled persistence | API/worker | Unit/integration tests |
 | `LocalDocumentIndexingService` | Application | End-to-end local indexing coordinator | API/worker | Unit/integration tests |
@@ -599,11 +608,11 @@ Bearer authentication → tenant from current user → filename/extension/size v
 
 ### Local Folder initial synchronization
 
-Persisted active scope → durable job → bounded runner acquisition/run → deterministic discovery → canonical source/membership → immutable version → extraction/chunking/embedding → complete discovery → missing-membership reconciliation → atomic run/job success. **Missing: connector admin/enqueue API and continuous worker host.**
+Persisted active scope → authenticated admin enqueue API → durable job → bounded runner acquisition/run → deterministic discovery → canonical source/membership → immutable version → extraction/chunking/embedding → complete discovery → missing-membership reconciliation → atomic run/job success. **Missing: continuous worker host/scheduler.**
 
 ### Local Folder unchanged rerun
 
-New logical job/run → checksum comparison → completed prior source/version reused → sync item skipped → no new version or embedding call. **Missing initiating API/host.**
+New logical job requested through the API → checksum comparison → completed prior source/version reused → sync item skipped → no new version or embedding call. **Missing continuous host.**
 
 ### Local Folder changed file
 
@@ -658,7 +667,7 @@ Authenticated tenant/user input → effective platform grants/external principal
 
 ### Security and operational gaps
 
-- connector administrator authorization and APIs;
+- connector update/delete/cancellation/credential authorization and APIs beyond the implemented create/read/enqueue slice;
 - full audit emission and audit-access authorization;
 - production secret-manager integration and key rotation;
 - gateway/API rate limiting;
@@ -704,7 +713,7 @@ Required command executed at this snapshot:
 python -m pytest --import-mode=importlib -q
 ```
 
-Result: **861 passed, 1 skipped, 45 warnings; exit code 0**.
+Result: **894 passed, 1 skipped, 45 warnings; exit code 0**.
 
 Coverage categories include pure domain/unit tests, API tests, real PostgreSQL repositories, migration downgrade/re-upgrade tests, filesystem/extractor integration, deterministic fake embeddings, concurrent enqueue/acquisition/recovery/version allocation, rollback/pre-commit failure, tenant isolation, ACL authorization, permission-aware retrieval, query-plan/index availability, and worker session cleanup.
 
@@ -757,9 +766,11 @@ Never display or request: password hashes, refresh-token hashes, connector secre
 | Sign in | Supported by existing API | Login, refresh, current user, logout APIs exist |
 | Manual upload | Supported by existing API | Upload and response only; no library navigation |
 | Organization/admin overview | Backend data exists; API missing | Role authorization also missing |
-| Connector list/add/edit | Backend exists; API missing | Must enforce administrator capability |
-| Connector scope configuration | Backend exists; API missing | Knowledge space/access mode/root/provider scope concepts |
-| Synchronization history/status | Backend exists; API missing | Present job, run, item, safe error, cancellation states |
+| Connector list/add | Supported by existing API | Active Local Folder only; responses redact config/root/secrets |
+| Connector edit/delete/credentials | Not implemented | Requires explicit lifecycle and secret-management design |
+| Connector scope create/list | Supported by existing API | Active `platform_managed` Local Folder scope; root is write-only |
+| Synchronization history/status | Supported by existing API | Job-level safe status/history; run/item/error APIs remain missing |
+| Synchronization cancellation | Backend operation exists; API missing | Must preserve cooperative cancellation semantics |
 | Knowledge spaces/grants | Schema/retrieval exists; management API missing | Platform grants complement source ACLs |
 | Departments/teams/users | Schema/auth user exists; management API missing | Responsibilities are not platform roles |
 | Document library | Backend data exists; API missing | Upload alone exists |
@@ -773,7 +784,7 @@ Never display or request: password hashes, refresh-token hashes, connector secre
 |---|---|
 | Continuous worker daemon/host | Backend runner exists; host deferred |
 | Scheduler and automatic expired-job recovery invocation | Deferred |
-| Connector administration APIs and authorization enforcement | Primary product gap |
+| Connector administration API breadth | Create/read/enqueue/status implemented; update/delete/cancel/credentials/audit remain gaps |
 | Connector UI / any functional frontend | Not implemented |
 | Search API | Backend repository exists; API absent |
 | Chat/answer generation and citation rendering API | Not implemented |
@@ -801,10 +812,10 @@ The current architecture supports this order because the data plane is stronger 
 | # | Item | Purpose, dependencies, deliverable | Recommended model | Manual credentials/business decisions |
 |---:|---|---|---|---|
 | 1 | Continuous bounded worker host + recovery invocation | Host existing runner; graceful shutdown/readiness; bounded job/recovery cadence | GPT-5.6 Sol, high | Deployment/runtime policy required |
-| 2 | Connector admin authorization | Enforce `organization_admin` capability before management operations | GPT-5.6 Sol, high | Role policy and delegation decisions required |
-| 3 | Connector/scope application services | Validate capabilities, config, space/access mode, lifecycle, audit intent | GPT-5.6 Sol, high | Local Folder deployment policy required |
-| 4 | Authenticated connector APIs | CRUD, enqueue, cancel, job/run/status with safe DTOs/OpenAPI | GPT-5.6 Sol, high | API ownership and retention decisions |
-| 5 | End-to-end admin workflow | Bootstrap/configure/sync/observe/cancel/recover acceptance flow | GPT-5.6 Sol, high | Operator runbook decisions |
+| 2 | Complete connector lifecycle APIs | Add update/archive/remove/cancel with narrow state transitions and audit emission | GPT-5.6 Sol, high | Retention and delegation decisions required |
+| 3 | Credential and validation services | Integrate secret manager and provider-neutral validation without exposing secrets | GPT-5.6 Sol, high | Secret platform and Local Folder deployment policy required |
+| 4 | End-to-end admin workflow | Bootstrap/configure/sync/observe/cancel/recover acceptance flow | GPT-5.6 Sol, high | Operator runbook decisions |
+| 5 | Job/run/item/error operation APIs | Add safe detailed operational views and recovery controls | GPT-5.6 Sol, high | Error retention and operator authorization decisions |
 | 6 | Minimal admin UI | Sign-in, connectors, scopes, sync history, upload | GPT-5.6 Luna, medium | Product design/branding required |
 | 7 | Search service and API | Server-side query embedding + existing authorized repository | GPT-5.6 Sol, high | Provider credentials and result contract |
 | 8 | Grounded answers/citations | Answer generation, citation evidence, refusal/guardrails | GPT-5.6 Sol, high | Model/provider, safety, prompt policy decisions |
@@ -843,7 +854,8 @@ The current architecture supports this order because the data plane is stronger 
 
 - [ ] Continuous worker/recovery host
 - [ ] Administrator authorization policy
-- [ ] Connector/scope/job application APIs
+- [x] First Local Folder connector/scope/job create/read/enqueue APIs
+- [ ] Connector update/delete/cancel/credential and detailed run/item/error APIs
 - [ ] Minimal administrator UI
 - [ ] Search service/API with server-side query embedding
 - [ ] Audit emission and operational observability

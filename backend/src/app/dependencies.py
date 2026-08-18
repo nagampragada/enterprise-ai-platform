@@ -10,6 +10,7 @@ from fastapi import Depends, Header, HTTPException, status
 from sqlalchemy.orm import Session
 
 from application.services.authentication_service import AuthenticationService
+from application.services.connector_management_service import ConnectorManagementService
 from application.services.document_chunk_embedding_service import DocumentChunkEmbeddingService
 from application.services.local_document_indexing_service import LocalDocumentIndexingService
 from application.services.local_document_ingestion_service import LocalDocumentIngestionService
@@ -36,6 +37,12 @@ class CurrentUser:
     display_name: str
 
 
+@dataclass(frozen=True)
+class ConnectorAdministrator:
+    user_id: UUID
+    organization_id: UUID
+
+
 def get_db_session() -> Generator[Session, None, None]:
     """Provide a request-scoped SQLAlchemy session."""
     session = SessionLocal()
@@ -53,6 +60,12 @@ def get_authentication_service(db_session: Session = Depends(get_db_session)) ->
         user_repository=user_repository,
         authentication_session_repository=authentication_session_repository,
     )
+
+
+def get_connector_management_service(
+    db_session: Session = Depends(get_db_session),
+) -> ConnectorManagementService:
+    return ConnectorManagementService(db_session)
 
 
 def get_local_document_indexing_service(
@@ -131,3 +144,25 @@ def get_current_user(
         email=user.email,
         display_name=user.display_name,
     )
+
+
+def get_connector_administrator(
+    current_user: CurrentUser = Depends(get_current_user),
+    db_session: Session = Depends(get_db_session),
+) -> ConnectorAdministrator:
+    try:
+        authorized = UserRepository(db_session).is_active_organization_admin(
+            current_user.organization_id,
+            current_user.user_id,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error",
+        ) from exc
+    if not authorized:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Connector administration is forbidden",
+        )
+    return ConnectorAdministrator(current_user.user_id, current_user.organization_id)

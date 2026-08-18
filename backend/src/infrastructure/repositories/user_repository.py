@@ -5,10 +5,10 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import exists, select
 from sqlalchemy.orm import Session
 
-from infrastructure.db.models import User
+from infrastructure.db.models import Organization, Role, User, UserRole
 
 
 class UserRepository:
@@ -32,6 +32,27 @@ class UserRepository:
             User.normalized_email == normalized_email,
         )
         return self._session.execute(statement).scalar_one_or_none()
+
+    def is_active_organization_admin(self, organization_id: UUID, user_id: UUID) -> bool:
+        """Return whether an active tenant user has the committed administrator role."""
+        statement = select(
+            exists().where(
+                Organization.id == organization_id,
+                Organization.id == User.organization_id,
+                Organization.status == "active",
+                Organization.deleted_at.is_(None),
+                User.organization_id == organization_id,
+                User.id == user_id,
+                User.status == "active",
+                UserRole.organization_id == organization_id,
+                UserRole.organization_id == User.organization_id,
+                UserRole.user_id == user_id,
+                UserRole.user_id == User.id,
+                Role.id == UserRole.role_id,
+                Role.name == "organization_admin",
+            )
+        )
+        return bool(self._session.execute(statement).scalar_one())
 
     def add(self, user: User) -> User:
         """Add a new user entity to the active session."""
