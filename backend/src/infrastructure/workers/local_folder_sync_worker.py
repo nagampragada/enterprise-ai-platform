@@ -10,7 +10,10 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
-from application.services.connector_sync_execution_service import ConnectorSyncExecutionService
+from application.services.connector_sync_execution_service import (
+    AcquiredSyncAttempt,
+    ConnectorSyncExecutionService,
+)
 from application.services.connector_sync_retry_policy import SyncFailureKind, classify_exception
 from application.services.staged_local_folder_synchronization_service import (
     LocalFolderDiscoveredEntry,
@@ -123,27 +126,32 @@ class LocalFolderSyncWorker:
                 session.rollback()
                 return None
             session.commit()
-            lease = acquired.lease
-            return LocalFolderAttemptContext(
-                lease.organization_id,
-                lease.job_id,
-                lease.connector_id,
-                lease.connector_scope_id,
-                acquired.sync_run_id,
-                lease.attempt_number,
-                self._worker_id,
-                lease.lease_id,
-                lease.fencing_token,
-                lease.lease_expires_at,
-                lease.mode,
-                lease.trigger_type,
-                lease.max_attempts,
-            )
+            return self.attempt_context(acquired)
         except Exception:
             session.rollback()
             raise
         finally:
             session.close()
+
+    def attempt_context(self, acquired: AcquiredSyncAttempt) -> LocalFolderAttemptContext:
+        if not isinstance(acquired, AcquiredSyncAttempt):
+            raise InvalidLocalFolderWorkerConfiguration("acquired attempt is invalid")
+        lease = acquired.lease
+        return LocalFolderAttemptContext(
+            lease.organization_id,
+            lease.job_id,
+            lease.connector_id,
+            lease.connector_scope_id,
+            acquired.sync_run_id,
+            lease.attempt_number,
+            self._worker_id,
+            lease.lease_id,
+            lease.fencing_token,
+            lease.lease_expires_at,
+            lease.mode,
+            lease.trigger_type,
+            lease.max_attempts,
+        )
 
     def heartbeat(self, context: LocalFolderAttemptContext) -> LocalFolderAttemptContext:
         _context(context, self._worker_id)

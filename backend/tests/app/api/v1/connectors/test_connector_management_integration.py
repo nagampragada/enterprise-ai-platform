@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import subprocess
@@ -21,13 +23,74 @@ from app.dependencies import (
 )
 from app.main import app
 from application.services.connector_management_service import ConnectorManagementService
-from infrastructure.db.models import Connector, ConnectorScope, ConnectorSyncJob
+from domain.embeddings.exceptions import RetryableEmbeddingProviderError
+from domain.embeddings.models import EmbeddingProfile, EmbeddingRequest, EmbeddingResult
+from domain.embeddings.provider import EmbeddingProvider
+from infrastructure.db.models import (
+    Connector,
+    ConnectorScope,
+    ConnectorSyncJob,
+    ConnectorSyncRun,
+    Document,
+    DocumentChunk,
+    DocumentIndexingState,
+    DocumentVersion,
+    SourceItem,
+    SourceItemScopeMembership,
+)
+from infrastructure.workers.local_folder_sync_worker_host import (
+    LocalFolderHostExitCode,
+    LocalFolderWorkerHostSettings,
+    compose_local_folder_sync_worker_host,
+)
 
 ROOT = Path(__file__).resolve().parents[5]
 PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
 INI = ROOT / "alembic.ini"
 ADMIN_ROLE_ID = uuid.UUID("11111111-1111-1111-1111-111111111111")
 EMPLOYEE_ROLE_ID = uuid.UUID("22222222-2222-2222-2222-222222222222")
+DIMENSION = 1536
+
+
+class HostTestEmbeddingProvider(EmbeddingProvider):
+    def __init__(self) -> None:
+        self.calls = 0
+        self.transient_failures = 0
+
+    @property
+    def profile(self) -> EmbeddingProfile:
+        return EmbeddingProfile("host-test", "host-test", DIMENSION, "host-test:1536", 64)
+
+    def embed_batch(self, requests: Sequence[EmbeddingRequest]) -> tuple[EmbeddingResult, ...]:
+        self.calls += 1
+        if self.transient_failures > 0:
+            self.transient_failures -= 1
+            raise RetryableEmbeddingProviderError("controlled transient failure")
+        return tuple(
+            EmbeddingResult(
+                request.input_index,
+                (float(request.input_index + 1),) * DIMENSION,
+                self.profile.model_identifier,
+                DIMENSION,
+            )
+            for request in requests
+        )
+
+
+def _host_settings(worker_id: str) -> LocalFolderWorkerHostSettings:
+    return LocalFolderWorkerHostSettings(
+        worker_id=worker_id,
+        idle_interval=timedelta(seconds=1),
+        lease_duration=timedelta(minutes=15),
+        heartbeat_interval=timedelta(minutes=1),
+        maximum_consecutive_failures=3,
+        minimum_backoff=timedelta(seconds=1),
+        maximum_backoff=timedelta(seconds=4),
+        backoff_jitter=0.0,
+        graceful_shutdown_timeout=timedelta(minutes=5),
+        one_shot=True,
+        expired_recovery_limit=10,
+    )
 
 
 def _identity(url: str):
@@ -216,6 +279,106 @@ def test_full_api_flow_persists_defaults_redacts_and_coalesces(factory, tmp_path
     assert connector.status == "active" and connector.acl_support == "none"
     assert persisted_scope.external_scope_key == root and persisted_scope.created_by_user_id == user_id
     assert session.scalar(select(func.count()).select_from(ConnectorSyncJob)) == 1
+    session.close()
+
+
+def test_api_enqueued_job_runs_end_to_end_through_one_shot_host(factory, tmp_path):
+    organization_id, user_id, space_id = _identity_rows(factory, "Hosted", admin=True)
+    _configure_app(factory, organization_id, user_id)
+    root = tmp_path / "hosted"
+    root.mkdir()
+    document_path = root / "document.txt"
+    document_path.write_text("initial content", encoding="utf-8")
+    removable_path = root / "removable.txt"
+    removable_path.write_text("retained until complete scan", encoding="utf-8")
+    with TestClient(app) as client:
+        connector = client.post(
+            "/api/v1/connectors",
+            json={"connector_type": "local_folder", "display_name": "Hosted", "slug": "hosted"},
+        )
+        connector_id = connector.json()["connector_id"]
+        scope = client.post(
+            f"/api/v1/connectors/{connector_id}/scopes",
+            json={
+                "knowledge_space_id": str(space_id),
+                "display_name": "Hosted",
+                "slug": "hosted",
+                "configuration": {"root_path": str(root.resolve()), "follow_symlinks": False},
+            },
+        )
+        scope_id = scope.json()["scope_id"]
+        queued = client.post(
+            f"/api/v1/connectors/{connector_id}/scopes/{scope_id}/sync-jobs"
+        )
+    assert queued.status_code == 202
+
+    provider = HostTestEmbeddingProvider()
+    host = compose_local_folder_sync_worker_host(
+        _host_settings("host-e2e-one"),
+        session_factory=factory,
+        embedding_provider_factory=lambda: provider,
+        random_uniform=lambda low, high: high / 2,
+    )
+    assert host.run() == LocalFolderHostExitCode.SUCCESS
+    assert provider.calls == 2
+    session = factory()
+    job = session.get(ConnectorSyncJob, uuid.UUID(queued.json()["job_id"]))
+    assert job is not None and job.status == "succeeded" and job.attempt_count == 1
+    assert session.scalar(select(func.count()).select_from(ConnectorSyncRun)) == 1
+    assert session.scalar(select(func.count()).select_from(SourceItem)) == 2
+    assert session.scalar(select(func.count()).select_from(DocumentVersion)) == 2
+    assert session.scalar(select(func.count()).select_from(Document)) == 2
+    assert session.scalar(select(func.count()).select_from(DocumentChunk)) == 2
+    assert session.scalar(
+        select(func.count()).select_from(DocumentIndexingState).where(
+            DocumentIndexingState.status == "indexed"
+        )
+    ) == 2
+    session.close()
+
+    second_host = compose_local_folder_sync_worker_host(
+        _host_settings("host-e2e-two"),
+        session_factory=factory,
+        embedding_provider_factory=lambda: provider,
+        random_uniform=lambda low, high: high / 2,
+    )
+    assert second_host.run() == LocalFolderHostExitCode.NO_WORK
+
+    with TestClient(app) as client:
+        unchanged = client.post(
+            f"/api/v1/connectors/{connector_id}/scopes/{scope_id}/sync-jobs"
+        )
+    assert unchanged.status_code == 202
+    assert second_host.run() == LocalFolderHostExitCode.SUCCESS
+    assert provider.calls == 2
+
+    document_path.write_text("changed content", encoding="utf-8")
+    with TestClient(app) as client:
+        changed = client.post(
+            f"/api/v1/connectors/{connector_id}/scopes/{scope_id}/sync-jobs"
+        )
+    assert changed.status_code == 202
+    assert second_host.run() == LocalFolderHostExitCode.SUCCESS
+    assert provider.calls == 3
+    session = factory()
+    assert session.scalar(select(func.count()).select_from(DocumentVersion)) == 3
+    assert session.scalar(select(func.count()).select_from(DocumentIndexingState)) == 3
+    session.close()
+
+    removable_path.unlink()
+    document_path.write_text("retryable content", encoding="utf-8")
+    provider.transient_failures = 1
+    with TestClient(app) as client:
+        retryable = client.post(
+            f"/api/v1/connectors/{connector_id}/scopes/{scope_id}/sync-jobs"
+        )
+    assert retryable.status_code == 202
+    assert second_host.run() == LocalFolderHostExitCode.RETRY_SCHEDULED
+    session = factory()
+    retry_job = session.get(ConnectorSyncJob, uuid.UUID(retryable.json()["job_id"]))
+    assert retry_job is not None and retry_job.status == "retry_wait"
+    memberships = session.scalars(select(SourceItemScopeMembership)).all()
+    assert len(memberships) == 2 and all(item.status == "active" for item in memberships)
     session.close()
 
 

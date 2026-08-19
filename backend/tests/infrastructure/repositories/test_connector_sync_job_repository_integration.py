@@ -178,6 +178,14 @@ def _acquire(session: Session, organization_id, *, worker="worker-one", now=NOW)
     )
 
 
+def _acquire_local_folder(session: Session, *, worker="worker-one", now=NOW):
+    return _repo(session).acquire_next_local_folder(
+        worker_id=worker,
+        lease_duration=LEASE,
+        now=now,
+    )
+
+
 def test_concurrent_enqueue_coalesces_to_one_nonterminal_job(engine):
     setup = Session(engine)
     organization_id, connector_id, scope_id = _setup(setup, "Coalesce")
@@ -251,6 +259,156 @@ def test_two_concurrent_acquirers_produce_one_lease_and_one_generation(engine):
     lease = winners[0]
     assert lease.attempt_number == lease.fencing_token == 1
     assert lease.lease_expires_at == NOW + LEASE
+
+
+def test_internal_local_folder_claim_selects_across_tenants_and_excludes_other_types(session):
+    first_org, first_connector, first_scope = _setup(session, "GlobalA")
+    second_org, second_connector, second_scope = _setup(session, "GlobalB")
+    other_org, other_connector, other_scope = _setup(session, "GlobalOther")
+    _exec(
+        session,
+        "UPDATE connectors SET connector_type='google_drive' WHERE id=:id",
+        id=other_connector,
+    )
+    _enqueue(session, first_org, first_connector, first_scope)
+    _enqueue(session, second_org, second_connector, second_scope)
+    _enqueue(session, other_org, other_connector, other_scope)
+    session.commit()
+
+    leases = []
+    for worker in ("global-one", "global-two"):
+        lease = _acquire_local_folder(session, worker=worker)
+        assert lease is not None
+        leases.append(lease)
+        session.commit()
+
+    assert {lease.organization_id for lease in leases} == {first_org, second_org}
+    assert _acquire_local_folder(session, worker="global-three") is None
+    other_job = session.scalar(
+        select(ConnectorSyncJob).where(ConnectorSyncJob.organization_id == other_org)
+    )
+    assert other_job is not None and other_job.status == "queued" and other_job.attempt_count == 0
+
+
+def test_two_internal_hosts_cannot_claim_the_same_local_folder_job(engine):
+    setup = Session(engine)
+    organization_id, connector_id, scope_id = _setup(setup, "GlobalRace")
+    _enqueue(setup, organization_id, connector_id, scope_id)
+    setup.commit()
+    setup.close()
+    barrier = threading.Barrier(2)
+    leases = []
+
+    def acquire(worker: int):
+        value = Session(engine, expire_on_commit=False)
+        try:
+            barrier.wait()
+            leases.append(_acquire_local_folder(value, worker=f"global-{worker}"))
+            value.commit()
+        finally:
+            value.close()
+
+    threads = [threading.Thread(target=acquire, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len([lease for lease in leases if lease is not None]) == 1
+
+
+def test_two_internal_hosts_can_claim_different_cross_tenant_jobs(engine):
+    setup = Session(engine)
+    first_org, first_connector, first_scope = _setup(setup, "GlobalParallelA")
+    second_org, second_connector, second_scope = _setup(setup, "GlobalParallelB")
+    _enqueue(setup, first_org, first_connector, first_scope)
+    _enqueue(setup, second_org, second_connector, second_scope)
+    setup.commit()
+    setup.close()
+    barrier = threading.Barrier(2)
+    leases = []
+
+    def acquire(worker: int):
+        value = Session(engine, expire_on_commit=False)
+        try:
+            barrier.wait()
+            leases.append(_acquire_local_folder(value, worker=f"parallel-{worker}"))
+            value.commit()
+        finally:
+            value.close()
+
+    threads = [threading.Thread(target=acquire, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len(leases) == 2 and all(lease is not None for lease in leases)
+    assert {lease.organization_id for lease in leases if lease is not None} == {
+        first_org,
+        second_org,
+    }
+    assert len({lease.job_id for lease in leases if lease is not None}) == 2
+
+
+def test_internal_claim_excludes_future_and_terminal_jobs(session):
+    organization_id, connector_id, future_scope = _setup(session, "GlobalEligibility")
+    terminal_scope = _scope(session, organization_id, connector_id, "terminal")
+    eligible_scope = _scope(session, organization_id, connector_id, "eligible")
+    _repo(session).enqueue_or_coalesce(
+        organization_id,
+        connector_id,
+        future_scope,
+        mode="incremental",
+        trigger_type="manual",
+        now=NOW + timedelta(hours=1),
+    )
+    terminal = _enqueue(session, organization_id, connector_id, terminal_scope)
+    eligible = _enqueue(session, organization_id, connector_id, eligible_scope)
+    _repo(session).request_cancellation(organization_id, terminal.job_id, now=NOW)
+    session.commit()
+    lease = _acquire_local_folder(session)
+    assert lease is not None and lease.job_id == eligible.job_id
+    session.commit()
+    assert _acquire_local_folder(session) is None
+
+
+def test_internal_local_folder_recovery_excludes_other_types_and_fences_old_owner(session):
+    _exec(session, "DELETE FROM connector_sync_runs")
+    _exec(session, "DELETE FROM connector_sync_jobs")
+    session.commit()
+    local_org, local_connector, local_scope = _setup(session, "RecoverLocal")
+    other_org, other_connector, other_scope = _setup(session, "RecoverOther")
+    _enqueue(session, local_org, local_connector, local_scope, maximum=2)
+    _enqueue(session, other_org, other_connector, other_scope, maximum=2)
+    session.commit()
+    local_lease = _acquire(session, local_org, worker="local-owner")
+    other_lease = _acquire(session, other_org, worker="other-owner")
+    assert local_lease is not None and other_lease is not None
+    _repo(session).create_attempt_run(local_lease, worker_id="local-owner", now=NOW)
+    _repo(session).create_attempt_run(other_lease, worker_id="other-owner", now=NOW)
+    _exec(
+        session,
+        "UPDATE connectors SET connector_type='google_drive' WHERE id=:id",
+        id=other_connector,
+    )
+    session.commit()
+    service = ConnectorSyncExecutionService(
+        _repo(session),
+        ConnectorSyncRetryPolicy(random_uniform=lambda low, high: high / 2),
+        clock=lambda: local_lease.lease_expires_at,
+    )
+    recovered = service.recover_expired_local_folder(limit=10)
+    assert len(recovered) == 1 and recovered[0].job_id == local_lease.job_id
+    session.commit()
+    local_job = session.get(ConnectorSyncJob, local_lease.job_id)
+    other_job = session.get(ConnectorSyncJob, other_lease.job_id)
+    assert local_job is not None and local_job.status == "retry_wait"
+    assert other_job is not None and other_job.status == "running"
+    with pytest.raises(LostSyncJobLease):
+        _repo(session).complete_success(
+            local_lease,
+            worker_id="local-owner",
+            now=local_lease.lease_expires_at,
+        )
 
 
 def test_heartbeat_uses_tenant_lease_worker_fence_expiration_and_cancellation(session):

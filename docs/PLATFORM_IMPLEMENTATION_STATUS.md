@@ -6,8 +6,8 @@
 |---|---|
 | Repository | `enterprise-ai-platform` |
 | Snapshot branch | `main` |
-| Snapshot commit | `aff3236b34bcbdae3ffbdee0202f37cce76ebcb4` |
-| Snapshot date | 2026-08-18 |
+| Snapshot commit | `4b82821357cdf3e3976c4cade950a594abb4b1a1` (implementation baseline) |
+| Snapshot date | 2026-08-19 |
 | Alembic head | `20260823_000014` |
 | Purpose | Authoritative, code-evidenced inventory of implemented, exposed, partial, planned, deferred, and excluded capabilities |
 | Audiences | Product owners, backend/data/security/connector/operations/UI/QA engineers, and future repository agents |
@@ -27,9 +27,9 @@ This document treats executable code, migrations, runtime route registration, an
 
 The repository is building a multi-tenant enterprise knowledge platform. Organizations will eventually configure controlled data connectors, ingest and index documents, retrieve only content a user is authorized to see, and use a future answer/agent layer to produce grounded responses with citations.
 
-Operationally today, the FastAPI backend supports authentication and authenticated manual upload of TXT, Markdown, DOCX, and PDF files through a fully tested extraction, deterministic chunking, embedding, and PostgreSQL/pgvector persistence pipeline. The backend also contains a complete, tested Local Folder synchronization engine, durable job control, bounded worker runner, immutable source versioning, and permission-aware vector retrieval repository. Those connector and retrieval capabilities are not exposed by APIs or a continuously hosted worker.
+Operationally today, the FastAPI backend supports authentication and authenticated manual upload of TXT, Markdown, DOCX, and PDF files through a fully tested extraction, deterministic chunking, embedding, and PostgreSQL/pgvector persistence pipeline. The backend also contains secure Local Folder connector-management APIs, a complete synchronization engine, durable job control, a continuous and one-shot worker host, immutable source versioning, and a permission-aware vector retrieval repository. Retrieval is not exposed by an API, and recurring synchronization scheduling is not implemented.
 
-The product is therefore a **tested backend foundation and vertical-slice implementation, not a finished user-facing product**. Its strongest capability is the tenant-safe content ingestion/synchronization/indexing data plane with bounded leases, fencing, retries, rollback, and authorization-before-ranking retrieval. Its primary gap is operational exposure: connector administration APIs, a continuous worker host/scheduler, search APIs, answer generation, and a frontend are absent.
+The product is therefore a **tested backend foundation and vertical-slice implementation, not a finished user-facing product**. Its strongest capability is the tenant-safe content ingestion/synchronization/indexing data plane with bounded leases, fencing, retries, rollback, continuous Local Folder execution, and authorization-before-ranking retrieval. Its primary gaps are recurring scheduling, broader connector lifecycle operations, search APIs, answer generation, deployment supervision, and a frontend.
 
 ### Documentation precedence and known stale statements
 
@@ -76,7 +76,8 @@ flowchart LR
     ADMIN[Future administrator API] -.-> CONN[Connector and scope]
     CONN -.-> LF[Local Folder discovery]
     LF -.-> JOB[Sync job]
-    JOB -.-> WORKER[Bounded worker: lease + fencing]
+    JOB --> HOST[Continuous / one-shot Local Folder host]
+    HOST --> WORKER[Bounded staged worker: lease + fencing]
     WORKER -.-> SOURCE[Source items and memberships]
     SOURCE -.-> VERSION[Immutable document versions]
     VERSION -.-> EXTRACT
@@ -89,7 +90,7 @@ flowchart LR
     RETRIEVE -.-> FUTURE[Future search / answer API]
 ```
 
-Implemented but not operationally exposed: connector/scope management, job enqueue/cancel/status, bounded worker hosting, expired-lease invocation, ACL synchronization, and retrieval. LangGraph, LangChain, UI, cloud connectors, and answer generation are not shown as implemented.
+Implemented runtime exposure includes connector/scope creation and reads, job enqueue/status, continuous/one-shot Local Folder hosting, and expired-lease recovery. Cancellation APIs, recurring scheduling, ACL synchronization, retrieval APIs, LangGraph, LangChain, UI, cloud connectors, and answer generation remain absent.
 
 ## 5. Technology stack
 
@@ -379,7 +380,7 @@ Implemented behavior:
 - missing files remove only the stale scope membership; canonical availability considers other active memberships;
 - tenant, connector, and scope identity are validated.
 
-**Current operational status:** synchronization engine, bounded worker runner, and secure Local Folder create/read/enqueue/status APIs are implemented and tested. The HTTP enqueue operation only creates or coalesces durable work and returns `202`; it never scans the root or invokes the worker, extraction, embedding, or indexing. A continuously hosted daemon, scheduler, automatic recovery invocation, connector update/delete/cancellation/credential APIs, employee device enrollment, and on-prem agent packaging are not implemented.
+**Current operational status:** synchronization engine, bounded worker runner, continuous/one-shot process host, automatic bounded expired recovery, and secure Local Folder create/read/enqueue/status APIs are implemented and tested. The HTTP enqueue operation only creates or coalesces durable work and returns `202`; it never scans the root or invokes the worker, extraction, embedding, or indexing. Recurring scheduling, process-supervisor/deployment configuration, connector update/delete/cancellation/credential APIs, employee device enrollment, and on-prem agent packaging are not implemented.
 
 Current limitations include delete-plus-create rename semantics, no provider-native delta feed, no native source ACLs (`acl_support='none'`), and bounded cancellation observation rather than interruption inside one extractor/provider call.
 
@@ -425,6 +426,7 @@ A retry never rewrites prior run/item/error history. Run/item counters are nonne
 - One nonterminal job (`queued`, `running`, `retry_wait`) is allowed per organization/scope by partial unique index.
 - `enqueue_or_coalesce` uses PostgreSQL `ON CONFLICT`; a duplicate returns the existing nonterminal job without changing original provenance/configuration.
 - Acquisition uses an eligible ordered candidate with `FOR UPDATE SKIP LOCKED` and a conditional `UPDATE ... RETURNING`.
+- The host-only global claim accepts no tenant or resource selector, correlates jobs to `connector_type='local_folder'`, returns tenant identity from the claimed lease, and is not exposed through an API.
 - A successful acquisition creates a new UUID lease, records owner/acquired/expiry/heartbeat, and increments `attempt_count` and `fencing_token` together exactly once.
 - Every worker mutation predicates on tenant, job, running lifecycle, worker ID, lease UUID, fence, attempt, and unexpired lease. Heartbeat/success/failure additionally respect cancellation policy.
 - Expired recovery locks bounded candidates, clears the old lease, finalizes the old run, and schedules retry or terminal failure/cancellation. The next acquisition increments generation.
@@ -448,7 +450,7 @@ Retry policy:
 
 There is no `sleep()`, immediate retry loop, forever poll, or unlimited retry configuration. Organization financial budgets and durable provider circuit breakers do not exist.
 
-## 18. Local Folder worker runner
+## 18. Local Folder worker runner and host
 
 `LocalFolderSyncWorker` is a bounded staged transaction adapter, not a daemon.
 
@@ -469,6 +471,21 @@ Defaults: 5-minute lease, 60-second heartbeat target, one step per invocation, h
 Cancellation is checked before folder access, before/between steps, at the pre-commit barrier, and in success finalization. One indivisible filesystem/extractor/embedding call is not interrupted; cancellation is observed at the next boundary.
 
 A provider call may repeat if the worker crashes after the provider responds but before the short item-persistence transaction commits. Database materialization and per-run item progress remain idempotent and retries are bounded, but exactly-once external provider execution is not claimed. One prepared item is capped at 500 chunks/vectors; the full manifest is never retained in memory.
+
+`LocalFolderSyncWorkerHost` continuously performs the same bounded cycle used by one-shot mode: check shutdown, recover expired Local Folder leases and claim at most one eligible Local Folder job in one short transaction, close the session, execute the staged worker to a durable outcome, and poll again. Empty queues wait interruptibly. Host-level database/composition failures use capped exponential jitter, reset after a successful database cycle, and exit nonzero at the configured consecutive-failure limit so an external supervisor can restart the process. Host failures do not become provider retries.
+
+Invocation from `backend`:
+
+```powershell
+.\.venv\Scripts\python.exe -m infrastructure.workers.local_folder_sync_worker_host
+.\.venv\Scripts\python.exe -m infrastructure.workers.local_folder_sync_worker_host --once
+```
+
+One-shot uses the same recovery, claim, lease, fencing, staged worker, and outcome path. It makes one claim attempt, executes at most one job, and returns deterministic exit codes: success `0`, host failure `1`, no work `2`, retry scheduled `3`, terminal failure `4`, cancellation `5`, lost lease `6`, and pre-work shutdown `130`.
+
+Host defaults are: generated `local-folder-<uuid>` worker ID, 5-second idle interval, 15-minute lease, 60-second heartbeat target, 5 maximum consecutive host failures, 1-to-60-second host backoff with 20% jitter, 5-minute graceful shutdown limit, and expired recovery limit 10. Environment names are `LOCAL_FOLDER_WORKER_ID`, `LOCAL_FOLDER_WORKER_IDLE_SECONDS`, `LOCAL_FOLDER_WORKER_LEASE_SECONDS`, `LOCAL_FOLDER_WORKER_HEARTBEAT_SECONDS`, `LOCAL_FOLDER_WORKER_MAX_FAILURES`, `LOCAL_FOLDER_WORKER_BACKOFF_MIN_SECONDS`, `LOCAL_FOLDER_WORKER_BACKOFF_MAX_SECONDS`, `LOCAL_FOLDER_WORKER_BACKOFF_JITTER`, `LOCAL_FOLDER_WORKER_SHUTDOWN_TIMEOUT_SECONDS`, and `LOCAL_FOLDER_WORKER_RECOVERY_LIMIT`. Durations are positive and hard-bounded, heartbeat is strictly shorter than lease, backoff maximum is at least its minimum, and malformed values fail startup. No organization, connector, scope, job, path, database URL, or secret selector is accepted.
+
+`SIGINT` and supported `SIGTERM` handlers only set a shutdown event. Idle/backoff waits stop promptly; a claimed job stops at the next committed staged boundary without being marked successful. One extraction or embedding call cannot be interrupted or renewed by a shared-session heartbeat thread. The default 15-minute lease is therefore a conservative single-step operational limit; operators must choose a lease longer than the maximum expected indivisible provider step. If such a step returns after the graceful limit, the host exits nonzero after reaching the safe boundary. A production process supervisor, readiness endpoint, service manifest, and restart policy remain deployment work.
 
 ## 19. Immutable document versions and indexing state
 
@@ -608,11 +625,11 @@ Bearer authentication → tenant from current user → filename/extension/size v
 
 ### Local Folder initial synchronization
 
-Persisted active scope → authenticated admin enqueue API → durable job → bounded runner acquisition/run → deterministic discovery → canonical source/membership → immutable version → extraction/chunking/embedding → complete discovery → missing-membership reconciliation → atomic run/job success. **Missing: continuous worker host/scheduler.**
+Persisted active scope → authenticated admin enqueue API → durable job → continuous host recovery/claim → bounded runner acquisition/run → deterministic discovery → canonical source/membership → immutable version → extraction/chunking/embedding → complete discovery → missing-membership reconciliation → atomic run/job success. **Recurring scheduling remains missing.**
 
 ### Local Folder unchanged rerun
 
-New logical job requested through the API → checksum comparison → completed prior source/version reused → sync item skipped → no new version or embedding call. **Missing continuous host.**
+New logical job requested through the API → host claim → checksum comparison → completed prior source/version reused → sync item skipped → no new version or embedding call.
 
 ### Local Folder changed file
 
@@ -624,7 +641,7 @@ Only after complete discovery → stale scope memberships paged → membership r
 
 ### Transient failure and retry
 
-Continuation rollback → controlled cause classification → current fenced outcome transaction → `retry_wait` and delayed eligibility → later acquisition creates new lease/fence/run → bounded continuation. Retry is not executed in the same invocation. **Missing continuous host/recovery invocation.**
+Continuation rollback → controlled cause classification → current fenced outcome transaction → `retry_wait` and delayed eligibility → later host acquisition creates new lease/fence/run → bounded continuation. Retry is not executed in the same invocation.
 
 ### Permanent failure
 
@@ -713,7 +730,7 @@ Required command executed at this snapshot:
 python -m pytest --import-mode=importlib -q
 ```
 
-Result: **885 passed, 1 skipped, 45 warnings; exit code 0**.
+Result: **924 passed, 1 skipped, 45 warnings; exit code 0**.
 
 Coverage categories include pure domain/unit tests, API tests, real PostgreSQL repositories, migration downgrade/re-upgrade tests, filesystem/extractor integration, deterministic fake embeddings, concurrent enqueue/acquisition/recovery/version allocation, rollback/pre-commit failure, tenant isolation, ACL authorization, permission-aware retrieval, query-plan/index availability, and worker session cleanup.
 
@@ -738,9 +755,9 @@ Known output at snapshot:
 | pgvector | Extension migration and vector column complete |
 | Local configuration | Environment-driven database/JWT/OpenAI settings; no secrets are documented here |
 | Migrations | 14 revisions, head `20260823_000014`, real PostgreSQL lifecycle tests |
-| Worker runner | Bounded callable class implemented |
-| Continuous worker host | Not implemented |
-| Scheduler/automatic recovery | Not implemented |
+| Worker runner | Bounded staged callable class implemented |
+| Continuous worker host | Direct module with continuous and one-shot modes implemented |
+| Scheduler/automatic recovery | Expired recovery implemented in host; recurring schedule creation absent |
 | Worker health/readiness | Not implemented |
 | Backend/frontend containers | Not implemented |
 | Deployment manifests | Environment directories exist but contain no manifests |
@@ -782,7 +799,7 @@ Never display or request: password hashes, refresh-token hashes, connector secre
 
 | Capability | Classification |
 |---|---|
-| Continuous worker daemon/host | Backend runner exists; host deferred |
+| Recurring synchronization scheduler | Host executes queued work; schedule creation remains deferred |
 | Scheduler and automatic expired-job recovery invocation | Deferred |
 | Connector administration API breadth | Create/read/enqueue/status implemented; update/delete/cancel/credentials/audit remain gaps |
 | Connector UI / any functional frontend | Not implemented |
@@ -811,7 +828,7 @@ The current architecture supports this order because the data plane is stronger 
 
 | # | Item | Purpose, dependencies, deliverable | Recommended model | Manual credentials/business decisions |
 |---:|---|---|---|---|
-| 1 | Continuous bounded worker host + recovery invocation | Host existing runner; graceful shutdown/readiness; bounded job/recovery cadence | GPT-5.6 Sol, high | Deployment/runtime policy required |
+| 1 | Recurring Local Folder scheduler | Enqueue due scope jobs without combining scheduling with worker execution | GPT-5.6 Sol, high | Cadence, timezone, missed-run, and overlap policy required |
 | 2 | Complete connector lifecycle APIs | Add update/archive/remove/cancel with narrow state transitions and audit emission | GPT-5.6 Sol, high | Retention and delegation decisions required |
 | 3 | Credential and validation services | Integrate secret manager and provider-neutral validation without exposing secrets | GPT-5.6 Sol, high | Secret platform and Local Folder deployment policy required |
 | 4 | End-to-end admin workflow | Bootstrap/configure/sync/observe/cancel/recover acceptance flow | GPT-5.6 Sol, high | Operator runbook decisions |
@@ -835,7 +852,7 @@ The current architecture supports this order because the data plane is stronger 
 - [x] Authenticated manual upload and complete indexing pipeline
 - [x] TXT/Markdown/DOCX/PDF extraction
 - [x] Deterministic chunking and 1,536-dimensional embeddings
-- [x] Local Folder connector, synchronization service, execution control, and bounded runner as callable code
+- [x] Local Folder connector, synchronization service, execution control, bounded runner, and continuous/one-shot host
 - [x] Canonical source identity, immutable versions, indexing states/attempts
 - [x] Permission-aware retrieval repository
 - [x] Comprehensive fake-provider, PostgreSQL, filesystem, concurrency, rollback, and migration tests
@@ -844,7 +861,7 @@ The current architecture supports this order because the data plane is stronger 
 
 - [x] Connector/scope repositories and lifecycle persistence
 - [x] Durable jobs, run/item/error/cursor history, cancellation/recovery operations
-- [x] Bounded Local Folder worker without continuous host
+- [x] Continuous Local Folder host with internal global claim and expired recovery
 - [x] Knowledge-space grants and organization structure
 - [x] External identity/ACL persistence and authorization query
 - [x] Audit table
@@ -852,7 +869,7 @@ The current architecture supports this order because the data plane is stronger 
 
 ### Next blockers
 
-- [ ] Continuous worker/recovery host
+- [ ] Recurring synchronization scheduler
 - [ ] Administrator authorization policy
 - [x] First Local Folder connector/scope/job create/read/enqueue APIs
 - [ ] Connector update/delete/cancel/credential and detailed run/item/error APIs

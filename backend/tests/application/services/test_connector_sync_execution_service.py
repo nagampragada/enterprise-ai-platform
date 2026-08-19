@@ -57,6 +57,20 @@ def test_no_eligible_work_does_not_allocate_a_run():
     repository.create_attempt_run.assert_not_called()
 
 
+def test_internal_local_folder_acquire_allocates_one_run_without_tenant_input():
+    repository = Mock()
+    lease = _lease()
+    repository.acquire_next_local_folder.return_value = lease
+    repository.create_attempt_run.return_value = ConnectorSyncRun(id=uuid4())
+    result = _service(repository).acquire_one_local_folder(
+        worker_id="worker-one",
+        lease_duration=timedelta(minutes=5),
+    )
+    assert result is not None and result.lease.organization_id == lease.organization_id
+    repository.acquire_next_local_folder.assert_called_once()
+    repository.create_attempt_run.assert_called_once()
+
+
 def test_retry_decision_passes_only_safe_controlled_error_fields():
     repository = Mock()
     lease = _lease()
@@ -99,6 +113,17 @@ def test_recovery_is_bounded_by_repository_result_and_does_not_increment_attempt
     repository.lock_expired.assert_called_once()
     repository.recover_expired.assert_called_once()
     assert repository.recover_expired.call_args.kwargs["retry_at"] == NOW + timedelta(seconds=15)
+
+
+def test_internal_local_folder_recovery_uses_narrow_repository_query():
+    repository = Mock()
+    expired = Mock(attempt_count=1, max_attempts=3, cancellation_requested=False)
+    repository.lock_expired_local_folder.return_value = (expired,)
+    repository.recover_expired.return_value = Mock()
+    recovered = _service(repository).recover_expired_local_folder(limit=4)
+    assert len(recovered) == 1
+    repository.lock_expired_local_folder.assert_called_once_with(now=NOW, limit=4)
+    repository.lock_expired.assert_not_called()
 
 
 def test_service_and_repository_source_have_no_sleep_commit_rollback_or_forever_loop():

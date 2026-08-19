@@ -13,7 +13,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from infrastructure.db.models import ConnectorSyncJob, ConnectorSyncRun
+from infrastructure.db.models import Connector, ConnectorSyncJob, ConnectorSyncRun
 from infrastructure.repositories.connector_repository import (
     _require_aware,
     _require_choice,
@@ -302,6 +302,69 @@ class ConnectorSyncJobRepository:
         row = self._updated(statement, "synchronization job could not be acquired")
         return _lease(row) if row is not None else None
 
+    def acquire_next_local_folder(
+        self,
+        *,
+        worker_id: str,
+        lease_duration: timedelta,
+        now: datetime,
+    ) -> SyncJobLease | None:
+        """Claim one Local Folder job across tenants for the internal worker host."""
+        worker_id = _worker_id(worker_id)
+        now = _aware("now", now)
+        duration = _lease_duration(lease_duration)
+        lease_id = self._lease_uuid()
+        local_folder = select(Connector.id).where(
+            Connector.organization_id == ConnectorSyncJob.organization_id,
+            Connector.id == ConnectorSyncJob.connector_id,
+            Connector.connector_type == "local_folder",
+        ).exists()
+        candidate = (
+            select(ConnectorSyncJob.id)
+            .where(
+                local_folder,
+                ConnectorSyncJob.status.in_(("queued", "retry_wait")),
+                ConnectorSyncJob.next_attempt_at <= now,
+                ConnectorSyncJob.cancel_requested_at.is_(None),
+                ConnectorSyncJob.attempt_count < ConnectorSyncJob.max_attempts,
+            )
+            .order_by(
+                ConnectorSyncJob.priority,
+                ConnectorSyncJob.next_attempt_at,
+                ConnectorSyncJob.created_at,
+                ConnectorSyncJob.id,
+            )
+            .with_for_update(of=ConnectorSyncJob, skip_locked=True)
+            .limit(1)
+            .cte("eligible_local_folder_sync_job")
+        )
+        statement = (
+            update(ConnectorSyncJob)
+            .where(
+                ConnectorSyncJob.id == candidate.c.id,
+                local_folder,
+                ConnectorSyncJob.status.in_(("queued", "retry_wait")),
+                ConnectorSyncJob.next_attempt_at <= now,
+                ConnectorSyncJob.cancel_requested_at.is_(None),
+                ConnectorSyncJob.attempt_count < ConnectorSyncJob.max_attempts,
+            )
+            .values(
+                status="running",
+                attempt_count=ConnectorSyncJob.attempt_count + 1,
+                fencing_token=ConnectorSyncJob.fencing_token + 1,
+                next_attempt_at=None,
+                lease_owner=worker_id,
+                lease_id=lease_id,
+                lease_acquired_at=now,
+                lease_expires_at=now + duration,
+                heartbeat_at=now,
+                updated_at=now,
+            )
+            .returning(ConnectorSyncJob)
+        )
+        row = self._updated(statement, "Local Folder synchronization job could not be acquired")
+        return _lease(row) if row is not None else None
+
     def renew_heartbeat(
         self,
         lease: SyncJobLease,
@@ -571,6 +634,34 @@ class ConnectorSyncJobRepository:
             .limit(limit)
         )
         rows = self._all(statement, "expired synchronization jobs could not be read")
+        return tuple(_expired(row) for row in rows)
+
+    def lock_expired_local_folder(
+        self,
+        *,
+        now: datetime,
+        limit: int,
+    ) -> tuple[ExpiredSyncJobLease, ...]:
+        """Lock expired Local Folder jobs across tenants for internal recovery."""
+        now = _aware("now", now)
+        limit = _recovery_limit(limit)
+        local_folder = select(Connector.id).where(
+            Connector.organization_id == ConnectorSyncJob.organization_id,
+            Connector.id == ConnectorSyncJob.connector_id,
+            Connector.connector_type == "local_folder",
+        ).exists()
+        statement = (
+            select(ConnectorSyncJob)
+            .where(
+                local_folder,
+                ConnectorSyncJob.status == "running",
+                ConnectorSyncJob.lease_expires_at <= now,
+            )
+            .order_by(ConnectorSyncJob.lease_expires_at, ConnectorSyncJob.id)
+            .with_for_update(of=ConnectorSyncJob, skip_locked=True)
+            .limit(limit)
+        )
+        rows = self._all(statement, "expired Local Folder synchronization jobs could not be read")
         return tuple(_expired(row) for row in rows)
 
     def recover_expired(

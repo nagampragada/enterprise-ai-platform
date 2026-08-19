@@ -158,6 +158,17 @@ def test_claim_acquires_one_run_commits_closes_and_returns_scalar_immutable_cont
         context.attempt_number = 2  # type: ignore[misc]
 
 
+def test_attempt_context_uses_tenant_identity_from_acquired_lease():
+    sessions, lease, local = SessionFactory(), _lease(), Mock()
+    acquired = AcquiredSyncAttempt(lease, uuid4())
+    context = _worker(sessions, _execution(lease), local).attempt_context(acquired)
+    assert context.organization_id == lease.organization_id
+    assert context.connector_id == lease.connector_id
+    assert context.connector_scope_id == lease.connector_scope_id
+    assert context.job_id == lease.job_id
+    assert sessions.sessions == []
+
+
 def test_incomplete_work_is_bounded_and_does_not_finalize_or_consume_retry():
     sessions, lease = SessionFactory(), _lease()
     execution, staged, preparation = _execution(lease), Mock(), Mock()
