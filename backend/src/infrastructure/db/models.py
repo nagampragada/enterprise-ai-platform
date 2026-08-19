@@ -694,6 +694,84 @@ class SourceItemScopeMembership(Base):
     )
 
 
+class ConnectorSyncSchedule(Base):
+    __tablename__ = "connector_sync_schedules"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_connector_sync_schedules"),
+        ForeignKeyConstraint(
+            ["organization_id"], ["organizations.id"],
+            name="fk_sync_schedules_organization", ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "connector_id", "connector_scope_id"],
+            ["connector_scopes.organization_id", "connector_scopes.connector_id", "connector_scopes.id"],
+            name="fk_sync_schedules_scope_tenant", ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "connector_id", "connector_scope_id", "last_job_id"],
+            ["connector_sync_jobs.organization_id", "connector_sync_jobs.connector_id", "connector_sync_jobs.connector_scope_id", "connector_sync_jobs.id"],
+            name="fk_sync_schedules_last_job_tenant", ondelete="SET NULL (last_job_id)",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "created_by_user_id"],
+            ["users.organization_id", "users.id"],
+            name="fk_sync_schedules_creator_tenant", ondelete="SET NULL (created_by_user_id)",
+        ),
+        UniqueConstraint("organization_id", "id", name="uq_sync_schedules_organization_id_id"),
+        UniqueConstraint(
+            "organization_id", "connector_id", "connector_scope_id",
+            name="uq_sync_schedules_scope",
+        ),
+        CheckConstraint("status IN ('active', 'paused')", name="schedule_status_valid"),
+        CheckConstraint(
+            "interval_seconds BETWEEN 900 AND 2592000", name="schedule_interval_valid"
+        ),
+        CheckConstraint(
+            "(status = 'active' AND paused_at IS NULL AND pause_reason_code IS NULL) OR "
+            "(status = 'paused' AND paused_at IS NOT NULL)",
+            name="schedule_pause_consistent",
+        ),
+        CheckConstraint(
+            "pause_reason_code IS NULL OR pause_reason_code ~ '^[a-z][a-z0-9_]*$'",
+            name="schedule_pause_reason_valid",
+        ),
+        CheckConstraint(
+            "last_enqueued_at IS NULL OR last_due_at IS NOT NULL",
+            name="schedule_enqueue_requires_due",
+        ),
+        CheckConstraint("updated_at >= created_at", name="schedule_updated_after_created"),
+        Index(
+            "ix_sync_schedules_due", "next_run_at", "id",
+            postgresql_where=text("status = 'active'"),
+        ),
+        Index(
+            "ix_sync_schedules_org_scope", "organization_id", "connector_scope_id"
+        ),
+        Index("ix_sync_schedules_status_next", "status", "next_run_at"),
+        Index("ix_sync_schedules_last_job", "organization_id", "last_job_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_scope_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'active'"))
+    interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    next_run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_enqueued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_job_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    pause_reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
 class ConnectorSyncJob(Base):
     __tablename__ = "connector_sync_jobs"
     __table_args__ = (

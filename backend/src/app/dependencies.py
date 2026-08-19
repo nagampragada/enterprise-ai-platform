@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from application.services.authentication_service import AuthenticationService
 from application.services.connector_management_service import ConnectorManagementService
+from application.services.connector_sync_schedule_service import ConnectorSyncScheduleService
 from application.services.document_chunk_embedding_service import DocumentChunkEmbeddingService
 from application.services.local_document_indexing_service import LocalDocumentIndexingService
 from application.services.local_document_ingestion_service import LocalDocumentIngestionService
@@ -66,6 +67,12 @@ def get_connector_management_service(
     db_session: Session = Depends(get_db_session),
 ) -> ConnectorManagementService:
     return ConnectorManagementService(db_session)
+
+
+def get_connector_sync_schedule_service(
+    db_session: Session = Depends(get_db_session),
+) -> ConnectorSyncScheduleService:
+    return ConnectorSyncScheduleService(db_session)
 
 
 def get_local_document_indexing_service(

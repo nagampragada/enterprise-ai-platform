@@ -8,7 +8,7 @@
 | Snapshot branch | `main` |
 | Snapshot commit | `4b82821357cdf3e3976c4cade950a594abb4b1a1` (implementation baseline) |
 | Snapshot date | 2026-08-19 |
-| Alembic head | `20260823_000014` |
+| Alembic head | `20260824_000015` |
 | Purpose | Authoritative, code-evidenced inventory of implemented, exposed, partial, planned, deferred, and excluded capabilities |
 | Audiences | Product owners, backend/data/security/connector/operations/UI/QA engineers, and future repository agents |
 
@@ -27,9 +27,9 @@ This document treats executable code, migrations, runtime route registration, an
 
 The repository is building a multi-tenant enterprise knowledge platform. Organizations will eventually configure controlled data connectors, ingest and index documents, retrieve only content a user is authorized to see, and use a future answer/agent layer to produce grounded responses with citations.
 
-Operationally today, the FastAPI backend supports authentication and authenticated manual upload of TXT, Markdown, DOCX, and PDF files through a fully tested extraction, deterministic chunking, embedding, and PostgreSQL/pgvector persistence pipeline. The backend also contains secure Local Folder connector-management APIs, a complete synchronization engine, durable job control, a continuous and one-shot worker host, immutable source versioning, and a permission-aware vector retrieval repository. Retrieval is not exposed by an API, and recurring synchronization scheduling is not implemented.
+Operationally today, the FastAPI backend supports authentication and authenticated manual upload of TXT, Markdown, DOCX, and PDF files through a fully tested extraction, deterministic chunking, embedding, and PostgreSQL/pgvector persistence pipeline. The backend also contains secure Local Folder connector-management APIs, recurring interval schedules, a database-only scheduler host, a complete synchronization engine, durable job control, a continuous and one-shot worker host, immutable source versioning, and a permission-aware vector retrieval repository. Retrieval is not exposed by an API.
 
-The product is therefore a **tested backend foundation and vertical-slice implementation, not a finished user-facing product**. Its strongest capability is the tenant-safe content ingestion/synchronization/indexing data plane with bounded leases, fencing, retries, rollback, continuous Local Folder execution, and authorization-before-ranking retrieval. Its primary gaps are recurring scheduling, broader connector lifecycle operations, search APIs, answer generation, deployment supervision, and a frontend.
+The product is therefore a **tested backend foundation and vertical-slice implementation, not a finished user-facing product**. Its strongest capability is the tenant-safe scheduled content ingestion/synchronization/indexing data plane with bounded leases, fencing, retries, rollback, continuous Local Folder execution, and authorization-before-ranking retrieval. Its primary gaps are cron/timezone scheduling, broader connector lifecycle operations, search APIs, answer generation, deployment supervision, and a frontend.
 
 ### Documentation precedence and known stale statements
 
@@ -90,7 +90,7 @@ flowchart LR
     RETRIEVE -.-> FUTURE[Future search / answer API]
 ```
 
-Implemented runtime exposure includes connector/scope creation and reads, job enqueue/status, continuous/one-shot Local Folder hosting, and expired-lease recovery. Cancellation APIs, recurring scheduling, ACL synchronization, retrieval APIs, LangGraph, LangChain, UI, cloud connectors, and answer generation remain absent.
+Implemented runtime exposure includes connector/scope creation and reads, interval schedule create/read/pause/resume/delete, job enqueue/status, continuous/one-shot scheduling, continuous/one-shot Local Folder hosting, and expired-lease recovery. Cancellation APIs, cron/timezone schedules, ACL synchronization, retrieval APIs, LangGraph, LangChain, UI, cloud connectors, and answer generation remain absent.
 
 ## 5. Technology stack
 
@@ -123,7 +123,7 @@ Evidence: `backend/pyproject.toml`, `infra/docker/docker-compose.postgres.yml`, 
 
 ## 6. Database architecture
 
-SQLAlchemy metadata contains **38 live tables**. Alembic head is `20260823_000014`; migrations are forward-ordered, tested against real PostgreSQL, and generally provide narrow downgrades. The pgvector extension downgrade is intentionally conservative because extensions can be shared infrastructure.
+SQLAlchemy metadata contains **39 live tables**. Alembic head is `20260824_000015`; migrations are forward-ordered, tested against real PostgreSQL, and generally provide narrow downgrades. The pgvector extension downgrade is intentionally conservative because extensions can be shared infrastructure.
 
 ### Organizations, users, authentication, and structure
 
@@ -167,6 +167,7 @@ SQLAlchemy metadata contains **38 live tables**. Alembic head is `20260823_00001
 | `source_items` | Canonical connector-wide source identity | UUID PK; unique `(organization_id,connector_id,source_item_key)` | `active/deleted/unavailable`; metadata/checksum/version |
 | `source_item_scope_memberships` | Source item presence in a scope | UUID PK; unique tenant item/scope | `active/removed`; discovery/reconciliation timestamps |
 | `connector_sync_jobs` | Logical durable request and execution control | UUID PK; tenant candidate keys; unique lease; connector/scope/user FKs | Queue, lease, fence, cancellation, attempts, terminal outcome |
+| `connector_sync_schedules` | One recurring interval per tenant scope | UUID PK; unique tenant connector/scope; optional creator/last-job FKs | Active/paused; UTC due time; 15-minute to 30-day interval |
 | `connector_sync_runs` | One execution attempt/history record | UUID PK; unique tenant job/attempt; nullable legacy job link | Run mode/trigger/status/counters/timestamps |
 | `connector_sync_items` | Per-source work in a run | UUID PK; unique tenant run/source key | `pending/processing/succeeded/skipped/failed` |
 | `connector_sync_errors` | Append-oriented safe run/item errors | UUID PK; run CASCADE, optional item SET NULL | Controlled category/code, retry metadata |
@@ -380,7 +381,7 @@ Implemented behavior:
 - missing files remove only the stale scope membership; canonical availability considers other active memberships;
 - tenant, connector, and scope identity are validated.
 
-**Current operational status:** synchronization engine, bounded worker runner, continuous/one-shot process host, automatic bounded expired recovery, and secure Local Folder create/read/enqueue/status APIs are implemented and tested. The HTTP enqueue operation only creates or coalesces durable work and returns `202`; it never scans the root or invokes the worker, extraction, embedding, or indexing. Recurring scheduling, process-supervisor/deployment configuration, connector update/delete/cancellation/credential APIs, employee device enrollment, and on-prem agent packaging are not implemented.
+**Current operational status:** synchronization engine, interval scheduler and host, bounded worker runner, continuous/one-shot worker host, automatic bounded expired recovery, and secure Local Folder create/read/enqueue/status/schedule APIs are implemented and tested. Scheduler and HTTP operations never scan the root or invoke extraction, embedding, or indexing. Cron/timezone schedules, process-supervisor/deployment configuration, connector update/delete/cancellation/credential APIs, employee device enrollment, and on-prem agent packaging are not implemented.
 
 Current limitations include delete-plus-create rename semantics, no provider-native delta feed, no native source ACLs (`acl_support='none'`), and bounded cancellation observation rather than interruption inside one extractor/provider call.
 
@@ -547,7 +548,7 @@ Tests cover platform grants, direct/nested groups, domains, anyone, expired/revo
 
 ## 23. Current APIs
 
-Generated OpenAPI verifies **16 application operations across 13 paths**. FastAPI also exposes 4 framework routes: `/openapi.json`, `/docs`, `/docs/oauth2-redirect`, and `/redoc`.
+Generated OpenAPI verifies **20 application operations across 14 paths**. FastAPI also exposes 4 framework routes: `/openapi.json`, `/docs`, `/docs/oauth2-redirect`, and `/redoc`.
 
 | Method | Route | Authentication | Purpose | Request | Response | Status |
 |---|---|---|---|---|---|---|
@@ -567,6 +568,10 @@ Generated OpenAPI verifies **16 application operations across 13 paths**. FastAP
 | POST | `/api/v1/connectors/{connector_id}/scopes/{scope_id}/sync-jobs` | Bearer + `organization_admin` | Enqueue/coalesce durable asynchronous work | empty optional body; execution controls forbidden | safe job + `coalesced`, HTTP 202 | Complete |
 | GET | `/api/v1/connectors/{connector_id}/scopes/{scope_id}/sync-jobs` | Bearer + `organization_admin` | Scope job-history keyset page | limit/cursor/status | redacted job page | Complete |
 | GET | `/api/v1/connectors/{connector_id}/scopes/{scope_id}/sync-jobs/{job_id}` | Bearer + `organization_admin` | Tenant-safe job detail | UUID paths | redacted job or concealed 404 | Complete |
+| PUT | `/api/v1/connectors/{connector_id}/scopes/{scope_id}/schedule` | Bearer + `organization_admin` | Create or replace interval schedule | interval + optional aware first run | safe schedule | Complete |
+| GET | `/api/v1/connectors/{connector_id}/scopes/{scope_id}/schedule` | Bearer + `organization_admin` | Read current schedule | UUID paths | safe schedule or concealed 404 | Complete |
+| PATCH | `/api/v1/connectors/{connector_id}/scopes/{scope_id}/schedule` | Bearer + `organization_admin` | Pause or resume | controlled action | safe schedule | Complete |
+| DELETE | `/api/v1/connectors/{connector_id}/scopes/{scope_id}/schedule` | Bearer + `organization_admin` | Return scope to manual-only | UUID paths | HTTP 204 | Complete |
 
 Source modules: `backend/src/app/main.py`, `backend/src/app/api/router.py`, `backend/src/app/api/v1/auth/router.py`, and `backend/src/app/api/v1/documents/router.py`.
 
@@ -625,7 +630,7 @@ Bearer authentication → tenant from current user → filename/extension/size v
 
 ### Local Folder initial synchronization
 
-Persisted active scope → authenticated admin enqueue API → durable job → continuous host recovery/claim → bounded runner acquisition/run → deterministic discovery → canonical source/membership → immutable version → extraction/chunking/embedding → complete discovery → missing-membership reconciliation → atomic run/job success. **Recurring scheduling remains missing.**
+Persisted active scope → optional UTC interval schedule → scheduler host due lock/enqueue/advance → durable job → continuous worker host recovery/claim → bounded runner acquisition/run → deterministic discovery → canonical source/membership → immutable version → extraction/chunking/embedding → complete discovery → missing-membership reconciliation → atomic run/job success.
 
 ### Local Folder unchanged rerun
 
@@ -730,7 +735,7 @@ Required command executed at this snapshot:
 python -m pytest --import-mode=importlib -q
 ```
 
-Result: **924 passed, 1 skipped, 45 warnings; exit code 0**.
+Result: **958 passed, 1 skipped, 47 warnings; exit code 0**.
 
 Coverage categories include pure domain/unit tests, API tests, real PostgreSQL repositories, migration downgrade/re-upgrade tests, filesystem/extractor integration, deterministic fake embeddings, concurrent enqueue/acquisition/recovery/version allocation, rollback/pre-commit failure, tenant isolation, ACL authorization, permission-aware retrieval, query-plan/index availability, and worker session cleanup.
 
@@ -754,10 +759,10 @@ Known output at snapshot:
 | Local PostgreSQL | Docker Compose uses `pgvector/pgvector:pg16`, localhost port, health check, named volume; development credentials only |
 | pgvector | Extension migration and vector column complete |
 | Local configuration | Environment-driven database/JWT/OpenAI settings; no secrets are documented here |
-| Migrations | 14 revisions, head `20260823_000014`, real PostgreSQL lifecycle tests |
+| Migrations | 15 revisions, head `20260824_000015`, real PostgreSQL lifecycle tests |
 | Worker runner | Bounded staged callable class implemented |
 | Continuous worker host | Direct module with continuous and one-shot modes implemented |
-| Scheduler/automatic recovery | Expired recovery implemented in host; recurring schedule creation absent |
+| Scheduler/automatic recovery | Continuous/one-shot interval scheduler and worker expired recovery implemented |
 | Worker health/readiness | Not implemented |
 | Backend/frontend containers | Not implemented |
 | Deployment manifests | Environment directories exist but contain no manifests |
@@ -799,7 +804,7 @@ Never display or request: password hashes, refresh-token hashes, connector secre
 
 | Capability | Classification |
 |---|---|
-| Recurring synchronization scheduler | Host executes queued work; schedule creation remains deferred |
+| Cron/timezone synchronization scheduling | Interval scheduling exists; wall-clock recurrence remains deferred |
 | Scheduler and automatic expired-job recovery invocation | Deferred |
 | Connector administration API breadth | Create/read/enqueue/status implemented; update/delete/cancel/credentials/audit remain gaps |
 | Connector UI / any functional frontend | Not implemented |
@@ -828,7 +833,7 @@ The current architecture supports this order because the data plane is stronger 
 
 | # | Item | Purpose, dependencies, deliverable | Recommended model | Manual credentials/business decisions |
 |---:|---|---|---|---|
-| 1 | Recurring Local Folder scheduler | Enqueue due scope jobs without combining scheduling with worker execution | GPT-5.6 Sol, high | Cadence, timezone, missed-run, and overlap policy required |
+| 1 | Cron/timezone scheduling | Add wall-clock recurrence only after timezone and DST policy is approved | GPT-5.6 Sol, high | Timezone, DST, and missed-run policy required |
 | 2 | Complete connector lifecycle APIs | Add update/archive/remove/cancel with narrow state transitions and audit emission | GPT-5.6 Sol, high | Retention and delegation decisions required |
 | 3 | Credential and validation services | Integrate secret manager and provider-neutral validation without exposing secrets | GPT-5.6 Sol, high | Secret platform and Local Folder deployment policy required |
 | 4 | End-to-end admin workflow | Bootstrap/configure/sync/observe/cancel/recover acceptance flow | GPT-5.6 Sol, high | Operator runbook decisions |
@@ -869,7 +874,8 @@ The current architecture supports this order because the data plane is stronger 
 
 ### Next blockers
 
-- [ ] Recurring synchronization scheduler
+- [x] Recurring UTC interval scheduler and database-only scheduler host
+- [ ] Cron/timezone wall-clock scheduling
 - [ ] Administrator authorization policy
 - [x] First Local Folder connector/scope/job create/read/enqueue APIs
 - [ ] Connector update/delete/cancel/credential and detailed run/item/error APIs

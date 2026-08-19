@@ -126,6 +126,44 @@ class EnqueueSyncJobRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
 
+class PutSyncScheduleRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    interval_seconds: int = Field(ge=900, le=2_592_000)
+    first_run_at: datetime | None = None
+
+    @field_validator("first_run_at")
+    @classmethod
+    def _first_run_must_be_aware(cls, value: datetime | None) -> datetime | None:
+        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+            raise ValueError("first_run_at must be timezone-aware")
+        return value
+
+
+class PatchSyncScheduleRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    action: Literal["pause", "resume"]
+
+
+class SyncScheduleResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schedule_id: UUID
+    connector_id: UUID
+    scope_id: UUID
+    status: Literal["active", "paused"]
+    interval_seconds: int
+    next_run_at: datetime
+    last_due_at: datetime | None
+    last_enqueued_at: datetime | None
+    last_job_id: UUID | None
+    pause_reason_code: str | None
+    paused_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
 class ConnectorPageResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 

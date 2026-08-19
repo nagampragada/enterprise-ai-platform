@@ -20,9 +20,11 @@ from app.dependencies import (
     get_connector_management_service,
     get_current_user,
     get_db_session,
+    get_connector_sync_schedule_service,
 )
 from app.main import app
 from application.services.connector_management_service import ConnectorManagementService
+from application.services.connector_sync_schedule_service import ConnectorSyncScheduleService
 from domain.embeddings.exceptions import RetryableEmbeddingProviderError
 from domain.embeddings.models import EmbeddingProfile, EmbeddingRequest, EmbeddingResult
 from domain.embeddings.provider import EmbeddingProvider
@@ -31,6 +33,7 @@ from infrastructure.db.models import (
     ConnectorScope,
     ConnectorSyncJob,
     ConnectorSyncRun,
+    ConnectorSyncSchedule,
     Document,
     DocumentChunk,
     DocumentIndexingState,
@@ -42,6 +45,11 @@ from infrastructure.workers.local_folder_sync_worker_host import (
     LocalFolderHostExitCode,
     LocalFolderWorkerHostSettings,
     compose_local_folder_sync_worker_host,
+)
+from infrastructure.workers.connector_sync_scheduler_host import (
+    ConnectorSyncSchedulerHostSettings,
+    SchedulerHostExitCode,
+    compose_connector_sync_scheduler_host,
 )
 
 ROOT = Path(__file__).resolve().parents[5]
@@ -93,6 +101,19 @@ def _host_settings(worker_id: str) -> LocalFolderWorkerHostSettings:
     )
 
 
+def _scheduler_settings(scheduler_id: str) -> ConnectorSyncSchedulerHostSettings:
+    return ConnectorSyncSchedulerHostSettings(
+        scheduler_id=scheduler_id,
+        poll_interval=timedelta(seconds=1),
+        maximum_consecutive_failures=3,
+        minimum_backoff=timedelta(seconds=1),
+        maximum_backoff=timedelta(seconds=4),
+        backoff_jitter=0.0,
+        graceful_shutdown_timeout=timedelta(seconds=30),
+        one_shot=True,
+    )
+
+
 def _identity(url: str):
     value = make_url(url)
     return value.drivername, value.host, value.port, value.database
@@ -129,7 +150,8 @@ def clean(engine):
             "external_directory_states", "user_external_identity_links", "external_principals",
             "document_indexing_attempts", "document_indexing_states", "document_version_documents",
             "document_versions", "connector_sync_cursors", "connector_sync_errors",
-            "connector_sync_items", "connector_sync_runs", "connector_sync_jobs",
+            "connector_sync_items", "connector_sync_runs", "connector_sync_schedules",
+            "connector_sync_jobs",
             "source_item_scope_memberships", "source_items", "connector_scopes", "connectors",
             "audit_events", "knowledge_space_user_grants", "knowledge_space_team_grants",
             "knowledge_space_department_grants", "knowledge_space_organization_grants",
@@ -539,4 +561,101 @@ def test_request_transaction_rolls_back_partial_connector(factory):
     assert response.status_code == 500 and "controlled" not in response.text
     session = factory()
     assert session.scalar(select(func.count()).select_from(Connector)) == 0
+    session.close()
+
+
+def test_recurring_schedule_runs_api_to_scheduler_to_worker_without_network(factory, tmp_path):
+    organization_id, user_id, space_id = _identity_rows(factory, "Scheduled", admin=True)
+    _configure_app(factory, organization_id, user_id)
+    clock_value = datetime(2026, 8, 24, 12, tzinfo=timezone.utc)
+
+    def schedule_service(db_session: Session = Depends(get_db_session)):
+        return ConnectorSyncScheduleService(db_session, clock=lambda: clock_value)
+
+    app.dependency_overrides[get_connector_sync_schedule_service] = schedule_service
+    root = tmp_path / "scheduled"
+    root.mkdir()
+    (root / "document.txt").write_text("scheduled content", encoding="utf-8")
+    with TestClient(app) as client:
+        connector = client.post(
+            "/api/v1/connectors",
+            json={"connector_type": "local_folder", "display_name": "Scheduled", "slug": "scheduled"},
+        )
+        connector_id = connector.json()["connector_id"]
+        scope = client.post(
+            f"/api/v1/connectors/{connector_id}/scopes",
+            json={
+                "knowledge_space_id": str(space_id), "display_name": "Scheduled", "slug": "scheduled",
+                "configuration": {"root_path": str(root.resolve()), "follow_symlinks": False},
+            },
+        )
+        scope_id = scope.json()["scope_id"]
+        schedule = client.put(
+            f"/api/v1/connectors/{connector_id}/scopes/{scope_id}/schedule",
+            json={"interval_seconds": 3600, "first_run_at": clock_value.isoformat()},
+        )
+    assert schedule.status_code == 200
+
+    scheduler = compose_connector_sync_scheduler_host(
+        _scheduler_settings("scheduler-e2e"), session_factory=factory, clock=lambda: clock_value,
+        random_uniform=lambda low, high: high,
+    )
+    assert scheduler.run() == SchedulerHostExitCode.SUCCESS
+    assert scheduler.run() == SchedulerHostExitCode.NO_WORK
+    session = factory()
+    job = session.scalar(select(ConnectorSyncJob))
+    persisted_schedule = session.scalar(select(ConnectorSyncSchedule))
+    assert job is not None and job.trigger_type == "scheduled" and job.status == "queued"
+    assert persisted_schedule.next_run_at == clock_value + timedelta(hours=1)
+    session.close()
+
+    provider = HostTestEmbeddingProvider()
+    worker = compose_local_folder_sync_worker_host(
+        _host_settings("worker-scheduled"), session_factory=factory,
+        embedding_provider_factory=lambda: provider, clock=lambda: clock_value,
+        random_uniform=lambda low, high: high,
+    )
+    assert worker.run() == LocalFolderHostExitCode.SUCCESS and provider.calls == 1
+
+    clock_value += timedelta(hours=3, minutes=20)
+    assert scheduler.run() == SchedulerHostExitCode.SUCCESS
+    session = factory()
+    active_job = session.scalar(
+        select(ConnectorSyncJob).where(ConnectorSyncJob.status == "queued")
+    )
+    persisted_schedule = session.scalar(select(ConnectorSyncSchedule))
+    assert active_job is not None
+    assert persisted_schedule.next_run_at == datetime(2026, 8, 24, 16, tzinfo=timezone.utc)
+    clock_value = persisted_schedule.next_run_at
+    session.close()
+    assert scheduler.run() == SchedulerHostExitCode.SUCCESS
+    session = factory()
+    assert session.scalar(
+        select(func.count()).select_from(ConnectorSyncJob).where(
+            ConnectorSyncJob.status.in_(("queued", "running", "retry_wait"))
+        )
+    ) == 1
+    session.close()
+
+    with TestClient(app) as client:
+        paused = client.patch(
+            f"/api/v1/connectors/{connector_id}/scopes/{scope_id}/schedule",
+            json={"action": "pause"},
+        )
+        assert paused.status_code == 200 and paused.json()["status"] == "paused"
+        resumed = client.patch(
+            f"/api/v1/connectors/{connector_id}/scopes/{scope_id}/schedule",
+            json={"action": "resume"},
+        )
+        assert resumed.status_code == 200 and resumed.json()["next_run_at"] > clock_value.isoformat()
+        deleted = client.delete(
+            f"/api/v1/connectors/{connector_id}/scopes/{scope_id}/schedule"
+        )
+        manual = client.post(
+            f"/api/v1/connectors/{connector_id}/scopes/{scope_id}/sync-jobs"
+        )
+    assert deleted.status_code == 204 and manual.status_code == 202
+    session = factory()
+    assert session.scalar(select(func.count()).select_from(ConnectorSyncSchedule)) == 0
+    assert session.get(ConnectorSyncJob, active_job.id) is not None
     session.close()

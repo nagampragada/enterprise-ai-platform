@@ -14,11 +14,16 @@ from app.dependencies import (
     ConnectorAdministrator,
     get_connector_administrator,
     get_connector_management_service,
+    get_connector_sync_schedule_service,
     get_db_session,
 )
 from app.main import app
 from application.services.connector_management_service import (
     ConnectorManagementNotFound,
+)
+from application.services.connector_sync_schedule_service import (
+    SyncScheduleNotFound,
+    SyncScheduleView,
 )
 from infrastructure.repositories.connector_repository import (
     ConnectorPage,
@@ -103,7 +108,19 @@ def _job(connector_id=None, scope_id=None, **overrides):
     return SimpleNamespace(**values)
 
 
-def _setup(service=None, session=None):
+def _schedule(connector_id=None, scope_id=None, **overrides):
+    values = dict(
+        schedule_id=uuid4(), connector_id=connector_id or uuid4(),
+        connector_scope_id=scope_id or uuid4(), status="active", interval_seconds=3600,
+        next_run_at=NOW + __import__("datetime").timedelta(hours=1), last_due_at=None,
+        last_enqueued_at=None, last_job_id=None, pause_reason_code=None, paused_at=None,
+        created_at=NOW, updated_at=NOW,
+    )
+    values.update(overrides)
+    return SyncScheduleView(**values)
+
+
+def _setup(service=None, session=None, schedule_service=None):
     service = service or Mock()
     session = session or FakeSession()
     administrator = ConnectorAdministrator(uuid4(), uuid4())
@@ -114,6 +131,8 @@ def _setup(service=None, session=None):
     app.dependency_overrides[get_db_session] = session_override
     app.dependency_overrides[get_connector_administrator] = lambda: administrator
     app.dependency_overrides[get_connector_management_service] = lambda: service
+    if schedule_service is not None:
+        app.dependency_overrides[get_connector_sync_schedule_service] = lambda: schedule_service
     return service, session, administrator
 
 
@@ -301,3 +320,81 @@ def test_job_list_and_get_are_redacted_and_cross_tenant_not_found_is_safe():
     with TestClient(app) as client:
         concealed = client.get(f"/api/v1/connectors/{connector_id}/scopes/{scope_id}/sync-jobs/{uuid4()}")
     assert concealed.status_code == 404 and concealed.json() == {"detail": "Resource not found"}
+
+
+def test_schedule_put_get_pause_resume_delete_use_admin_identity_and_transactions():
+    schedule_service = Mock()
+    _, session, admin = _setup(schedule_service=schedule_service)
+    connector_id, scope_id = uuid4(), uuid4()
+    active = _schedule(connector_id, scope_id)
+    paused = _schedule(
+        connector_id, scope_id, status="paused", pause_reason_code="administrator_paused",
+        paused_at=NOW,
+    )
+    schedule_service.create_or_replace.return_value = active
+    schedule_service.get.return_value = active
+    schedule_service.pause.return_value = paused
+    schedule_service.resume.return_value = active
+    with TestClient(app) as client:
+        created = client.put(
+            f"/api/v1/connectors/{connector_id}/scopes/{scope_id}/schedule",
+            json={"interval_seconds": 3600},
+        )
+        read = client.get(f"/api/v1/connectors/{connector_id}/scopes/{scope_id}/schedule")
+        pause = client.patch(
+            f"/api/v1/connectors/{connector_id}/scopes/{scope_id}/schedule",
+            json={"action": "pause"},
+        )
+        resume = client.patch(
+            f"/api/v1/connectors/{connector_id}/scopes/{scope_id}/schedule",
+            json={"action": "resume"},
+        )
+        deleted = client.delete(
+            f"/api/v1/connectors/{connector_id}/scopes/{scope_id}/schedule"
+        )
+    assert created.status_code == read.status_code == pause.status_code == resume.status_code == 200
+    assert deleted.status_code == 204 and deleted.content == b""
+    schedule_service.create_or_replace.assert_called_once_with(
+        admin.organization_id, admin.user_id, connector_id, scope_id,
+        interval_seconds=3600, first_run_at=None,
+    )
+    schedule_service.get.assert_called_once_with(admin.organization_id, connector_id, scope_id)
+    schedule_service.pause.assert_called_once_with(admin.organization_id, connector_id, scope_id)
+    schedule_service.resume.assert_called_once_with(admin.organization_id, connector_id, scope_id)
+    schedule_service.delete.assert_called_once_with(admin.organization_id, connector_id, scope_id)
+    assert session.commit_calls == 4 and session.rollback_calls == 0
+    for response in (created, read, pause, resume):
+        assert "organization_id" not in response.text
+        assert "root" not in response.text and "secret" not in response.text
+
+
+def test_schedule_requests_reject_unknown_identity_actions_intervals_and_naive_time():
+    _setup(schedule_service=Mock())
+    path = f"/api/v1/connectors/{uuid4()}/scopes/{uuid4()}/schedule"
+    payloads = (
+        {"interval_seconds": 899},
+        {"interval_seconds": 2_592_001},
+        {"interval_seconds": 3600, "organization_id": str(uuid4())},
+        {"interval_seconds": 3600, "created_by_user_id": str(uuid4())},
+        {"interval_seconds": 3600, "first_run_at": "2026-08-24T12:00:00"},
+    )
+    with TestClient(app) as client:
+        responses = [client.put(path, json=payload) for payload in payloads]
+        invalid_action = client.patch(path, json={"action": "replace"})
+        extra_action = client.patch(path, json={"action": "pause", "interval_seconds": 3600})
+    assert all(response.status_code == 422 for response in (*responses, invalid_action, extra_action))
+
+
+def test_missing_schedule_is_concealed_and_mutation_rolls_back():
+    schedule_service = Mock()
+    schedule_service.get.side_effect = SyncScheduleNotFound("foreign schedule")
+    _, session, _ = _setup(schedule_service=schedule_service)
+    path = f"/api/v1/connectors/{uuid4()}/scopes/{uuid4()}/schedule"
+    with TestClient(app) as client:
+        missing = client.get(path)
+    assert missing.status_code == 404 and missing.json() == {"detail": "Resource not found"}
+    schedule_service.create_or_replace.side_effect = RuntimeError("C:/secret/root")
+    with TestClient(app) as client:
+        failed = client.put(path, json={"interval_seconds": 3600})
+    assert failed.status_code == 500 and "secret" not in failed.text and "root" not in failed.text
+    assert session.rollback_calls == 1

@@ -23,6 +23,9 @@ from app.api.v1.connectors.schemas import (
     CreateConnectorScopeRequest,
     EnqueueSyncJobRequest,
     EnqueueSyncJobResponse,
+    PatchSyncScheduleRequest,
+    PutSyncScheduleRequest,
+    SyncScheduleResponse,
     SyncJobPageResponse,
     SyncJobResponse,
     decode_cursor,
@@ -32,6 +35,7 @@ from app.dependencies import (
     ConnectorAdministrator,
     get_connector_administrator,
     get_connector_management_service,
+    get_connector_sync_schedule_service,
     get_db_session,
 )
 from application.services.connector_management_service import (
@@ -40,6 +44,12 @@ from application.services.connector_management_service import (
     ConnectorManagementPersistenceError,
     ConnectorManagementService,
     InvalidConnectorManagementRequest,
+)
+from application.services.connector_sync_schedule_service import (
+    ConnectorSyncScheduleService,
+    SyncScheduleNotFound,
+    SyncScheduleResourceConflict,
+    SyncScheduleView,
 )
 from infrastructure.repositories.connector_repository import (
     ConnectorPageCursor,
@@ -53,6 +63,11 @@ from infrastructure.repositories.connector_sync_job_repository import (
     SyncJobConflict,
     SyncJobPageCursor,
     SyncJobPersistenceError,
+)
+from infrastructure.repositories.connector_sync_schedule_repository import (
+    InvalidSyncScheduleRequest,
+    SyncScheduleConflict,
+    SyncSchedulePersistenceError,
 )
 
 class SafeConnectorValidationRoute(APIRoute):
@@ -291,6 +306,94 @@ def get_sync_job(
         _raise_http(exc)
 
 
+@connectors_router.put(
+    "/{connector_id}/scopes/{scope_id}/schedule",
+    response_model=SyncScheduleResponse,
+)
+def put_sync_schedule(
+    connector_id: UUID,
+    scope_id: UUID,
+    payload: PutSyncScheduleRequest,
+    administrator: ConnectorAdministrator = Depends(get_connector_administrator),
+    service: ConnectorSyncScheduleService = Depends(get_connector_sync_schedule_service),
+    db_session: Session = Depends(get_db_session),
+) -> SyncScheduleResponse:
+    try:
+        schedule = service.create_or_replace(
+            administrator.organization_id,
+            administrator.user_id,
+            connector_id,
+            scope_id,
+            interval_seconds=payload.interval_seconds,
+            first_run_at=payload.first_run_at,
+        )
+        db_session.commit()
+        return _schedule_response(schedule)
+    except Exception as exc:
+        db_session.rollback()
+        _raise_http(exc)
+
+
+@connectors_router.get(
+    "/{connector_id}/scopes/{scope_id}/schedule",
+    response_model=SyncScheduleResponse,
+)
+def get_sync_schedule(
+    connector_id: UUID,
+    scope_id: UUID,
+    administrator: ConnectorAdministrator = Depends(get_connector_administrator),
+    service: ConnectorSyncScheduleService = Depends(get_connector_sync_schedule_service),
+) -> SyncScheduleResponse:
+    try:
+        return _schedule_response(
+            service.get(administrator.organization_id, connector_id, scope_id)
+        )
+    except Exception as exc:
+        _raise_http(exc)
+
+
+@connectors_router.patch(
+    "/{connector_id}/scopes/{scope_id}/schedule",
+    response_model=SyncScheduleResponse,
+)
+def patch_sync_schedule(
+    connector_id: UUID,
+    scope_id: UUID,
+    payload: PatchSyncScheduleRequest,
+    administrator: ConnectorAdministrator = Depends(get_connector_administrator),
+    service: ConnectorSyncScheduleService = Depends(get_connector_sync_schedule_service),
+    db_session: Session = Depends(get_db_session),
+) -> SyncScheduleResponse:
+    try:
+        operation = service.pause if payload.action == "pause" else service.resume
+        schedule = operation(administrator.organization_id, connector_id, scope_id)
+        db_session.commit()
+        return _schedule_response(schedule)
+    except Exception as exc:
+        db_session.rollback()
+        _raise_http(exc)
+
+
+@connectors_router.delete(
+    "/{connector_id}/scopes/{scope_id}/schedule",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_sync_schedule(
+    connector_id: UUID,
+    scope_id: UUID,
+    administrator: ConnectorAdministrator = Depends(get_connector_administrator),
+    service: ConnectorSyncScheduleService = Depends(get_connector_sync_schedule_service),
+    db_session: Session = Depends(get_db_session),
+) -> Response:
+    try:
+        service.delete(administrator.organization_id, connector_id, scope_id)
+        db_session.commit()
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    except Exception as exc:
+        db_session.rollback()
+        _raise_http(exc)
+
+
 def _connector_response(row) -> ConnectorResponse:
     return ConnectorResponse(
         connector_id=row.id,
@@ -343,21 +446,44 @@ def _job_values(row) -> dict[str, object]:
     }
 
 
+def _schedule_response(row: SyncScheduleView) -> SyncScheduleResponse:
+    return SyncScheduleResponse(
+        schedule_id=row.schedule_id,
+        connector_id=row.connector_id,
+        scope_id=row.connector_scope_id,
+        status=row.status,
+        interval_seconds=row.interval_seconds,
+        next_run_at=row.next_run_at,
+        last_due_at=row.last_due_at,
+        last_enqueued_at=row.last_enqueued_at,
+        last_job_id=row.last_job_id,
+        pause_reason_code=row.pause_reason_code,
+        paused_at=row.paused_at,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
 def _raise_http(exc: Exception) -> None:
     if isinstance(exc, HTTPException):
         raise exc
     if isinstance(exc, ConnectorManagementNotFound):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resource not found") from exc
-    if isinstance(exc, (ConnectorRepositoryConflict, SyncJobConflict)):
+    if isinstance(exc, SyncScheduleNotFound):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resource not found") from exc
+    if isinstance(exc, (ConnectorRepositoryConflict, SyncJobConflict, SyncScheduleConflict)):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Resource conflict") from exc
-    if isinstance(exc, ConnectorManagementConflict):
+    if isinstance(exc, (ConnectorManagementConflict, SyncScheduleResourceConflict)):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Resource state conflict") from exc
     if isinstance(exc, InvalidConnectorManagementRequest):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Connector request is invalid",
         ) from exc
-    if isinstance(exc, (InvalidConnectorRepositoryRequest, InvalidSyncJobRequest, ValueError)):
+    if isinstance(
+        exc,
+        (InvalidConnectorRepositoryRequest, InvalidSyncJobRequest, InvalidSyncScheduleRequest, ValueError),
+    ):
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Connector request is invalid") from exc
     if isinstance(
         exc,
@@ -365,6 +491,7 @@ def _raise_http(exc: Exception) -> None:
             ConnectorManagementPersistenceError,
             ConnectorRepositoryPersistenceError,
             SyncJobPersistenceError,
+            SyncSchedulePersistenceError,
             SQLAlchemyError,
         ),
     ):
