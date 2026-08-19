@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Callable
 from uuid import UUID
 
@@ -12,12 +12,13 @@ from sqlalchemy.orm import Session
 
 from application.services.connector_sync_execution_service import ConnectorSyncExecutionService
 from application.services.connector_sync_retry_policy import SyncFailureKind, classify_exception
-from application.services.local_folder_synchronization_service import (
-    LocalFolderSynchronizationRequest,
-    LocalFolderSynchronizationService,
+from application.services.staged_local_folder_synchronization_service import (
+    LocalFolderDiscoveredEntry,
+    LocalFolderPreparationService,
+    LocalFolderSynchronizationSnapshot,
+    PreparedLocalFolderItem,
+    StagedLocalFolderSynchronizationService,
 )
-from infrastructure.repositories.connector_repository import ConnectorRepository
-from infrastructure.repositories.connector_scope_repository import ConnectorScopeRepository
 from infrastructure.repositories.connector_sync_job_repository import (
     LostSyncJobLease,
     StaleSyncJobFence,
@@ -68,7 +69,7 @@ class LocalFolderWorkerResult:
 
 
 ExecutionServiceFactory = Callable[[Session], ConnectorSyncExecutionService]
-LocalFolderServiceFactory = Callable[[Session], LocalFolderSynchronizationService]
+StagedLocalFolderServiceFactory = Callable[[Session], StagedLocalFolderSynchronizationService]
 SessionFactory = Callable[[], Session]
 
 
@@ -79,17 +80,20 @@ class LocalFolderSyncWorker:
         self,
         session_factory: SessionFactory,
         execution_service_factory: ExecutionServiceFactory,
-        local_folder_service_factory: LocalFolderServiceFactory,
+        staged_service_factory: StagedLocalFolderServiceFactory,
+        preparation_service: LocalFolderPreparationService,
         *,
         worker_id: str,
         lease_duration: timedelta = DEFAULT_LEASE_DURATION,
         heartbeat_target: timedelta = DEFAULT_HEARTBEAT_TARGET,
         steps_per_invocation: int = DEFAULT_STEPS_PER_INVOCATION,
         batch_size: int = DEFAULT_BATCH_SIZE,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._session_factory = session_factory
         self._execution_service_factory = execution_service_factory
-        self._local_folder_service_factory = local_folder_service_factory
+        self._staged_service_factory = staged_service_factory
+        self._preparation = preparation_service
         self._worker_id = _worker_identifier(worker_id)
         self._lease_duration = _positive_duration("lease_duration", lease_duration, maximum=3600)
         self._heartbeat_target = _positive_duration(
@@ -99,6 +103,7 @@ class LocalFolderSyncWorker:
             "steps_per_invocation", steps_per_invocation, MAX_STEPS_PER_INVOCATION
         )
         self._batch_size = _bounded_integer("batch_size", batch_size, 100)
+        self._clock = clock
 
     def run_one(self, organization_id: UUID) -> LocalFolderWorkerResult:
         context = self.claim_one(organization_id)
@@ -176,82 +181,110 @@ class LocalFolderSyncWorker:
     def _execute_step(
         self, context: LocalFolderAttemptContext
     ) -> tuple[str, LocalFolderAttemptContext]:
-        session = self._session_factory()
-        deferred: tuple[str, BaseException | None] | None = None
         try:
-            execution = self._execution_service_factory(session)
-            state = execution.validate_attempt(
-                _lease(context), context.sync_run_id, worker_id=self._worker_id
-            )
-            if state.cancellation_requested:
-                session.rollback()
-                return self._acknowledge_cancellation(context), context
-            self._validate_local_folder_dispatch(session, context)
-            result = self._local_folder_service_factory(session).synchronize(
-                LocalFolderSynchronizationRequest(
-                    context.organization_id,
-                    context.connector_id,
-                    context.connector_scope_id,
-                    sync_run_id=context.sync_run_id,
-                    mode=context.mode,
-                    trigger_type=context.trigger_type,
-                    batch_size=self._batch_size,
-                )
-            )
-            if result.sync_run_id != context.sync_run_id:
-                raise UnsupportedLocalFolderJob("synchronization run identity changed")
-            if result.outcome == "completed":
-                execution.complete_success(_lease(context), worker_id=self._worker_id)
-                session.commit()
+            snapshot = self._load_snapshot(context)
+            if snapshot.phase == "completed":
                 return "completed", context
-            if result.outcome != "running":
-                raise UnsupportedLocalFolderJob("synchronization outcome is invalid")
-            renewed = execution.heartbeat(
+            if snapshot.phase == "reconciliation":
+                outcome = self._persist_reconciliation(context, snapshot)
+                return outcome, context
+            entry = self._preparation.discover_next(snapshot)
+            prepared: PreparedLocalFolderItem | None = None
+            if entry is not None:
+                item_snapshot = self._load_item_snapshot(context, snapshot, entry)
+                prepared = self._preparation.prepare_item(snapshot, item_snapshot, entry)
+            outcome = self._persist_discovery(context, snapshot, prepared)
+            return outcome, context
+        except SyncJobCancellationConflict:
+            return self._acknowledge_cancellation(context), context
+        except (LostSyncJobLease, StaleSyncJobFence):
+            return "lost_lease", context
+        except Exception as error:
+            return self._record_failure(context, error), context
+
+    def _load_snapshot(
+        self, context: LocalFolderAttemptContext
+    ) -> LocalFolderSynchronizationSnapshot:
+        session = self._session_factory()
+        try:
+            snapshot = self._staged_service_factory(session).snapshot(
+                _lease(context), context.sync_run_id,
+                worker_id=self._worker_id, now=self._now(),
+            )
+            session.commit()
+            return snapshot
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def _load_item_snapshot(
+        self,
+        context: LocalFolderAttemptContext,
+        snapshot: LocalFolderSynchronizationSnapshot,
+        entry: LocalFolderDiscoveredEntry,
+    ):
+        session = self._session_factory()
+        try:
+            result = self._staged_service_factory(session).item_snapshot(
+                _lease(context), snapshot, entry, worker_id=self._worker_id
+            )
+            session.commit()
+            return result
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def _persist_discovery(
+        self,
+        context: LocalFolderAttemptContext,
+        snapshot: LocalFolderSynchronizationSnapshot,
+        prepared: PreparedLocalFolderItem | None,
+    ) -> str:
+        session = self._session_factory()
+        try:
+            result = self._staged_service_factory(session).persist_discovery(
+                _lease(context), snapshot, prepared,
+                worker_id=self._worker_id, now=self._now(),
+            )
+            self._execution_service_factory(session).heartbeat(
                 _lease(context),
                 worker_id=self._worker_id,
                 lease_duration=self._lease_duration,
             )
             session.commit()
-            return "in_progress", replace(context, lease_expires_at=renewed.lease_expires_at)
-        except SyncJobCancellationConflict:
+            return "in_progress" if result.outcome != "completed" else "completed"
+        except Exception:
             session.rollback()
-            deferred = ("cancelled", None)
-        except (LostSyncJobLease, StaleSyncJobFence):
-            session.rollback()
-            deferred = ("lost_lease", None)
-        except Exception as error:
-            session.rollback()
-            deferred = ("failure", error)
+            raise
         finally:
             session.close()
-        if deferred is None:
-            raise RuntimeError("continuation outcome was not resolved")
-        if deferred[0] == "cancelled":
-            return self._acknowledge_cancellation(context), context
-        if deferred[0] == "lost_lease":
-            return "lost_lease", context
-        assert deferred[1] is not None
-        return self._record_failure(context, deferred[1]), context
 
-    def _validate_local_folder_dispatch(
-        self, session: Session, context: LocalFolderAttemptContext
-    ) -> None:
-        connector = ConnectorRepository(session).get_by_id(
-            context.organization_id, context.connector_id
-        )
-        scope = ConnectorScopeRepository(session).get_by_id(
-            context.organization_id, context.connector_scope_id
-        )
-        if (
-            connector is None
-            or connector.connector_type != "local_folder"
-            or connector.status != "active"
-            or scope is None
-            or scope.organization_id != context.organization_id
-            or scope.connector_id != context.connector_id
-            or scope.status != "active"
-        ):
-            raise UnsupportedLocalFolderJob("Local Folder synchronization is unavailable")
+    def _persist_reconciliation(
+        self, context: LocalFolderAttemptContext, snapshot: LocalFolderSynchronizationSnapshot
+    ) -> str:
+        session = self._session_factory()
+        try:
+            result = self._staged_service_factory(session).reconcile(
+                _lease(context), snapshot, worker_id=self._worker_id,
+                now=self._now(), limit=self._batch_size,
+            )
+            if result.outcome != "completed":
+                self._execution_service_factory(session).heartbeat(
+                    _lease(context),
+                    worker_id=self._worker_id,
+                    lease_duration=self._lease_duration,
+                )
+            session.commit()
+            return result.outcome
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
 
     def _acknowledge_cancellation(self, context: LocalFolderAttemptContext) -> str:
         session = self._session_factory()
@@ -296,6 +329,12 @@ class LocalFolderSyncWorker:
         if acknowledge:
             return self._acknowledge_cancellation(context)
         raise RuntimeError("failure outcome was not resolved")
+
+    def _now(self) -> datetime:
+        value = self._clock()
+        if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+            raise InvalidLocalFolderWorkerConfiguration("clock must return timezone-aware time")
+        return value
 
 
 def _classify_chain(error: BaseException) -> SyncFailureKind:

@@ -16,10 +16,10 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from application.services.connector_sync_execution_service import ConnectorSyncExecutionService
 from application.services.connector_sync_retry_policy import ConnectorSyncRetryPolicy
-from application.services.document_chunk_embedding_service import DocumentChunkEmbeddingService
-from application.services.local_document_indexing_service import LocalDocumentIndexingService
-from application.services.local_document_ingestion_service import LocalDocumentIngestionService
-from application.services.local_folder_synchronization_service import LocalFolderSynchronizationService
+from application.services.staged_local_folder_synchronization_service import (
+    LocalFolderPreparationService,
+    StagedLocalFolderSynchronizationService,
+)
 from domain.embeddings.exceptions import PermanentEmbeddingProviderError, RetryableEmbeddingProviderError
 from domain.embeddings.models import EmbeddingProfile, EmbeddingRequest, EmbeddingResult
 from domain.embeddings.provider import EmbeddingProvider
@@ -38,16 +38,9 @@ from infrastructure.db.models import (
     KnowledgeSpace,
     Organization,
     SourceItem,
+    SourceItemScopeMembership,
 )
-from infrastructure.repositories.connector_repository import ConnectorRepository
-from infrastructure.repositories.connector_scope_repository import ConnectorScopeRepository
 from infrastructure.repositories.connector_sync_job_repository import ConnectorSyncJobRepository
-from infrastructure.repositories.connector_sync_repository import ConnectorSyncRepository
-from infrastructure.repositories.document_chunk_repository import DocumentChunkRepository
-from infrastructure.repositories.document_indexing_repository import DocumentIndexingRepository
-from infrastructure.repositories.document_repository import DocumentRepository
-from infrastructure.repositories.document_version_repository import DocumentVersionRepository
-from infrastructure.repositories.source_item_repository import SourceItemRepository
 from infrastructure.workers.local_folder_sync_worker import LocalFolderSyncWorker
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -195,43 +188,28 @@ def _configured_scope(factory, root: Path, name: str):
     return organization_id, connector_id, scope_id
 
 
-def _local_service(
-    session: Session, provider: EmbeddingProvider, clock: MutableClock
-) -> LocalFolderSynchronizationService:
-    chunks = DocumentChunkRepository(session)
-    indexing = LocalDocumentIndexingService(
-        LocalDocumentIngestionService(
-            create_default_content_extractor_registry(),
-            DeterministicTextChunker(),
-            DocumentRepository(session),
-            chunks,
-        ),
-        chunks,
-        DocumentChunkEmbeddingService(provider, chunks),
-    )
-    return LocalFolderSynchronizationService(
-        ConnectorRepository(session),
-        ConnectorScopeRepository(session),
-        SourceItemRepository(session),
-        ConnectorSyncRepository(session),
-        DocumentVersionRepository(session),
-        DocumentIndexingRepository(session),
-        indexing,
-        clock=clock,
-    )
-
-
 def _worker(factory, clock: MutableClock, provider: EmbeddingProvider, *, worker="worker-one"):
     policy = ConnectorSyncRetryPolicy(random_uniform=lambda low, high: high / 2)
+    preparation = LocalFolderPreparationService(
+        create_default_content_extractor_registry(), DeterministicTextChunker(), provider
+    )
     return LocalFolderSyncWorker(
         factory,
         lambda session: ConnectorSyncExecutionService(
             ConnectorSyncJobRepository(session), policy, clock=clock
         ),
-        lambda session: _local_service(session, provider, clock),
+        lambda session: StagedLocalFolderSynchronizationService(
+            session,
+            ConnectorSyncExecutionService(
+                ConnectorSyncJobRepository(session), policy, clock=clock
+            ),
+            preparation.profile,
+        ),
+        preparation,
         worker_id=worker,
         steps_per_invocation=1,
         batch_size=1,
+        clock=clock,
     )
 
 
@@ -305,6 +283,111 @@ def test_success_and_unchanged_rerun_reuse_committed_indexing(engine, tmp_path):
     assert provider.calls == first_calls
     assert _count(factory, DocumentVersion) == 2
     assert _count(factory, DocumentIndexingAttempt) == 2
+
+
+def test_changed_file_creates_exactly_one_new_version(engine, tmp_path):
+    factory, clock = _session_factory(engine), MutableClock()
+    root = tmp_path / "changed"; root.mkdir()
+    path = root / "a.txt"; path.write_text("alpha", encoding="utf-8")
+    organization_id, connector_id, scope_id = _configured_scope(factory, root, "Changed")
+    provider = DeterministicWorkerEmbeddingProvider(); worker = _worker(factory, clock, provider)
+    _enqueue(factory, clock, organization_id, connector_id, scope_id)
+    first = worker.claim_one(organization_id); assert first is not None
+    assert _finish(worker, first)[-1].outcome == "completed"
+    path.write_text("beta", encoding="utf-8")
+    _enqueue(factory, clock, organization_id, connector_id, scope_id)
+    second = worker.claim_one(organization_id); assert second is not None
+    assert _finish(worker, second)[-1].outcome == "completed"
+    assert _count(factory, DocumentVersion) == 2
+    assert _count(factory, DocumentIndexingAttempt) == 2
+    assert provider.calls == 2
+
+
+def test_missing_item_is_removed_only_after_complete_scan_reconciliation(engine, tmp_path):
+    factory, clock = _session_factory(engine), MutableClock()
+    root = tmp_path / "removed"; root.mkdir()
+    (root / "a.txt").write_text("alpha", encoding="utf-8")
+    removed = root / "b.txt"; removed.write_text("beta", encoding="utf-8")
+    organization_id, connector_id, scope_id = _configured_scope(factory, root, "Removed")
+    worker = _worker(factory, clock, DeterministicWorkerEmbeddingProvider())
+    _enqueue(factory, clock, organization_id, connector_id, scope_id)
+    first = worker.claim_one(organization_id); assert first is not None
+    assert _finish(worker, first)[-1].outcome == "completed"
+    removed.unlink()
+    clock.advance(timedelta(seconds=1))
+    _enqueue(factory, clock, organization_id, connector_id, scope_id)
+    second = worker.claim_one(organization_id); assert second is not None
+    assert worker.execute(second).outcome == "in_progress"
+    session = factory()
+    memberships = session.scalars(select(SourceItemScopeMembership)).all()
+    assert sum(row.status == "active" for row in memberships) == 2
+    session.close()
+    assert _finish(worker, second)[-1].outcome == "completed"
+    session = factory(); memberships = session.scalars(select(SourceItemScopeMembership)).all()
+    assert sum(row.status == "removed" for row in memberships) == 1
+    session.close()
+
+
+def test_embedding_failure_before_complete_scan_never_removes_unseen_item(engine, tmp_path):
+    factory, clock = _session_factory(engine), MutableClock()
+    root = tmp_path / "partial"; root.mkdir()
+    changed = root / "a.txt"; changed.write_text("alpha", encoding="utf-8")
+    missing = root / "b.txt"; missing.write_text("beta", encoding="utf-8")
+    organization_id, connector_id, scope_id = _configured_scope(factory, root, "Partial")
+    initial = _worker(factory, clock, DeterministicWorkerEmbeddingProvider())
+    _enqueue(factory, clock, organization_id, connector_id, scope_id)
+    first = initial.claim_one(organization_id); assert first is not None
+    assert _finish(initial, first)[-1].outcome == "completed"
+    changed.write_text("changed", encoding="utf-8"); missing.unlink()
+    failing = _worker(factory, clock, DeterministicWorkerEmbeddingProvider(transient_failures=1))
+    _enqueue(factory, clock, organization_id, connector_id, scope_id)
+    attempt = failing.claim_one(organization_id); assert attempt is not None
+    assert failing.execute(attempt).outcome == "retry_scheduled"
+    session = factory(); memberships = session.scalars(select(SourceItemScopeMembership)).all()
+    assert all(row.status == "active" for row in memberships)
+    session.close()
+
+
+def test_crash_after_one_persisted_item_resumes_without_duplicate_artifacts(engine, tmp_path):
+    factory, clock = _session_factory(engine), MutableClock()
+    root = tmp_path / "resume"; root.mkdir()
+    (root / "a.txt").write_text("alpha", encoding="utf-8")
+    (root / "b.txt").write_text("beta", encoding="utf-8")
+    organization_id, connector_id, scope_id = _configured_scope(factory, root, "Resume")
+    provider = DeterministicWorkerEmbeddingProvider(); worker = _worker(factory, clock, provider)
+    _enqueue(factory, clock, organization_id, connector_id, scope_id)
+    context = worker.claim_one(organization_id); assert context is not None
+    assert worker.execute(context).outcome == "in_progress"
+    assert _count(factory, SourceItem) == 1 and _count(factory, DocumentVersion) == 1
+    resumed = _worker(factory, clock, provider)
+    assert _finish(resumed, context)[-1].outcome == "completed"
+    assert _count(factory, SourceItem) == 2
+    assert _count(factory, DocumentVersion) == 2
+    assert _count(factory, DocumentIndexingAttempt) == 2
+    assert provider.calls == 2
+
+
+def test_stale_prepared_item_cannot_overwrite_newer_persisted_source(engine, tmp_path):
+    factory, clock = _session_factory(engine), MutableClock()
+    root = tmp_path / "stale-prepared"; root.mkdir()
+    path = root / "a.txt"; path.write_text("alpha", encoding="utf-8")
+    organization_id, connector_id, scope_id = _configured_scope(factory, root, "StalePrepared")
+    provider = DeterministicWorkerEmbeddingProvider(); worker = _worker(factory, clock, provider)
+    _enqueue(factory, clock, organization_id, connector_id, scope_id)
+    first = worker.claim_one(organization_id); assert first is not None
+    assert _finish(worker, first)[-1].outcome == "completed"
+    path.write_text("beta", encoding="utf-8")
+    _enqueue(factory, clock, organization_id, connector_id, scope_id)
+    second = worker.claim_one(organization_id); assert second is not None
+    original = worker._preparation.prepare_item
+    def prepare_then_advance(*args):
+        prepared = original(*args)
+        session = factory(); source = session.scalar(select(SourceItem))
+        source.source_checksum = "b" * 64; session.commit(); session.close()
+        return prepared
+    worker._preparation.prepare_item = prepare_then_advance  # type: ignore[method-assign]
+    assert worker.execute(second).outcome == "retry_scheduled"
+    assert _count(factory, DocumentVersion) == 1
 
 
 def test_transient_retry_allocates_new_lease_fence_and_run_then_succeeds(engine, tmp_path):
@@ -471,7 +554,7 @@ def test_provider_response_then_commit_failure_rolls_back_progress_and_fails_saf
         nonlocal calls
         calls += 1
         session = base_factory()
-        if calls == 2:
+        if calls == 4:
             original_commit = session.commit
             def fail_before_commit():
                 raise RuntimeError("controlled pre-commit failure")

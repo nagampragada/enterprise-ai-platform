@@ -450,16 +450,16 @@ There is no `sleep()`, immediate retry loop, forever poll, or unlimited retry co
 
 ## 18. Local Folder worker runner
 
-`LocalFolderSyncWorker` is a bounded transaction adapter, not a daemon.
+`LocalFolderSyncWorker` is a bounded staged transaction adapter, not a daemon.
 
 1. Open acquisition session.
 2. Acquire at most one eligible job and allocate exactly one linked run.
 3. Commit acquisition before folder access; close session.
 4. Open a short heartbeat session; conditionally renew; commit/close.
-5. Open continuation session; validate tenant/job/run/worker/lease/fence/attempt/expiry and Local Folder connector/scope state.
-6. Process one bounded Local Folder continuation by default (hard helper maximum 10; batch size validated up to 100).
-7. For incomplete work, perform a conditional heartbeat as the pre-commit fencing/cancellation barrier, then commit progress and keep the same attempt/run/lease.
-8. For complete work, atomically commit cursor/reconciliation/indexing, run completion, and job success.
+5. Open a short snapshot session; validate tenant/job/run/worker/lease/fence/attempt/expiry and Local Folder connector/scope state; return immutable scalar/path/profile data; commit/close.
+6. Discover one manifest entry, read/check the file, extract, chunk, and embed outside every SQLAlchemy session. Completed run items and checksum/profile-complete items skip provider work. File identity is checked before and after extraction and after embedding.
+7. Open a short item persistence session; revalidate the fence and active context, lock canonical source/version/indexing rows, reject stale prepared work, atomically persist the item and cursor, then apply a conditional heartbeat as the pre-commit barrier.
+8. After an exhausted complete scan, run bounded reconciliation transactions. Only then atomically commit completed cursor, run completion, and job success.
 9. On failure, roll back and close the continuation session before opening a separate safe outcome session. Schedule retry or fail; never execute the retry in the same invocation.
 10. On cancellation, acknowledge in a separate current-lease transaction. On lease loss, return `lost_lease` without mutating outcome.
 11. Close every session in `finally`, including no-work, cancellation, commit-failure, rollback, and stale-worker paths.
@@ -468,7 +468,7 @@ Defaults: 5-minute lease, 60-second heartbeat target, one step per invocation, h
 
 Cancellation is checked before folder access, before/between steps, at the pre-commit barrier, and in success finalization. One indivisible filesystem/extractor/embedding call is not interrupted; cancellation is observed at the next boundary.
 
-A provider call may repeat if the worker crashes after the provider responds but before the database transaction commits. Database materialization remains idempotent and retries are bounded, but exactly-once external provider execution is not claimed.
+A provider call may repeat if the worker crashes after the provider responds but before the short item-persistence transaction commits. Database materialization and per-run item progress remain idempotent and retries are bounded, but exactly-once external provider execution is not claimed. One prepared item is capped at 500 chunks/vectors; the full manifest is never retained in memory.
 
 ## 19. Immutable document versions and indexing state
 
@@ -595,7 +595,7 @@ All repositories and application services use caller-owned transactions unless n
 | `LocalDocumentIndexingService` | Application | End-to-end local indexing coordinator | API/worker | Unit/integration tests |
 | `ConnectorSyncRetryPolicy` | Application/pure | Failure taxonomy and bounded backoff | None | Pure tests |
 | `ConnectorSyncExecutionService` | Application | Enqueue/acquire/heartbeat/outcome/recovery composition | Runner/future host | Pure/PostgreSQL tests |
-| `LocalFolderSynchronizationService` | Application | One bounded discovery/reconciliation/indexing continuation | Runner | Unit/filesystem/PostgreSQL tests |
+| `LocalFolderPreparationService` / `StagedLocalFolderSynchronizationService` | Application | Session-free discovery/extraction/chunking/embedding plus short fenced item/reconciliation persistence | Runner | Pure/filesystem/PostgreSQL tests |
 | `LocalFolderSyncWorker` | Infrastructure runtime | Session phases and one bounded job invocation | Self by explicit design | Pure/filesystem/PostgreSQL/concurrency tests |
 
 There are no management repositories for organization structure, knowledge spaces/grants, audit events, or external identities/ACL mutation.
@@ -713,7 +713,7 @@ Required command executed at this snapshot:
 python -m pytest --import-mode=importlib -q
 ```
 
-Result: **894 passed, 1 skipped, 45 warnings; exit code 0**.
+Result: **885 passed, 1 skipped, 45 warnings; exit code 0**.
 
 Coverage categories include pure domain/unit tests, API tests, real PostgreSQL repositories, migration downgrade/re-upgrade tests, filesystem/extractor integration, deterministic fake embeddings, concurrent enqueue/acquisition/recovery/version allocation, rollback/pre-commit failure, tenant isolation, ACL authorization, permission-aware retrieval, query-plan/index availability, and worker session cleanup.
 
