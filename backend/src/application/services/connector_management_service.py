@@ -92,8 +92,6 @@ class ConnectorManagementService:
             capabilities=asdict(LOCAL_FOLDER_CAPABILITIES),
             safe_config={},
             config_schema_version=1,
-            secret_reference=None,
-            credential_status="not_configured",
             created_by_user_id=creator_user_id,
         )
         return self._connectors.add(organization_id, connector)

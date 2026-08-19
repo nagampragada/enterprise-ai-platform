@@ -74,7 +74,6 @@ def _connector(**overrides):
             "supports_content_download": True,
         },
         safe_config={"secret": "must-not-leak"},
-        secret_reference="vault://must-not-leak",
         created_at=NOW,
         updated_at=NOW,
         last_validated_at=None,
@@ -173,7 +172,7 @@ def test_create_connector_derives_actor_commits_and_redacts_sensitive_fields():
     assert session.commit_calls == 1 and session.rollback_calls == 0
     body = response.json()
     assert "safe_config" not in body and "secret_reference" not in body
-    assert "credential_status" not in body and "organization_id" not in body
+    assert "organization_id" not in body
 
 
 def test_connector_request_rejects_unsupported_type_unknown_fields_and_client_identity():

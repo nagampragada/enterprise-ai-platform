@@ -443,26 +443,16 @@ class Connector(Base):
             name="status_valid",
         ),
         CheckConstraint("acl_support IN ('none', 'partial', 'complete')", name="acl_support_valid"),
-        CheckConstraint(
-            "credential_status IN ('not_configured', 'validating', 'valid', 'expiring', 'expired', 'revoked', 'invalid')",
-            name="credential_status_valid",
-        ),
         CheckConstraint("jsonb_typeof(capabilities) = 'object'", name="capabilities_object"),
         CheckConstraint("jsonb_typeof(safe_config) = 'object'", name="safe_config_object"),
         CheckConstraint("config_schema_version > 0", name="config_version_positive"),
-        CheckConstraint("secret_reference IS NULL OR btrim(secret_reference) <> ''", name="secret_reference_not_blank"),
         CheckConstraint(
             "(status = 'archived' AND archived_at IS NOT NULL) OR "
             "(status <> 'archived' AND archived_at IS NULL)",
             name="archive_consistent",
         ),
-        CheckConstraint(
-            "credential_expires_at IS NULL OR credential_expires_at > created_at",
-            name="credential_expiry_after_created",
-        ),
         Index("ix_connectors_organization_id_status", "organization_id", "status"),
         Index("ix_connectors_org_type_status", "organization_id", "connector_type", "status"),
-        Index("ix_connectors_org_credential_status", "organization_id", "credential_status"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -475,9 +465,6 @@ class Connector(Base):
     capabilities: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
     safe_config: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
     config_schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("1"))
-    secret_reference: Mapped[str | None] = mapped_column(String(1024), nullable=True)
-    credential_status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'not_configured'"))
-    credential_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     last_validated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
@@ -485,6 +472,177 @@ class Connector(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ConnectorCredential(Base):
+    __tablename__ = "connector_credentials"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_connector_credentials"),
+        ForeignKeyConstraint(
+            ["organization_id"], ["organizations.id"],
+            name="fk_connector_credentials_organization", ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "connector_id"],
+            ["connectors.organization_id", "connectors.id"],
+            name="fk_connector_credentials_connector_tenant", ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "created_by_user_id"],
+            ["users.organization_id", "users.id"],
+            name="fk_connector_credentials_creator_tenant",
+            ondelete="SET NULL (created_by_user_id)",
+        ),
+        UniqueConstraint("organization_id", "id", name="uq_connector_credentials_org_id"),
+        UniqueConstraint(
+            "organization_id", "connector_id", name="uq_connector_credentials_connector"
+        ),
+        CheckConstraint("provider_key ~ '^[a-z][a-z0-9_]*$'", name="provider_key_valid"),
+        CheckConstraint(
+            "auth_scheme IN ('oauth2', 'api_token', 'service_account', 'app_installation')",
+            name="auth_scheme_valid",
+        ),
+        CheckConstraint("btrim(secret_reference) <> ''", name="secret_reference_not_blank"),
+        CheckConstraint(
+            "status IN ('active', 'expired', 'revoked', 'invalid')", name="status_valid"
+        ),
+        CheckConstraint(
+            "external_subject IS NULL OR btrim(external_subject) <> ''",
+            name="external_subject_not_blank",
+        ),
+        CheckConstraint(
+            "display_label IS NULL OR btrim(display_label) <> ''", name="display_label_not_blank"
+        ),
+        CheckConstraint("jsonb_typeof(granted_scopes) = 'array'", name="scopes_array"),
+        CheckConstraint("jsonb_array_length(granted_scopes) <= 100", name="scopes_bounded"),
+        CheckConstraint(
+            "NOT jsonb_path_exists(granted_scopes, "
+            "'$[*] ? (@.type() != \"string\" || @ like_regex \"^\\s*$\")')",
+            name="scopes_nonblank_strings",
+        ),
+        CheckConstraint(
+            "octet_length(granted_scopes::text) <= 32768", name="scopes_storage_bounded"
+        ),
+        CheckConstraint("expires_at IS NULL OR expires_at > created_at", name="expiry_after_created"),
+        CheckConstraint(
+            "validated_at IS NULL OR validated_at >= created_at", name="validation_after_created"
+        ),
+        CheckConstraint(
+            "(status = 'revoked' AND revoked_at IS NOT NULL) OR "
+            "(status <> 'revoked' AND revoked_at IS NULL)",
+            name="revocation_consistent",
+        ),
+        CheckConstraint(
+            "status <> 'expired' OR expires_at IS NOT NULL", name="expired_requires_expiry"
+        ),
+        CheckConstraint("revoked_at IS NULL OR revoked_at >= created_at", name="revoked_after_created"),
+        CheckConstraint("schema_version > 0", name="schema_version_positive"),
+        CheckConstraint("updated_at >= created_at", name="updated_after_created"),
+        Index("ix_connector_credentials_org_status", "organization_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    provider_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    auth_scheme: Mapped[str] = mapped_column(String(32), nullable=False)
+    secret_reference: Mapped[str] = mapped_column(String(1024), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'active'"))
+    external_subject: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    display_label: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    granted_scopes: Mapped[list[str]] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    validated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("1"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class OAuthAuthorizationTransaction(Base):
+    __tablename__ = "oauth_authorization_transactions"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_oauth_authorization_transactions"),
+        ForeignKeyConstraint(
+            ["organization_id"], ["organizations.id"],
+            name="fk_oauth_transactions_organization", ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "connector_id"],
+            ["connectors.organization_id", "connectors.id"],
+            name="fk_oauth_transactions_connector_tenant", ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "initiating_user_id"],
+            ["users.organization_id", "users.id"],
+            name="fk_oauth_transactions_user_tenant",
+            ondelete="SET NULL (initiating_user_id)",
+        ),
+        UniqueConstraint("organization_id", "id", name="uq_oauth_transactions_org_id"),
+        UniqueConstraint("state_hash", name="uq_oauth_transactions_state_hash"),
+        CheckConstraint("provider_key ~ '^[a-z][a-z0-9_]*$'", name="provider_key_valid"),
+        CheckConstraint("octet_length(state_hash) = 32", name="state_hash_sha256"),
+        CheckConstraint(
+            "pkce_verifier_secret_reference IS NULL OR "
+            "btrim(pkce_verifier_secret_reference) <> ''",
+            name="pkce_reference_not_blank",
+        ),
+        CheckConstraint(
+            "callback_identifier ~ '^[a-z][a-z0-9_]*$'", name="callback_identifier_valid"
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'consumed', 'expired', 'failed')", name="status_valid"
+        ),
+        CheckConstraint("expires_at > created_at", name="expiry_after_created"),
+        CheckConstraint(
+            "expires_at <= created_at + interval '20 minutes'", name="lifetime_bounded"
+        ),
+        CheckConstraint(
+            "(status = 'pending' AND consumed_at IS NULL AND failure_code IS NULL) OR "
+            "(status = 'consumed' AND consumed_at IS NOT NULL AND failure_code IS NULL) OR "
+            "(status = 'expired' AND consumed_at IS NULL AND failure_code IS NULL) OR "
+            "(status = 'failed' AND consumed_at IS NULL AND failure_code IS NOT NULL)",
+            name="lifecycle_consistent",
+        ),
+        CheckConstraint(
+            "consumed_at IS NULL OR consumed_at >= created_at", name="consumed_after_created"
+        ),
+        CheckConstraint(
+            "failure_code IS NULL OR failure_code ~ '^[a-z][a-z0-9_]*$'",
+            name="failure_code_valid",
+        ),
+        CheckConstraint("schema_version > 0", name="schema_version_positive"),
+        Index(
+            "ix_oauth_transactions_pending_state", "state_hash",
+            postgresql_where=text("status = 'pending'"),
+        ),
+        Index(
+            "ix_oauth_transactions_pending_expiry", "expires_at", "id",
+            postgresql_where=text("status = 'pending'"),
+        ),
+        Index(
+            "ix_oauth_transactions_org_connector_created",
+            "organization_id", "connector_id", "created_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    initiating_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    provider_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    state_hash: Mapped[bytes] = mapped_column(BYTEA, nullable=False)
+    pkce_verifier_secret_reference: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    callback_identifier: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'pending'"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    failure_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("1"))
 
 
 class ConnectorScope(Base):

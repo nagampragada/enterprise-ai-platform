@@ -163,7 +163,6 @@ def _configured_scope(factory, root: Path, name: str):
             capabilities=asdict(provider.capabilities),
             safe_config={},
             config_schema_version=1,
-            credential_status="not_configured",
         )
     )
     session.flush()

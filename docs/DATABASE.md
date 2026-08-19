@@ -94,7 +94,7 @@ erDiagram
     MESSAGES ||--o{ GENERATED_QUERIES : records
 ```
 
-Deferred capabilities not shown in the first-release diagram: invitations, permissions, role_permissions, separate connector_credentials, connector_sync_events, document_access_rules, ai_requests, model_usage, retrieval_events, and user_feedback.
+Deferred capabilities not shown in the first-release diagram: invitations, permissions, role_permissions, production secret-manager adapters, connector_sync_events, document_access_rules, ai_requests, model_usage, retrieval_events, and user_feedback.
 
 ## Multi-Tenancy Strategy
 
@@ -134,19 +134,13 @@ Version 1 can enforce tenancy at the application layer first, but the schema sho
 
 ## Connector Credential Security Strategy
 
-The first release should not create a separate connector_credentials table. Instead, connectors may contain:
+`connector_credentials` is the single PostgreSQL source of safe connector credential metadata. It stores one binding per tenant connector: normalized provider/auth-scheme codes, lifecycle state, bounded safe account/scope metadata, timestamps, and an opaque external secret-store reference. The legacy credential columns were removed from `connectors`; migration refuses to discard any populated legacy reference.
 
-- encrypted_secret_reference
-- credential_status
-- credential_updated_at
+PostgreSQL never stores access/refresh tokens, client secrets, PKCE verifier plaintext, authorization codes, API keys, private keys, passwords, cookies, or secret-manager payloads. A provider-neutral application port defines store/retrieve/delete behavior, but no production secret-manager adapter or plaintext fallback exists yet.
 
-These fields must not contain raw OAuth tokens or raw database passwords. The intended meaning is:
+`oauth_authorization_transactions` stores only a 32-byte SHA-256 state digest, optional opaque PKCE verifier reference, safe callback identifier, tenant/connector/user attribution, and bounded lifecycle timestamps. Pending transactions live at most 20 minutes, are locked before single-use consumption, and cannot transition back to pending. Raw state and PKCE verifier exist only in process memory during authorization preparation.
 
-- encrypted_secret_reference points to a secret manager record or stores an application-encrypted reference value
-- credential_status indicates whether credentials are configured, expired, revoked, or invalid
-- credential_updated_at records the most recent credential change time
-
-If credential rotation, multi-secret history, or per-connector secret lifecycle becomes complex later, a dedicated connector_credentials table can be introduced without redesigning the connector ownership model.
+Credential replacement first flushes the new fail-closed binding and then makes one best-effort deletion attempt for the prior external secret. Revocation/disconnect flushes revoked state before cleanup; deletion failure never reactivates a credential and there is no unbounded retry. A later operator reconciliation process may clean orphaned external references. No operational audit writer exists, so safe credential/OAuth audit emission remains required future integration.
 
 ## Document Versioning Strategy
 
@@ -827,10 +821,10 @@ Deferred table count: 10.
 - Why deferred: it only becomes necessary once permissions exists as a real authorization layer.
 - Add later when: permission catalogs are introduced and roles must map to reusable permission sets.
 
-#### connector_credentials as a separate table
+#### provider secret-manager adapters
 
-- Why deferred: the first release can keep a minimal encrypted_secret_reference and credential state directly on connectors.
-- Add later when: secret rotation history, multiple credential versions, or connector-specific secret lifecycle tracking becomes necessary.
+- Why deferred: the shared credential/OAuth lifecycle is implemented, but no Vault or cloud secret-manager adapter is selected.
+- Add later when: the first cloud connector, planned as GitHub, introduces provider authorization routes and an approved production secret manager.
 
 #### connector_sync_events
 
@@ -869,7 +863,7 @@ Deferred table count: 10.
 - invitations
 - permissions
 - role_permissions
-- connector_credentials as a separate table
+- production connector secret-manager adapters
 - connector_sync_events
 - document_access_rules
 - ai_requests

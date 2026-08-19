@@ -25,7 +25,7 @@ NOW = datetime(2026, 8, 23, tzinfo=timezone.utc)
 
 
 def _connector(org=None, index=0):
-    return Connector(id=uuid4(), organization_id=org or uuid4(), connector_type="local_folder", display_name="Local", slug=f"local-{index}", status="draft", acl_support="none", capabilities={}, safe_config={}, config_schema_version=1, credential_status="not_configured", created_at=NOW)
+    return Connector(id=uuid4(), organization_id=org or uuid4(), connector_type="local_folder", display_name="Local", slug=f"local-{index}", status="draft", acl_support="none", capabilities={}, safe_config={}, config_schema_version=1, created_at=NOW)
 
 
 def _scope(org=None, index=0):

@@ -126,14 +126,11 @@ def _connector(
     display_name: str = "Local Folder",
     status: str = "active",
     acl_support: str = "none",
-    credential_status: str = "not_configured",
     capabilities: str = "{}",
     safe_config: str = "{}",
     config_schema_version: int = 1,
-    secret_reference: str | None = None,
     created_by_user_id: uuid.UUID | None = None,
     archived_at: datetime | None = None,
-    credential_expires_at: datetime | None = None,
 ) -> uuid.UUID:
     value = uuid.uuid4()
     _execute(
@@ -141,20 +138,19 @@ def _connector(
         """
         INSERT INTO connectors (
             id, organization_id, connector_type, display_name, slug, status, acl_support,
-            capabilities, safe_config, config_schema_version, secret_reference, credential_status,
-            credential_expires_at, created_by_user_id, created_at, archived_at
+            capabilities, safe_config, config_schema_version,
+            created_by_user_id, created_at, archived_at
         ) VALUES (
             :id, :organization_id, :connector_type, :display_name, :slug, :status, :acl_support,
             CAST(:capabilities AS jsonb), CAST(:safe_config AS jsonb), :config_schema_version,
-            :secret_reference, :credential_status, :credential_expires_at, :created_by_user_id,
+            :created_by_user_id,
             :created_at, :archived_at
         )
         """,
         id=value, organization_id=organization_id, connector_type=connector_type,
         display_name=display_name, slug=slug, status=status, acl_support=acl_support,
         capabilities=capabilities, safe_config=safe_config, config_schema_version=config_schema_version,
-        secret_reference=secret_reference, credential_status=credential_status,
-        credential_expires_at=credential_expires_at, created_by_user_id=created_by_user_id,
+        created_by_user_id=created_by_user_id,
         created_at=datetime(2026, 8, 18, tzinfo=timezone.utc), archived_at=archived_at,
     )
     return value
@@ -211,19 +207,19 @@ def test_schema_matches_models_and_required_indexes(engine):
     assert {"organizations", "users", "knowledge_spaces", "audit_events", "documents", "document_chunks"}.issubset(inspector.get_table_names(schema="public"))
     assert engine.connect().execute(text("SELECT 1 FROM pg_extension WHERE extname = 'vector'")).scalar_one() == 1
     expected_columns = {
-        "connectors": ["id", "organization_id", "connector_type", "display_name", "slug", "status", "acl_support", "capabilities", "safe_config", "config_schema_version", "secret_reference", "credential_status", "credential_expires_at", "created_by_user_id", "last_validated_at", "created_at", "updated_at", "archived_at"],
+        "connectors": ["id", "organization_id", "connector_type", "display_name", "slug", "status", "acl_support", "capabilities", "safe_config", "config_schema_version", "created_by_user_id", "last_validated_at", "created_at", "updated_at", "archived_at"],
         "connector_scopes": ["id", "organization_id", "connector_id", "knowledge_space_id", "display_name", "slug", "scope_type", "external_scope_key", "access_mode", "status", "safe_config", "config_schema_version", "created_by_user_id", "last_validated_at", "created_at", "updated_at", "removed_at"],
     }
     expected_indexes = {
-        "connectors": {"ix_connectors_organization_id_status", "ix_connectors_org_type_status", "ix_connectors_org_credential_status"},
+        "connectors": {"ix_connectors_organization_id_status", "ix_connectors_org_type_status"},
         "connector_scopes": {"ix_connector_scopes_org_connector_status", "ix_connector_scopes_org_space_status", "ix_connector_scopes_org_access_status"},
     }
     nullable_columns = {
-        "connectors": {"secret_reference", "credential_expires_at", "created_by_user_id", "last_validated_at", "archived_at"},
+        "connectors": {"created_by_user_id", "last_validated_at", "archived_at"},
         "connector_scopes": {"created_by_user_id", "last_validated_at", "removed_at"},
     }
     defaulted_columns = {
-        "connectors": {"status", "acl_support", "capabilities", "safe_config", "config_schema_version", "credential_status", "created_at", "updated_at"},
+        "connectors": {"status", "acl_support", "capabilities", "safe_config", "config_schema_version", "created_at", "updated_at"},
         "connector_scopes": {"status", "safe_config", "config_schema_version", "created_at", "updated_at"},
     }
     for table, columns in expected_columns.items():
@@ -235,7 +231,7 @@ def test_schema_matches_models_and_required_indexes(engine):
         assert defaulted_columns[table].issubset({column["name"] for column in reflected if column["default"] is not None})
         assert str(next(column for column in reflected if column["name"] == "safe_config")["type"]).upper() == "JSONB"
         assert str(next(column for column in reflected if column["name"] == "config_schema_version")["type"]).upper() == "SMALLINT"
-        assert all(column["type"].timezone is True for column in reflected if column["name"] in {"credential_expires_at", "last_validated_at", "created_at", "updated_at", "archived_at", "removed_at"})
+        assert all(column["type"].timezone is True for column in reflected if column["name"] in {"last_validated_at", "created_at", "updated_at", "archived_at", "removed_at"})
         model_names = {constraint.name for constraint in Base.metadata.tables[table].constraints if constraint.name}
         database_names = {
             inspector.get_pk_constraint(table, schema="public")["name"],
@@ -255,11 +251,10 @@ def test_connector_validation_and_tenant_uniqueness(engine):
     assert _connector(engine, org_b, "local-documents")
     invalid_cases = (
         {"display_name": "   "}, {"connector_type": "Bad-Type"}, {"slug": "Bad_Slug"},
-        {"status": "invalid"}, {"acl_support": "full"}, {"credential_status": "unknown"},
+        {"status": "invalid"}, {"acl_support": "full"},
         {"capabilities": "[]"}, {"safe_config": "[]"}, {"config_schema_version": 0},
-        {"secret_reference": "   "}, {"status": "archived"},
+        {"status": "archived"},
         {"archived_at": datetime.now(timezone.utc)},
-        {"credential_expires_at": datetime(2026, 8, 17, tzinfo=timezone.utc)},
         {"created_by_user_id": creator_b},
     )
     for index, overrides in enumerate(invalid_cases):

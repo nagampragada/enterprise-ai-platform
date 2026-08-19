@@ -43,8 +43,6 @@ def test_connector_creation_uses_safe_server_owned_local_folder_defaults():
     assert connector.status == "active"
     assert connector.acl_support == "none"
     assert connector.safe_config == {}
-    assert connector.secret_reference is None
-    assert connector.credential_status == "not_configured"
     assert connector.capabilities["supports_permissions"] is False
     session.commit.assert_not_called()
     session.rollback.assert_not_called()

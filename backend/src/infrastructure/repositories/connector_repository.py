@@ -17,7 +17,6 @@ from infrastructure.db.models import Connector
 MAX_CONNECTOR_PAGE_LIMIT = 100
 CONNECTOR_STATUSES = frozenset({"draft", "validating", "active", "degraded", "auth_failed", "paused", "archived"})
 ACL_SUPPORT_VALUES = frozenset({"none", "partial", "complete"})
-CREDENTIAL_STATUSES = frozenset({"not_configured", "validating", "valid", "expiring", "expired", "revoked", "invalid"})
 _CODE = re.compile(r"^[a-z][a-z0-9_]*$")
 _SLUG = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
@@ -98,9 +97,9 @@ class ConnectorRepository:
         _require_json_object("safe_config", safe_config); _require_positive_integer("config_schema_version", config_schema_version)
         return self._update(organization_id, connector_id, safe_config=safe_config, config_schema_version=config_schema_version)
 
-    def update_validation(self, organization_id: UUID, connector_id: UUID, *, status: str, credential_status: str, validated_at: datetime) -> Connector | None:
-        _require_choice("status", status, CONNECTOR_STATUSES); _require_choice("credential_status", credential_status, CREDENTIAL_STATUSES); _require_aware("validated_at", validated_at)
-        return self._update(organization_id, connector_id, status=status, credential_status=credential_status, last_validated_at=validated_at)
+    def update_validation(self, organization_id: UUID, connector_id: UUID, *, status: str, validated_at: datetime) -> Connector | None:
+        _require_choice("status", status, CONNECTOR_STATUSES); _require_aware("validated_at", validated_at)
+        return self._update(organization_id, connector_id, status=status, last_validated_at=validated_at)
 
     def set_status(self, organization_id: UUID, connector_id: UUID, status: str, *, archived_at: datetime | None = None) -> Connector | None:
         normalized = _require_choice("status", status, CONNECTOR_STATUSES)
@@ -132,10 +131,9 @@ def _validate_connector(organization_id: UUID, connector: Connector) -> None:
     if not isinstance(connector, Connector) or connector.organization_id != organization_id: raise InvalidConnectorRepositoryRequest("connector tenant context is invalid")
     _require_code("connector_type", connector.connector_type); _require_slug("slug", connector.slug)
     if not isinstance(connector.display_name, str) or not connector.display_name.strip(): raise InvalidConnectorRepositoryRequest("display_name must be nonblank")
-    _require_choice("status", connector.status, CONNECTOR_STATUSES); _require_choice("acl_support", connector.acl_support, ACL_SUPPORT_VALUES); _require_choice("credential_status", connector.credential_status, CREDENTIAL_STATUSES)
+    _require_choice("status", connector.status, CONNECTOR_STATUSES); _require_choice("acl_support", connector.acl_support, ACL_SUPPORT_VALUES)
     _require_json_object("capabilities", connector.capabilities); _require_json_object("safe_config", connector.safe_config); _require_positive_integer("config_schema_version", connector.config_schema_version)
     if connector.created_by_user_id is not None: _require_uuid("created_by_user_id", connector.created_by_user_id)
-    if connector.secret_reference is not None and not connector.secret_reference.strip(): raise InvalidConnectorRepositoryRequest("secret_reference must be nonblank")
 
 
 def _require_uuid(name: str, value: object) -> UUID:

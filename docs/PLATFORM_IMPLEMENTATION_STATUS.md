@@ -8,7 +8,7 @@
 | Snapshot branch | `main` |
 | Snapshot commit | `4b82821357cdf3e3976c4cade950a594abb4b1a1` (implementation baseline) |
 | Snapshot date | 2026-08-19 |
-| Alembic head | `20260824_000015` |
+| Alembic head | `20260825_000016` |
 | Purpose | Authoritative, code-evidenced inventory of implemented, exposed, partial, planned, deferred, and excluded capabilities |
 | Audiences | Product owners, backend/data/security/connector/operations/UI/QA engineers, and future repository agents |
 
@@ -123,7 +123,7 @@ Evidence: `backend/pyproject.toml`, `infra/docker/docker-compose.postgres.yml`, 
 
 ## 6. Database architecture
 
-SQLAlchemy metadata contains **39 live tables**. Alembic head is `20260824_000015`; migrations are forward-ordered, tested against real PostgreSQL, and generally provide narrow downgrades. The pgvector extension downgrade is intentionally conservative because extensions can be shared infrastructure.
+SQLAlchemy metadata contains **41 live tables**. Alembic head is `20260825_000016`; migrations are forward-ordered, tested against real PostgreSQL, and generally provide narrow downgrades. The pgvector extension downgrade is intentionally conservative because extensions can be shared infrastructure.
 
 ### Organizations, users, authentication, and structure
 
@@ -341,7 +341,7 @@ There is no API for document listing, viewing, deletion, reprocessing, version h
 
 ## 13. Connector core
 
-`Connector` stores tenant/type identity, display/slug, lifecycle, ACL-support declaration, a capability snapshot, safe configuration, schema version, external `secret_reference`, credential lifecycle, and optional creator. `ConnectorScope` stores a connector-owned external scope key, one required knowledge space, access mode, lifecycle, safe configuration, and creator.
+`Connector` stores tenant/type identity, display/slug, lifecycle, ACL-support declaration, a capability snapshot, safe configuration, schema version, and optional creator. `connector_credentials` separately stores one provider-neutral binding per connector with only opaque secret references and safe metadata. `oauth_authorization_transactions` stores short-lived hashed, single-use authorization state. `ConnectorScope` stores a connector-owned external scope key, one required knowledge space, access mode, lifecycle, safe configuration, and creator.
 
 `ConnectorRepository` and `ConnectorScopeRepository` implement tenant-scoped reads, row locks, bounded `(created_at,id)` keyset pages, and controlled status/configuration updates with caller-owned transactions. They do not expose generic patches.
 
@@ -356,7 +356,7 @@ Operational connector implementation:
 | SQL Server | Placeholder directory only; not operational |
 | Other domain enum values (OneDrive, Slack, Jira, Confluence, GitHub, Gmail, Outlook, Dropbox, Box, S3, Azure Blob) | Contract vocabulary only |
 
-`ConnectorManagementService` and eight authenticated API operations now support Local Folder connector creation/list/get, scope creation/list, asynchronous job enqueue, and job list/get. They are restricted to active tenant `organization_admin` users. Responses explicitly omit `safe_config`, filesystem root, secret/credential references, lease/worker data, provider payloads, and ORM state. Update/delete/archive, credential management, cancellation, secret-manager integration, cloud providers, and UI remain absent. Audit persistence exists, but no reusable audit writer exists, so connector-management audit emission remains deferred rather than implemented ad hoc.
+`ConnectorManagementService` and eight authenticated API operations now support Local Folder connector creation/list/get, scope creation/list, asynchronous job enqueue, and job list/get. They are restricted to active tenant `organization_admin` users. Responses explicitly omit `safe_config`, filesystem root, secret/credential references, lease/worker data, provider payloads, and ORM state. The internal credential/OAuth lifecycle foundation exists, but public credential routes, update/delete/archive, cancellation, production secret-manager integration, cloud providers, and UI remain absent. Audit persistence exists, but no reusable audit writer exists, so connector-management audit emission remains deferred rather than implemented ad hoc.
 
 ## 14. Local Folder connector
 
@@ -735,7 +735,7 @@ Required command executed at this snapshot:
 python -m pytest --import-mode=importlib -q
 ```
 
-Result: **958 passed, 1 skipped, 47 warnings; exit code 0**.
+Result: **968 passed, 1 skipped, 51 warnings; exit code 0**.
 
 Coverage categories include pure domain/unit tests, API tests, real PostgreSQL repositories, migration downgrade/re-upgrade tests, filesystem/extractor integration, deterministic fake embeddings, concurrent enqueue/acquisition/recovery/version allocation, rollback/pre-commit failure, tenant isolation, ACL authorization, permission-aware retrieval, query-plan/index availability, and worker session cleanup.
 
@@ -759,7 +759,7 @@ Known output at snapshot:
 | Local PostgreSQL | Docker Compose uses `pgvector/pgvector:pg16`, localhost port, health check, named volume; development credentials only |
 | pgvector | Extension migration and vector column complete |
 | Local configuration | Environment-driven database/JWT/OpenAI settings; no secrets are documented here |
-| Migrations | 15 revisions, head `20260824_000015`, real PostgreSQL lifecycle tests |
+| Migrations | 16 revisions, head `20260825_000016`, real PostgreSQL lifecycle tests |
 | Worker runner | Bounded staged callable class implemented |
 | Continuous worker host | Direct module with continuous and one-shot modes implemented |
 | Scheduler/automatic recovery | Continuous/one-shot interval scheduler and worker expired recovery implemented |
@@ -767,7 +767,7 @@ Known output at snapshot:
 | Backend/frontend containers | Not implemented |
 | Deployment manifests | Environment directories exist but contain no manifests |
 | CI/CD | No executable GitHub Actions workflow found |
-| Secret manager | `secret_reference` fields only; no Vault/cloud secret integration |
+| Secret manager | Provider-neutral application port and opaque references; no production Vault/cloud adapter |
 | Monitoring/logging/tracing | No production metrics/traces/central logging stack |
 | Backups/disaster recovery | No automated backup/restore plan |
 | Horizontal scaling | Database lease primitives support multiple claimers; no deployed autoscaling/host |

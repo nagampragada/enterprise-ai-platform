@@ -67,7 +67,7 @@ def _space(session: Session, org, name):
 
 
 def _connector(org, slug, *, creator=None, status="draft", kind="local_folder"):
-    return Connector(id=uuid.uuid4(), organization_id=org, connector_type=kind, display_name=slug, slug=slug, status=status, acl_support="none", capabilities={"supports_folders": True}, safe_config={"root_path": "/mounted/docs"}, config_schema_version=1, credential_status="not_configured", created_by_user_id=creator)
+    return Connector(id=uuid.uuid4(), organization_id=org, connector_type=kind, display_name=slug, slug=slug, status=status, acl_support="none", capabilities={"supports_folders": True}, safe_config={"root_path": "/mounted/docs"}, config_schema_version=1, created_by_user_id=creator)
 
 
 def _scope(org, connector, space, slug, *, creator=None, status="draft", mode="platform_managed"):
@@ -107,7 +107,7 @@ def test_connector_keyset_filters_and_final_page(session):
 
 def test_connector_controlled_updates_are_caller_owned(session):
     org=_org(session,"Epsilon"); repository=ConnectorRepository(session); connector=_connector(org,"managed"); repository.add(org,connector); session.commit()
-    repository.update_safe_configuration(org,connector.id,{"root_path":"/safe"},2); repository.update_validation(org,connector.id,status="active",credential_status="valid",validated_at=NOW); repository.set_status(org,connector.id,"archived",archived_at=NOW)
+    repository.update_safe_configuration(org,connector.id,{"root_path":"/safe"},2); repository.update_validation(org,connector.id,status="active",validated_at=NOW); repository.set_status(org,connector.id,"archived",archived_at=NOW)
     changed=repository.get_by_id(org,connector.id); assert changed.safe_config=={"root_path":"/safe"} and changed.config_schema_version==2 and changed.archived_at==NOW
     session.rollback(); restored=repository.get_by_id(org,connector.id); assert restored.status=="draft" and restored.safe_config=={"root_path":"/mounted/docs"}
 
