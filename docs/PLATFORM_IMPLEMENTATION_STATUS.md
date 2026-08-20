@@ -27,7 +27,7 @@ This document treats executable code, migrations, runtime route registration, an
 
 The repository is building a multi-tenant enterprise knowledge platform. Organizations will eventually configure controlled data connectors, ingest and index documents, retrieve only content a user is authorized to see, and use a future answer/agent layer to produce grounded responses with citations.
 
-Operationally today, the FastAPI backend supports authentication and authenticated manual upload of TXT, Markdown, DOCX, and PDF files through a fully tested extraction, deterministic chunking, embedding, and PostgreSQL/pgvector persistence pipeline. The backend also contains secure Local Folder connector-management APIs, recurring interval schedules, a database-only scheduler host, a complete synchronization engine, durable job control, a continuous and one-shot worker host, immutable source versioning, and a permission-aware vector retrieval repository. GitHub is the first cloud connector: organization administrators can create a draft GitHub connector and run its GitHub App installation, setup redirect, PKCE callback, verified organization binding, safe status, and local disconnect lifecycle through a browser. Repository discovery and synchronization are not implemented. Retrieval is not exposed by an API.
+Operationally today, the FastAPI backend supports authentication and authenticated manual upload of TXT, Markdown, DOCX, and PDF files through a fully tested extraction, deterministic chunking, embedding, and PostgreSQL/pgvector persistence pipeline. The backend also contains secure Local Folder connector-management APIs, recurring interval schedules, a database-only scheduler host, a complete synchronization engine, durable job control, a continuous and one-shot worker host, immutable source versioning, and a permission-aware vector retrieval repository. GitHub is the first cloud connector: organization administrators can create a draft GitHub connector and run its GitHub App installation, setup redirect, PKCE callback, verified organization binding, safe status, and local disconnect lifecycle through a browser. A production Google Cloud Secret Manager adapter now supplies immutable GitHub configuration references and ephemeral PKCE storage through ADC-based, fail-closed composition. No GCP resource or Cloud Run deployment has been provisioned. Repository discovery and synchronization are not implemented. Retrieval is not exposed by an API.
 
 The product is therefore a **tested backend foundation and vertical-slice implementation, not a finished user-facing product**. Its strongest capability is the tenant-safe scheduled content ingestion/synchronization/indexing data plane with bounded leases, fencing, retries, rollback, continuous Local Folder execution, and authorization-before-ranking retrieval. Its primary gaps are cron/timezone scheduling, broader connector lifecycle operations, search APIs, answer generation, deployment supervision, and a frontend.
 
@@ -357,7 +357,15 @@ Operational connector implementation:
 | SQL Server | Placeholder directory only; not operational |
 | Other domain enum values (OneDrive, Slack, Jira, Confluence, GitHub, Gmail, Outlook, Dropbox, Box, S3, Azure Blob) | Contract vocabulary only |
 
-`ConnectorManagementService` and authenticated APIs support Local Folder and GitHub connector creation/list/get; Local Folder additionally supports scope creation/list, asynchronous job enqueue, and job list/get. GitHub connectors are created in `draft` with every repository, content, synchronization, ACL, folder, deletion, history, and webhook capability set to false. Organization-admin-only management operations initiate App installation, return safe installation status, and perform idempotent local disconnect. Public GitHub browser redirects use single-use state instead of a platform bearer token. Responses omit `safe_config`, filesystem roots, secret references, tokens, provider payloads, lease/worker data, and ORM state. Connector update/delete/archive, cancellation, production secret-manager integration, GitHub repository operations, and UI remain absent. Audit persistence exists, but no reusable audit writer exists, so connector-management audit emission remains deferred rather than implemented ad hoc.
+`ConnectorManagementService` and authenticated APIs support Local Folder and GitHub connector creation/list/get; Local Folder additionally supports scope creation/list, asynchronous job enqueue, and job list/get. GitHub connectors are created in `draft` with every repository, content, synchronization, ACL, folder, deletion, history, and webhook capability set to false. Organization-admin-only management operations initiate App installation, return safe installation status, and perform idempotent local disconnect. Public GitHub browser redirects use single-use state instead of a platform bearer token. Responses omit `safe_config`, filesystem roots, secret references, tokens, provider payloads, lease/worker data, and ORM state. Connector update/delete/archive, cancellation, GitHub repository operations, and UI remain absent. Audit persistence exists, but no reusable audit writer exists, so connector-management audit emission remains deferred rather than implemented ad hoc.
+
+### Google Cloud Secret Manager foundation
+
+The production `SecretStore` adapter uses the official Google client and Cloud Run ADC identity, creates one random non-identifying single-version secret container per stored value, returns only canonical numeric-version references, enforces the 64 KiB provider payload limit before calls, and sends and verifies CRC32C integrity data. The parser rejects cross-project, cross-prefix, alias, escaping, query, fragment, and path-injection inputs before provider access. Delete verifies exact managed labels, destroys only the referenced version, and will not delete a container when the numeric version does not exist. Provider errors map to fixed redacted application exceptions.
+
+Reads have at most three attempts within 12 seconds, with per-call timeouts no greater than 5 seconds and jittered 0.1/0.2-second backoff bounds. Google automatic retries are disabled on every call. Mutating version/destroy/delete calls have one attempt; create uses at most three different random names only for collisions. Partial store cleanup is one exact-container best-effort call. The adapter never lists or bulk-deletes secrets or versions.
+
+Runtime requires `GCP_SECRET_MANAGER_PROJECT_ID`, `GCP_SECRET_MANAGER_SECRET_PREFIX`, and `GCP_SECRET_MANAGER_ENVIRONMENT` plus complete GitHub settings containing version-pinned references. Missing configuration, ADC, or adapter initialization leaves GitHub routes fail-closed while unrelated APIs remain importable. There is no service-account JSON-key, plaintext, `.env`, or in-memory production fallback. Tenant isolation is the existing tenant-safe application/database ownership of opaque references, not per-customer GCP IAM. See `docs/GCP_SECRET_MANAGER.md` for exact IAM and operator guidance.
 
 ### GitHub App installation lifecycle
 
@@ -367,7 +375,7 @@ Completion exchanges GitHub's temporary authorization code exactly once, retriev
 
 Persisted data is limited to the untrusted positive candidate installation ID and setup timestamp on the OAuth transaction, followed after verification by the GitHub App/installation IDs, safe external organization ID/login/type, repository-selection mode, provider timestamps, credential lifecycle metadata, and last verification time. OAuth state is stored only as a SHA-256 digest; the PKCE verifier, App private key, and OAuth client secret are available only through opaque `SecretStore` references. The temporary user token, callback code, and App JWT are discarded after verification. Installation tokens are not generated by this slice. No token, code, raw state, secret, private key, raw provider response, authorization header, browser account name, or arbitrary redirect is persisted or returned.
 
-Required GitHub App registration/runtime settings are the App ID, distinct client ID, App slug, exact callback URL, setup URL, private-key secret reference, client-secret reference, GitHub API/web base URLs, and bounded timeout/retry controls. The App should not enable automatic OAuth-on-install for this sequence; the platform explicitly starts the documented web authorization flow with PKCE after installation. A production `SecretStore` adapter remains a deployment prerequisite and no insecure fallback is provided.
+Required GitHub App registration/runtime settings are the App ID, distinct client ID, App slug, exact callback URL, setup URL, version-pinned private-key secret reference, version-pinned client-secret reference, GitHub API/web base URLs, and bounded timeout/retry controls. The App should not enable automatic OAuth-on-install for this sequence; the platform explicitly starts the documented web authorization flow with PKCE after installation. The production Secret Manager adapter is implemented, but GCP resources, IAM, runtime identity, and secrets remain operator prerequisites; no insecure fallback is provided.
 
 The App requests only `Metadata: read` and `Contents: read`, which are the minimum intended permissions for the next repository-discovery and read-only content synchronization slices. It requests no write, organization-member, administration, issues, pull-request, or workflow permission. Remote uninstall remains an explicit GitHub-side administrator action; local disconnect does not uninstall the App.
 
@@ -377,7 +385,7 @@ The App requests only `Metadata: read` and `Contents: read`, which are the minim
 - Request only repository **Metadata: read** and **Contents: read**.
 - Configure setup URL `https://<platform-api-domain>/api/v1/connectors/github/setup`.
 - Configure callback URL `https://<platform-api-domain>/api/v1/connectors/github/callback`.
-- Keep the App private key and OAuth client secret in an approved production secret manager. The application receives only opaque references through `GITHUB_APP_PRIVATE_KEY_REFERENCE` and `GITHUB_APP_CLIENT_SECRET_REFERENCE`.
+- Provision the App private key and OAuth client secret in Google Secret Manager using the safe process in `docs/GCP_SECRET_MANAGER.md`. The application receives only canonical numeric-version references through `GITHUB_APP_PRIVATE_KEY_REFERENCE` and `GITHUB_APP_CLIENT_SECRET_REFERENCE`.
 - Configure the App ID, distinct client ID, App slug, exact HTTPS setup/callback URLs, explicitly trusted GitHub API/web base origins, and bounded timeout/retry settings. Do not enable automatic OAuth-on-install for this explicit setup sequence.
 - User authorization tokens are temporary and discarded. Future installation tokens will be minted only on demand and will never be persisted.
 - Leave webhooks disabled/not configured for this slice. Repository discovery is the next GitHub implementation slice; content retrieval, synchronization, ACLs, version history, deletions, folders, and webhooks are not operational.
@@ -715,7 +723,7 @@ Authenticated tenant/user input → effective platform grants/external principal
 
 - connector update/delete/cancellation/credential authorization and APIs beyond the implemented create/read/enqueue slice;
 - full audit emission and audit-access authorization;
-- production secret-manager integration and key rotation;
+- production provisioning of the implemented Secret Manager adapter, IAM, secrets, and key rotation operations;
 - gateway/API rate limiting;
 - malware scanning;
 - Data Loss Prevention (DLP) and Personally Identifiable Information (PII) classification;
@@ -759,9 +767,9 @@ Required command executed at this snapshot:
 python -m pytest --import-mode=importlib -q
 ```
 
-Result: **1022 passed, 1 skipped, 56 warnings; exit code 0**.
+Result: **1061 passed, 1 skipped, 55 warnings; exit code 0**.
 
-Coverage categories include pure domain/unit tests, API tests, real PostgreSQL repositories, migration downgrade/re-upgrade tests, filesystem/extractor integration, deterministic fake embeddings, concurrent enqueue/acquisition/recovery/version allocation, rollback/pre-commit failure, tenant isolation, ACL authorization, permission-aware retrieval, query-plan/index availability, worker session cleanup, GitHub setup/callback concurrency, and GitHub callback rollback. GitHub tests use deterministic fakes and make no live provider calls.
+Coverage categories include pure domain/unit tests, API tests, real PostgreSQL repositories, migration downgrade/re-upgrade tests, filesystem/extractor integration, deterministic fake embeddings, concurrent enqueue/acquisition/recovery/version allocation, rollback/pre-commit failure, tenant isolation, ACL authorization, permission-aware retrieval, query-plan/index availability, worker session cleanup, GitHub setup/callback concurrency, GitHub callback rollback, and Google Secret Manager parser/integrity/retry/cleanup/composition attacks. GitHub and Google tests use injected deterministic fakes and make no live provider calls.
 
 PostgreSQL tests require `TEST_DATABASE_URL`, reject reuse of `DATABASE_URL`, recreate the public schema, upgrade through Alembic, and clean dependent tables between tests. No live provider calls occur.
 
@@ -791,7 +799,7 @@ Known output at snapshot:
 | Backend/frontend containers | Not implemented |
 | Deployment manifests | Environment directories exist but contain no manifests |
 | CI/CD | No executable GitHub Actions workflow found |
-| Secret manager | Provider-neutral application port and opaque references; no production Vault/cloud adapter |
+| Secret manager | Google Cloud adapter implemented with ADC, strict version references, CRC32C, bounded retries, and narrow cleanup; GCP resources/IAM/secrets not provisioned |
 | Monitoring/logging/tracing | No production metrics/traces/central logging stack |
 | Backups/disaster recovery | No automated backup/restore plan |
 | Horizontal scaling | Database lease primitives support multiple claimers; no deployed autoscaling/host |
@@ -859,7 +867,7 @@ The current architecture supports this order because the data plane is stronger 
 |---:|---|---|---|---|
 | 1 | Cron/timezone scheduling | Add wall-clock recurrence only after timezone and DST policy is approved | GPT-5.6 Sol, high | Timezone, DST, and missed-run policy required |
 | 2 | Complete connector lifecycle APIs | Add update/archive/remove/cancel with narrow state transitions and audit emission | GPT-5.6 Sol, high | Retention and delegation decisions required |
-| 3 | Credential and validation services | Integrate secret manager and provider-neutral validation without exposing secrets | GPT-5.6 Sol, high | Secret platform and Local Folder deployment policy required |
+| 3 | Credential and validation services | Secret Manager foundation is implemented; provider-neutral connector validation remains | GPT-5.6 Sol, high | Provision GCP IAM/secrets and approve Local Folder deployment policy |
 | 4 | End-to-end admin workflow | Bootstrap/configure/sync/observe/cancel/recover acceptance flow | GPT-5.6 Sol, high | Operator runbook decisions |
 | 5 | Job/run/item/error operation APIs | Add safe detailed operational views and recovery controls | GPT-5.6 Sol, high | Error retention and operator authorization decisions |
 | 6 | Minimal admin UI | Sign-in, connectors, scopes, sync history, upload | GPT-5.6 Luna, medium | Product design/branding required |
@@ -907,4 +915,4 @@ The current architecture supports this order because the data plane is stronger 
 - [ ] Minimal administrator UI
 - [ ] Search service/API with server-side query embedding
 - [ ] Audit emission and operational observability
-- [ ] Production secrets, deployment, backups, and security hardening
+- [ ] Provision implemented production secrets foundation, deployment, backups, and security hardening

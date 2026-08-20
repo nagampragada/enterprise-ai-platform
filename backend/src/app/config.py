@@ -68,6 +68,27 @@ class GitHubAppSettings:
             raise ValueError("GitHub retry count is invalid")
 
 
+@dataclass(frozen=True, repr=False)
+class GoogleSecretManagerSettings:
+    project_id: str
+    secret_prefix: str
+    environment: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.project_id, str) or not re.fullmatch(
+            r"[a-z][a-z0-9-]{4,28}[a-z0-9]", self.project_id
+        ):
+            raise ValueError("Google Secret Manager project configuration is invalid")
+        if not isinstance(self.secret_prefix, str) or not re.fullmatch(
+            r"[a-z][a-z0-9-]{0,30}[a-z0-9]|[a-z]", self.secret_prefix
+        ):
+            raise ValueError("Google Secret Manager prefix configuration is invalid")
+        if not isinstance(self.environment, str) or not re.fullmatch(
+            r"[a-z][a-z0-9_-]{0,62}", self.environment
+        ):
+            raise ValueError("Google Secret Manager environment configuration is invalid")
+
+
 def load_github_app_settings_from_environment()->GitHubAppSettings:
     """Load references only; secret values are resolved later by an injected SecretStore."""
     required=("GITHUB_APP_ID","GITHUB_APP_SLUG","GITHUB_APP_CLIENT_ID",
@@ -85,6 +106,22 @@ def load_github_app_settings_from_environment()->GitHubAppSettings:
         web_base_url=os.getenv("GITHUB_WEB_BASE_URL","https://github.com"),
         request_timeout_seconds=float(os.getenv("GITHUB_REQUEST_TIMEOUT_SECONDS","10")),
         max_retries=int(os.getenv("GITHUB_MAX_RETRIES","2")))
+
+
+def load_google_secret_manager_settings_from_environment() -> GoogleSecretManagerSettings:
+    """Load nonsecret Google Secret Manager resource configuration only."""
+    required = (
+        "GCP_SECRET_MANAGER_PROJECT_ID",
+        "GCP_SECRET_MANAGER_SECRET_PREFIX",
+        "GCP_SECRET_MANAGER_ENVIRONMENT",
+    )
+    if any(not os.getenv(name) for name in required):
+        raise ValueError("Google Secret Manager configuration is incomplete")
+    return GoogleSecretManagerSettings(
+        project_id=os.environ["GCP_SECRET_MANAGER_PROJECT_ID"],
+        secret_prefix=os.environ["GCP_SECRET_MANAGER_SECRET_PREFIX"],
+        environment=os.environ["GCP_SECRET_MANAGER_ENVIRONMENT"],
+    )
 
 
 @lru_cache(maxsize=1)

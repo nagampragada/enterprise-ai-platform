@@ -31,6 +31,10 @@ class InvalidSecretReference(SecretStoreError):
     message = "secret reference is invalid"
 
 
+class SecretStoreIntegrityError(SecretStoreError):
+    message = "secret store integrity check failed"
+
+
 @dataclass(frozen=True, repr=False)
 class SecretValue:
     value: str
