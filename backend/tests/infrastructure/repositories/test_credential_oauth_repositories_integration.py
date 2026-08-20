@@ -64,6 +64,31 @@ def test_oauth_concurrent_consumption_has_one_winner_and_expiration_is_bounded(f
     with pytest.raises(OAuthTransactionConflict):repo.consume(repo.lock_by_state_hash(b"b"*32),now=NOW+timedelta(minutes=2))
     assert repo.expire_stale(now=NOW+timedelta(minutes=2),limit=1)==1;s.commit()
     assert s.get(OAuthAuthorizationTransaction,expired.id).status=="expired";s.close()
+def test_concurrent_setup_correlation_has_one_winner_and_cannot_be_replaced(factory):
+    org,user,connector=_setup(factory,"setup");seed=factory();repo=OAuthAuthorizationTransactionRepository(seed)
+    row=repo.create(org,connector,user,provider_key="github",state_hash=b"c"*32,
+        pkce_reference="opaque",callback_identifier="github_app_installation",created_at=NOW,
+        expires_at=NOW+timedelta(minutes=10));seed.commit();transaction_id=row.id;seed.close()
+    barrier=threading.Barrier(2);outcomes=[]
+    def correlate(candidate):
+        session=factory();repository=OAuthAuthorizationTransactionRepository(session)
+        try:
+            barrier.wait();locked=repository.lock_by_id(transaction_id)
+            repository.complete_provider_setup(locked,candidate_installation_id=candidate,
+                now=NOW+timedelta(minutes=1));session.commit();outcomes.append(("stored",candidate))
+        except OAuthTransactionConflict:
+            session.rollback();outcomes.append(("rejected",candidate))
+        finally:session.close()
+    threads=[threading.Thread(target=correlate,args=(candidate,)) for candidate in (77,88)]
+    [thread.start() for thread in threads];[thread.join() for thread in threads]
+    assert sorted(value[0] for value in outcomes)==["rejected","stored"]
+    session=factory();repository=OAuthAuthorizationTransactionRepository(session)
+    stored=repository.lock_by_id(transaction_id)
+    assert stored.provider_candidate_installation_id in {77,88}
+    with pytest.raises(OAuthTransactionConflict):
+        repository.complete_provider_setup(stored,candidate_installation_id=99,
+            now=NOW+timedelta(minutes=2))
+    session.rollback();session.close()
 def test_concurrent_cross_tenant_installation_binding_has_one_winner(factory):
     first_org,first_user,first_connector=_setup(factory,"first")
     second_org,second_user,second_connector=_setup(factory,"second")

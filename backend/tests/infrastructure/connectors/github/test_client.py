@@ -24,7 +24,8 @@ def settings(**kw):
     values=dict(app_id=12345,app_slug="enterprise-ai-test",client_id="Iv1.client-id",
         client_secret_reference=SecretReference("fake://github-client-secret"),
         private_key_reference=SecretReference("fake://github-app-key"),
-        callback_url="https://platform.example.test/callback",setup_url="https://platform.example.test/setup")
+        callback_url="https://platform.example.test/api/v1/connectors/github/callback",
+        setup_url="https://platform.example.test/api/v1/connectors/github/setup")
     values.update(kw);return GitHubAppSettings(**values)
 
 def payload(identifier=77,**kw):
@@ -41,7 +42,9 @@ def client(handler,**kw):
 
 def test_configuration_and_urls_are_strict_safe_and_use_pkce():
     with pytest.raises(ValueError):settings(api_base_url="http://api.github.com")
-    with pytest.raises(ValueError):settings(callback_url="https://platform.test/callback?wild=1")
+    with pytest.raises(ValueError):settings(callback_url="https://platform.test/api/v1/connectors/github/callback?wild=1")
+    with pytest.raises(ValueError):settings(setup_url="https://platform.example.test/wrong-setup")
+    with pytest.raises(ValueError):settings(web_base_url="https://github.com/untrusted-path")
     with pytest.raises(ValueError):settings(client_id="12345")
     with pytest.raises(ValueError):settings(client_secret_reference=SecretReference("plaintext-secret"))
     value,_=client(lambda request:response())

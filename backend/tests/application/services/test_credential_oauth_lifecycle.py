@@ -46,6 +46,24 @@ def test_consume_hashes_state_and_replay_or_expiry_fails_closed():
     service._transactions.lock_by_state_hash.return_value=None
     with pytest.raises(OAuthAuthorizationRejected,match="unavailable"):service.consume(STATE)
     assert STATE not in str(OAuthAuthorizationRejected("OAuth authorization transaction is unavailable"))
+def test_setup_correlation_is_locked_server_side_and_pkce_challenge_is_regenerated():
+    store=FakeStore();store.values["opaque-ref"]=VERIFIER;service=_oauth(store)
+    transaction_id,org,connector,user=uuid4(),uuid4(),uuid4(),uuid4()
+    pending=SimpleNamespace(id=transaction_id,organization_id=org,connector_id=connector,
+        initiating_user_id=user,provider_key="github",callback_identifier="github_app_installation",
+        pkce_verifier_secret_reference="opaque-ref",status="pending",
+        expires_at=NOW+timedelta(minutes=5),provider_candidate_installation_id=None,
+        provider_setup_completed_at=None)
+    correlated=SimpleNamespace(**pending.__dict__)
+    correlated.provider_candidate_installation_id=77;correlated.provider_setup_completed_at=NOW
+    service._transactions.lock_by_state_hash.return_value=pending
+    service._transactions.lock_by_id.return_value=pending
+    service._transactions.complete_provider_setup.return_value=correlated
+    locked=service.lock(STATE);result=service.complete_provider_setup(locked,candidate_installation_id=77)
+    challenge=service.retrieve_pkce_challenge(result)
+    assert result.provider_candidate_installation_id==77 and result.provider_setup_completed_at==NOW
+    assert challenge=="w1TpKUdYE9hUAcNSeeSRFioHDxfUxuHho_JHAfZ_vDM"
+    assert VERIFIER not in repr(result) and VERIFIER not in challenge
 def test_credential_replacement_and_disconnect_are_fail_closed_on_delete_failure():
     store=FakeStore();store.fail_delete=True;service=ConnectorCredentialService(Mock(),store,clock=lambda:NOW)
     service._connectors=Mock();service._connectors.lock_by_id.return_value=SimpleNamespace(connector_type="github")

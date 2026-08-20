@@ -53,10 +53,15 @@ class GitHubAppSettings:
                 or parsed.username or parsed.password or parsed.fragment or "*" in value):
                 raise ValueError("GitHub URL configuration is invalid")
         callback=urlparse(self.callback_url)
-        if callback.query or not callback.path or callback.path=="/":raise ValueError("GitHub callback URL is invalid")
+        setup=urlparse(self.setup_url)
+        if (callback.query or callback.path!="/api/v1/connectors/github/callback"
+            or setup.query or setup.path!="/api/v1/connectors/github/setup"
+            or (callback.scheme,callback.netloc)!=(setup.scheme,setup.netloc)):
+            raise ValueError("GitHub browser URL configuration is invalid")
         for value in (self.api_base_url,self.web_base_url):
             parsed=urlparse(value)
-            if parsed.query:raise ValueError("GitHub base URL configuration is invalid")
+            if parsed.query or parsed.path not in {"","/"}:
+                raise ValueError("GitHub base URL configuration is invalid")
         if not isinstance(self.request_timeout_seconds, (int, float)) or isinstance(self.request_timeout_seconds, bool) or not 0.1 <= self.request_timeout_seconds <= 60:
             raise ValueError("GitHub request timeout is invalid")
         if isinstance(self.max_retries, bool) or not isinstance(self.max_retries, int) or not 0 <= self.max_retries <= 3:

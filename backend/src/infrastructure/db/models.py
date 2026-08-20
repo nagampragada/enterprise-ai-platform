@@ -619,6 +619,17 @@ class OAuthAuthorizationTransaction(Base):
             "failure_code IS NULL OR failure_code ~ '^[a-z][a-z0-9_]*$'",
             name="failure_code_valid",
         ),
+        CheckConstraint(
+            "(provider_candidate_installation_id IS NULL AND provider_setup_completed_at IS NULL) OR "
+            "(provider_key = 'github' AND provider_candidate_installation_id > 0 AND "
+            "provider_setup_completed_at IS NOT NULL)",
+            name="setup_correlation_valid",
+        ),
+        CheckConstraint(
+            "provider_setup_completed_at IS NULL OR "
+            "(provider_setup_completed_at >= created_at AND provider_setup_completed_at < expires_at)",
+            name="setup_time_valid",
+        ),
         CheckConstraint("schema_version > 0", name="schema_version_positive"),
         Index(
             "ix_oauth_transactions_pending_state", "state_hash",
@@ -648,6 +659,10 @@ class OAuthAuthorizationTransaction(Base):
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     failure_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
     schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("1"))
+    provider_candidate_installation_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    provider_setup_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class GitHubAppInstallation(Base):

@@ -31,6 +31,20 @@ class OAuthAuthorizationTransactionRepository:
         _uuid(transaction_id)
         return self._one(select(OAuthAuthorizationTransaction).where(
             OAuthAuthorizationTransaction.id==transaction_id).with_for_update())
+    def complete_provider_setup(self,row:OAuthAuthorizationTransaction,*,candidate_installation_id:int,
+        now:datetime)->OAuthAuthorizationTransaction:
+        candidate_installation_id=_positive_bigint(candidate_installation_id);now=_aware(now)
+        result=self._updated(update(OAuthAuthorizationTransaction).where(
+            OAuthAuthorizationTransaction.id==row.id,
+            OAuthAuthorizationTransaction.status=="pending",
+            OAuthAuthorizationTransaction.expires_at>now,
+            OAuthAuthorizationTransaction.provider_key=="github",
+            OAuthAuthorizationTransaction.provider_candidate_installation_id.is_(None),
+            OAuthAuthorizationTransaction.provider_setup_completed_at.is_(None),
+        ).values(provider_candidate_installation_id=candidate_installation_id,
+            provider_setup_completed_at=now).returning(OAuthAuthorizationTransaction))
+        if result is None:raise OAuthTransactionConflict("OAuth authorization transaction is unavailable")
+        return result
     def consume(self,row:OAuthAuthorizationTransaction,*,now:datetime)->OAuthAuthorizationTransaction:
         now=_aware(now);result=self._updated(update(OAuthAuthorizationTransaction).where(
             OAuthAuthorizationTransaction.id==row.id,OAuthAuthorizationTransaction.status=="pending",
@@ -77,4 +91,8 @@ def _hash(v):
     return v
 def _reference(v):
     if v is not None and (not isinstance(v,str) or not v.strip() or len(v)>1024):raise InvalidOAuthTransactionRequest("secret reference is invalid")
+    return v
+def _positive_bigint(v):
+    if isinstance(v,bool) or not isinstance(v,int) or not 1<=v<=9_223_372_036_854_775_807:
+        raise InvalidOAuthTransactionRequest("provider candidate identifier is invalid")
     return v

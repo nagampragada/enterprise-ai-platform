@@ -217,6 +217,43 @@ def test_real_role_policy_denies_employee_and_disabled_admin(factory):
     _configure_app(factory, employee_org, employee_id)
     with TestClient(app) as client:
         assert client.get("/api/v1/connectors").status_code == 403
+        assert client.post(
+            "/api/v1/connectors",
+            json={"connector_type": "github", "display_name": "GitHub", "slug": "github"},
+        ).status_code == 403
+
+
+def test_admin_creates_tenant_bound_draft_github_connector(factory):
+    organization_id, user_id, _ = _identity_rows(factory, "GitHubAdmin", admin=True)
+    _configure_app(factory, organization_id, user_id)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/connectors",
+            json={"connector_type": "github", "display_name": "GitHub", "slug": "github"},
+        )
+        unsupported = client.post(
+            "/api/v1/connectors",
+            json={"connector_type": "google_drive", "display_name": "Drive", "slug": "drive"},
+        )
+        forced_active = client.post(
+            "/api/v1/connectors",
+            json={
+                "connector_type": "github", "display_name": "Unsafe", "slug": "unsafe",
+                "status": "active",
+            },
+        )
+        listing = client.get("/api/v1/connectors")
+    assert response.status_code == 201
+    body = response.json()
+    assert body["connector_type"] == "github" and body["status"] == "draft"
+    assert body["acl_support"] == "none"
+    assert set(body["capabilities"].values()) == {False}
+    assert unsupported.status_code == forced_active.status_code == 422
+    assert [item["connector_id"] for item in listing.json()["items"]] == [body["connector_id"]]
+    session = factory()
+    row = session.get(Connector, uuid.UUID(body["connector_id"]))
+    assert row.organization_id == organization_id and row.created_by_user_id == user_id
+    session.close()
 
 
 def test_business_team_owner_responsibility_does_not_grant_connector_admin(factory):

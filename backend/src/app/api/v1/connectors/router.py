@@ -11,7 +11,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
-from starlette.responses import Response
+from starlette.responses import RedirectResponse, Response
 
 from app.api.v1.connectors.schemas import (
     ConnectorCapabilitiesResponse,
@@ -23,7 +23,7 @@ from app.api.v1.connectors.schemas import (
     CreateConnectorScopeRequest,
     EnqueueSyncJobRequest,
     EnqueueSyncJobResponse,
-    CompleteGitHubInstallationRequest,
+    GitHubInstallationCompletionResponse,
     GitHubInstallationInitiationResponse,
     GitHubInstallationStatusResponse,
     PatchSyncScheduleRequest,
@@ -110,19 +110,45 @@ def initiate_github_installation(connector_id:UUID,administrator:ConnectorAdmini
     try:
         result=service.initiate(administrator.organization_id,connector_id,administrator.user_id);db_session.commit()
         return GitHubInstallationInitiationResponse(installation_url=result.installation_url,
-            authorization_url=result.authorization_url,expires_at=result.expires_at)
+            expires_at=result.expires_at)
     except Exception as exc:db_session.rollback();_raise_http(exc)
 
 
-@connectors_router.post("/{connector_id}/github/installation/complete",response_model=GitHubInstallationStatusResponse)
-def complete_github_installation(connector_id:UUID,payload:CompleteGitHubInstallationRequest,
-    administrator:ConnectorAdministrator=Depends(get_connector_administrator),service:GitHubAppInstallationService=Depends(get_github_app_installation_service),
-    db_session:Session=Depends(get_db_session))->GitHubInstallationStatusResponse:
+@connectors_router.get("/github/setup", response_class=RedirectResponse, status_code=status.HTTP_303_SEE_OTHER)
+def complete_github_setup(
+    state_value: str = Query(alias="state", min_length=43, max_length=512, pattern=r"^\S+$"),
+    installation_id: int = Query(gt=0, le=9_223_372_036_854_775_807),
+    setup_action: Literal["install"] = Query(),
+    service: GitHubAppInstallationService = Depends(get_github_app_installation_service),
+    db_session: Session = Depends(get_db_session),
+) -> RedirectResponse:
     try:
-        result=service.complete(administrator.organization_id,connector_id,administrator.user_id,
-            state=payload.state,code=payload.code,installation_id=payload.installation_id)
-        db_session.commit();return GitHubInstallationStatusResponse(**result.__dict__)
-    except Exception as exc:db_session.rollback();_raise_http(exc)
+        result = service.complete_setup(
+            state=state_value,
+            installation_id=installation_id,
+            setup_action=setup_action,
+        )
+        db_session.commit()
+        return RedirectResponse(result.authorization_url, status_code=status.HTTP_303_SEE_OTHER)
+    except Exception as exc:
+        db_session.rollback()
+        _raise_http(exc)
+
+
+@connectors_router.get("/github/callback", response_model=GitHubInstallationCompletionResponse)
+def complete_github_callback(
+    state_value: str = Query(alias="state", min_length=43, max_length=512, pattern=r"^\S+$"),
+    code: str = Query(min_length=1, max_length=1024, pattern=r"^\S+$"),
+    service: GitHubAppInstallationService = Depends(get_github_app_installation_service),
+    db_session: Session = Depends(get_db_session),
+) -> GitHubInstallationCompletionResponse:
+    try:
+        service.complete_callback(state=state_value, code=code)
+        db_session.commit()
+        return GitHubInstallationCompletionResponse(status="connected")
+    except Exception as exc:
+        db_session.rollback()
+        _raise_http(exc)
 
 
 @connectors_router.get("/{connector_id}/github/installation",response_model=GitHubInstallationStatusResponse)
@@ -149,12 +175,22 @@ def create_connector(
     db_session: Session = Depends(get_db_session),
 ) -> ConnectorResponse:
     try:
-        connector = service.create_local_folder_connector(
-            administrator.organization_id,
-            administrator.user_id,
-            display_name=payload.display_name,
-            slug=payload.slug,
-        )
+        if payload.connector_type == "local_folder":
+            connector = service.create_local_folder_connector(
+                administrator.organization_id,
+                administrator.user_id,
+                display_name=payload.display_name,
+                slug=payload.slug,
+            )
+        elif payload.connector_type == "github":
+            connector = service.create_github_connector(
+                administrator.organization_id,
+                administrator.user_id,
+                display_name=payload.display_name,
+                slug=payload.slug,
+            )
+        else:
+            raise InvalidConnectorManagementRequest("connector type is not supported")
         db_session.commit()
         return _connector_response(connector)
     except Exception as exc:

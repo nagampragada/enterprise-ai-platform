@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 Slug = str
 
@@ -16,10 +16,10 @@ Slug = str
 class CreateConnectorRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    connector_type: Literal["local_folder"]
+    connector_type: Literal["local_folder", "github"]
     display_name: str = Field(min_length=1, max_length=255)
     slug: str = Field(min_length=1, max_length=255, pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-    status: Literal["active"] = "active"
+    status: Literal["active", "draft"] | None = None
 
     @field_validator("display_name")
     @classmethod
@@ -28,19 +28,23 @@ class CreateConnectorRequest(BaseModel):
             raise ValueError("display_name must not be blank")
         return value.strip()
 
+    @model_validator(mode="after")
+    def _provider_lifecycle_is_server_owned(self) -> "CreateConnectorRequest":
+        expected = "active" if self.connector_type == "local_folder" else "draft"
+        if self.status is not None and self.status != expected:
+            raise ValueError("connector status is incompatible with connector_type")
+        return self
+
 
 class GitHubInstallationInitiationResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
     installation_url: str
-    authorization_url: str
     expires_at: datetime
 
 
-class CompleteGitHubInstallationRequest(BaseModel):
+class GitHubInstallationCompletionResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    state: str = Field(min_length=43, max_length=512)
-    code: str = Field(min_length=1, max_length=1024, pattern=r"^\S+$")
-    installation_id: int = Field(gt=0)
+    status: Literal["connected"]
 
 
 class GitHubInstallationStatusResponse(BaseModel):

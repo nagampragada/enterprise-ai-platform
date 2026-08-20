@@ -39,6 +39,15 @@ class GitHubAppRestClient(GitHubAppClient):
     @property
     def app_id(self)->int:return self._settings.app_id
 
+    @property
+    def web_base_url(self)->str:return self._settings.web_base_url
+
+    @property
+    def client_id(self)->str:return self._settings.client_id
+
+    @property
+    def callback_url(self)->str:return self._settings.callback_url
+
     def build_installation_url(self,state:str)->str:
         _opaque(state,"GitHub installation state",43,512)
         return f"{self._settings.web_base_url.rstrip('/')}/apps/{self._settings.app_slug}/installations/new?{urlencode({'state':state})}"

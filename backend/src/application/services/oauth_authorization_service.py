@@ -7,7 +7,9 @@ from typing import Callable, Collection
 from uuid import UUID
 from application.ports.secret_store import SecretReference,SecretStore,SecretStoreError,SecretValue
 from infrastructure.repositories.connector_repository import ConnectorRepository
-from infrastructure.repositories.oauth_authorization_transaction_repository import OAuthAuthorizationTransactionRepository
+from infrastructure.repositories.oauth_authorization_transaction_repository import (
+    OAuthAuthorizationTransactionRepository, OAuthTransactionConflict,
+)
 from infrastructure.repositories.user_repository import UserRepository
 
 DEFAULT_LIFETIME=timedelta(minutes=10);MAX_LIFETIME=timedelta(minutes=20)
@@ -27,7 +29,8 @@ class ConsumedOAuthAuthorization:
 class LockedOAuthAuthorization:
     transaction_id:UUID;organization_id:UUID;connector_id:UUID;initiating_user_id:UUID|None
     provider_key:str;callback_identifier:str;pkce_verifier_secret_reference:SecretReference|None
-    expires_at:datetime
+    expires_at:datetime;provider_candidate_installation_id:int|None
+    provider_setup_completed_at:datetime|None
 
 class OAuthAuthorizationService:
     def __init__(self,session,secret_store:SecretStore,*,clock:Callable[[],datetime]=lambda:datetime.now(UTC),
@@ -80,7 +83,25 @@ class OAuthAuthorizationService:
         reference=(SecretReference(row.pkce_verifier_secret_reference)
             if row.pkce_verifier_secret_reference else None)
         return LockedOAuthAuthorization(row.id,row.organization_id,row.connector_id,row.initiating_user_id,
-            row.provider_key,row.callback_identifier,reference,row.expires_at)
+            row.provider_key,row.callback_identifier,reference,row.expires_at,
+            row.provider_candidate_installation_id,row.provider_setup_completed_at)
+    def complete_provider_setup(self,locked:LockedOAuthAuthorization,*,candidate_installation_id:int)->LockedOAuthAuthorization:
+        now=_aware(self._clock())
+        current=self._transactions.lock_by_id(locked.transaction_id)
+        if current is None:raise OAuthAuthorizationRejected("OAuth authorization transaction is unavailable")
+        try:
+            row=self._transactions.complete_provider_setup(current,
+                candidate_installation_id=candidate_installation_id,now=now)
+        except OAuthTransactionConflict as exc:
+            raise OAuthAuthorizationRejected("OAuth authorization transaction is unavailable") from exc
+        reference=(SecretReference(row.pkce_verifier_secret_reference)
+            if row.pkce_verifier_secret_reference else None)
+        return LockedOAuthAuthorization(row.id,row.organization_id,row.connector_id,row.initiating_user_id,
+            row.provider_key,row.callback_identifier,reference,row.expires_at,
+            row.provider_candidate_installation_id,row.provider_setup_completed_at)
+    def retrieve_pkce_challenge(self,locked:LockedOAuthAuthorization)->str:
+        verifier=self.retrieve_pkce_verifier(locked)
+        return base64.urlsafe_b64encode(hashlib.sha256(verifier.value.encode()).digest()).rstrip(b"=").decode("ascii")
     def retrieve_pkce_verifier(self,locked:LockedOAuthAuthorization)->SecretValue:
         if locked.pkce_verifier_secret_reference is None:
             raise OAuthAuthorizationRejected("OAuth authorization transaction is unavailable")
@@ -91,7 +112,9 @@ class OAuthAuthorizationService:
         row=self._transactions.lock_by_id(locked.transaction_id)
         if row is None or row.status!="pending" or row.expires_at<=now:
             raise OAuthAuthorizationRejected("OAuth authorization transaction is unavailable")
-        self._transactions.consume(row,now=now)
+        try:self._transactions.consume(row,now=now)
+        except OAuthTransactionConflict as exc:
+            raise OAuthAuthorizationRejected("OAuth authorization transaction is unavailable") from exc
         return locked
     def delete_pkce_verifier(self,locked:LockedOAuthAuthorization)->None:
         if locked.pkce_verifier_secret_reference is None:return
@@ -104,5 +127,6 @@ def _lifetime(v):
     if not isinstance(v,timedelta) or v<=timedelta(0) or v>MAX_LIFETIME:raise InvalidOAuthAuthorization("OAuth lifetime is invalid")
     return v
 def _random(v,name):
-    if not isinstance(v,str) or len(v)<43:raise InvalidOAuthAuthorization(f"{name} generation failed")
+    if not isinstance(v,str) or not 43<=len(v)<=512 or any(ch.isspace() for ch in v):
+        raise InvalidOAuthAuthorization(f"{name} generation failed")
     return v

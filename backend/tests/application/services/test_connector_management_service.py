@@ -48,6 +48,27 @@ def test_connector_creation_uses_safe_server_owned_local_folder_defaults():
     session.rollback.assert_not_called()
 
 
+def test_github_connector_creation_uses_draft_and_only_committed_capabilities():
+    service, session = _service()
+    organization_id, user_id = uuid4(), uuid4()
+    service._connectors.add.side_effect = lambda org, row: row
+    connector = service.create_github_connector(
+        organization_id,
+        user_id,
+        display_name="GitHub",
+        slug="github",
+    )
+    assert connector.organization_id == organization_id
+    assert connector.created_by_user_id == user_id
+    assert connector.connector_type == "github"
+    assert connector.status == "draft"
+    assert connector.acl_support == "none"
+    assert connector.safe_config == {}
+    assert set(connector.capabilities.values()) == {False}
+    session.commit.assert_not_called()
+    session.rollback.assert_not_called()
+
+
 def test_missing_and_cross_tenant_connector_are_concealed():
     service, _ = _service()
     service._connectors.get_by_id.return_value = None

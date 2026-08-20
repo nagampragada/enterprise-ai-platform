@@ -43,6 +43,16 @@ LOCAL_FOLDER_CAPABILITIES = ConnectorCapabilities(
     supports_content_download=True,
 )
 
+GITHUB_PRECONNECTION_CAPABILITIES = ConnectorCapabilities(
+    supports_incremental_sync=False,
+    supports_permissions=False,
+    supports_folders=False,
+    supports_deletions=False,
+    supports_version_history=False,
+    supports_webhooks=False,
+    supports_content_download=False,
+)
+
 
 class InvalidConnectorManagementRequest(ValueError):
     """Raised when connector-management input or lifecycle state is invalid."""
@@ -96,6 +106,29 @@ class ConnectorManagementService:
         )
         return self._connectors.add(organization_id, connector)
 
+    def create_github_connector(
+        self,
+        organization_id: UUID,
+        creator_user_id: UUID,
+        *,
+        display_name: str,
+        slug: str,
+    ) -> Connector:
+        connector = Connector(
+            id=uuid4(),
+            organization_id=organization_id,
+            connector_type="github",
+            display_name=display_name,
+            slug=slug,
+            status="draft",
+            acl_support="none",
+            capabilities=asdict(GITHUB_PRECONNECTION_CAPABILITIES),
+            safe_config={},
+            config_schema_version=1,
+            created_by_user_id=creator_user_id,
+        )
+        return self._connectors.add(organization_id, connector)
+
     def get_connector(self, organization_id: UUID, connector_id: UUID) -> Connector:
         connector = self._connectors.get_by_id(organization_id, connector_id)
         if connector is None:
@@ -114,7 +147,6 @@ class ConnectorManagementService:
             organization_id,
             limit=limit,
             cursor=cursor,
-            connector_type="local_folder",
             status=status,
         )
 
