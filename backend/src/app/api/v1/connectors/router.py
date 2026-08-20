@@ -19,6 +19,7 @@ from app.api.v1.connectors.schemas import (
     ConnectorResponse,
     ConnectorScopePageResponse,
     ConnectorScopeResponse,
+    CreateGitHubRepositoryScopeRequest,
     CreateConnectorRequest,
     CreateConnectorScopeRequest,
     EnqueueSyncJobRequest,
@@ -28,6 +29,8 @@ from app.api.v1.connectors.schemas import (
     GitHubInstallationStatusResponse,
     GitHubRepositoryPageResponse,
     GitHubRepositoryResponse,
+    GitHubRepositoryScopePageResponse,
+    GitHubRepositoryScopeResponse,
     PatchSyncScheduleRequest,
     PutSyncScheduleRequest,
     SyncScheduleResponse,
@@ -43,6 +46,8 @@ from app.dependencies import (
     get_connector_sync_schedule_service,
     get_github_app_installation_service,
     get_github_repository_discovery_service,
+    get_github_repository_scope_service,
+    get_github_repository_selection_service,
     get_db_session,
 )
 from application.services.connector_management_service import (
@@ -67,6 +72,14 @@ from application.services.github_repository_discovery_service import (
     GitHubRepositoryDiscoveryNotFound,
     GitHubRepositoryDiscoveryRejected,
     GitHubRepositoryDiscoveryService,
+)
+from application.services.github_repository_selection_service import (
+    GitHubRepositoryScopeView,
+    GitHubRepositorySelectionConflict,
+    GitHubRepositorySelectionNotFound,
+    GitHubRepositorySelectionPersistenceError,
+    GitHubRepositorySelectionRejected,
+    GitHubRepositorySelectionService,
 )
 from application.ports.github_app import GitHubProviderError, GitHubProviderRateLimitError
 from application.ports.secret_store import SecretStoreError
@@ -207,6 +220,100 @@ def list_github_repositories(
             has_next=result.has_next,
             total_count=result.total_count,
         )
+    except Exception as exc:
+        db_session.rollback()
+        _raise_http(exc)
+
+
+@connectors_router.post(
+    "/{connector_id}/github/repository-scopes",
+    response_model=GitHubRepositoryScopeResponse,
+)
+def select_github_repository(
+    connector_id: UUID,
+    payload: CreateGitHubRepositoryScopeRequest,
+    administrator: ConnectorAdministrator = Depends(get_connector_administrator),
+    service: GitHubRepositorySelectionService = Depends(
+        get_github_repository_selection_service
+    ),
+    db_session: Session = Depends(get_db_session),
+) -> GitHubRepositoryScopeResponse:
+    try:
+        context = service.prepare(
+            administrator.organization_id,
+            connector_id,
+            payload.knowledge_space_id,
+            payload.repository_id,
+        )
+        db_session.rollback()
+        repository = service.verify(context)
+        result = service.persist(context, repository, administrator.user_id)
+        db_session.commit()
+        return _github_repository_scope_response(result)
+    except Exception as exc:
+        db_session.rollback()
+        _raise_http(exc)
+
+
+@connectors_router.get(
+    "/{connector_id}/github/repository-scopes",
+    response_model=GitHubRepositoryScopePageResponse,
+)
+def list_github_repository_scopes(
+    connector_id: UUID,
+    limit: int = Query(default=20, ge=1, le=100),
+    cursor: str | None = Query(default=None, max_length=512),
+    administrator: ConnectorAdministrator = Depends(get_connector_administrator),
+    service: GitHubRepositorySelectionService = Depends(
+        get_github_repository_scope_service
+    ),
+) -> GitHubRepositoryScopePageResponse:
+    try:
+        decoded = decode_cursor(cursor, "github_repository_scope")
+        page_cursor = ConnectorScopePageCursor(*decoded) if decoded else None
+        page = service.list(
+            administrator.organization_id,
+            connector_id,
+            limit=limit,
+            cursor=page_cursor,
+        )
+        return GitHubRepositoryScopePageResponse(
+            items=tuple(_github_repository_scope_response(item) for item in page.items),
+            limit=page.limit,
+            has_more=page.has_more,
+            next_cursor=(
+                encode_cursor(
+                    "github_repository_scope",
+                    page.next_cursor.created_at,
+                    page.next_cursor.scope_id,
+                )
+                if page.next_cursor
+                else None
+            ),
+        )
+    except Exception as exc:
+        _raise_http(exc)
+
+
+@connectors_router.delete(
+    "/{connector_id}/github/repository-scopes/{scope_id}",
+    response_model=GitHubRepositoryScopeResponse,
+)
+def deselect_github_repository(
+    connector_id: UUID,
+    scope_id: UUID,
+    administrator: ConnectorAdministrator = Depends(get_connector_administrator),
+    service: GitHubRepositorySelectionService = Depends(
+        get_github_repository_scope_service
+    ),
+    db_session: Session = Depends(get_db_session),
+) -> GitHubRepositoryScopeResponse:
+    try:
+        result = service.deselect(
+            administrator.organization_id, connector_id, scope_id
+        )
+        db_session.commit()
+        return _github_repository_scope_response(result)
     except Exception as exc:
         db_session.rollback()
         _raise_http(exc)
@@ -529,6 +636,7 @@ def _connector_response(row) -> ConnectorResponse:
     capabilities = {
         **row.capabilities,
         "supports_repository_discovery": row.connector_type == "github",
+        "supports_repository_selection": row.connector_type == "github",
     }
     return ConnectorResponse(
         connector_id=row.id,
@@ -560,6 +668,12 @@ def _scope_response(row) -> ConnectorScopeResponse:
         last_validated_at=row.last_validated_at,
         removed_at=row.removed_at,
     )
+
+
+def _github_repository_scope_response(
+    view: GitHubRepositoryScopeView,
+) -> GitHubRepositoryScopeResponse:
+    return GitHubRepositoryScopeResponse(**view.__dict__)
 
 
 def _job_values(row) -> dict[str, object]:
@@ -608,13 +722,19 @@ def _raise_http(exc: Exception) -> None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resource not found") from exc
     if isinstance(exc, GitHubRepositoryDiscoveryNotFound):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resource not found") from exc
+    if isinstance(exc, GitHubRepositorySelectionNotFound):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resource not found") from exc
     if isinstance(exc, GitHubInstallationRejected):
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="GitHub installation request is invalid") from exc
     if isinstance(exc, GitHubRepositoryDiscoveryRejected):
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="GitHub repository discovery request is invalid") from exc
+    if isinstance(exc, GitHubRepositorySelectionRejected):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="GitHub repository selection request is invalid") from exc
     if isinstance(exc, (GitHubInstallationConflict, GitHubBindingConflict)):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Resource state conflict") from exc
     if isinstance(exc, GitHubRepositoryDiscoveryConflict):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Resource state conflict") from exc
+    if isinstance(exc, GitHubRepositorySelectionConflict):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Resource state conflict") from exc
     if isinstance(exc, GitHubProviderRateLimitError):
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="GitHub provider is temporarily unavailable") from exc
@@ -646,6 +766,7 @@ def _raise_http(exc: Exception) -> None:
             SyncJobPersistenceError,
             SyncSchedulePersistenceError,
             GitHubInstallationPersistenceError,
+            GitHubRepositorySelectionPersistenceError,
             SQLAlchemyError,
         ),
     ):

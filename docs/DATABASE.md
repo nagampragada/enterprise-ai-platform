@@ -1,5 +1,13 @@
 # Database Architecture
 
+## GitHub repository scopes (no migration)
+
+Explicit GitHub repository selection reuses `connector_scopes`; migration `20260827_000018` remains the single head. A selection uses `scope_type = repository`, `access_mode = platform_managed`, the immutable external identity `github:repository:{positive_repository_id}`, one tenant-qualified knowledge-space foreign key, and a fixed safe metadata allowlist. The existing unique `(organization_id, connector_id, external_scope_key)` constraint permits exactly one durable identity per connector across active and removed states. It therefore prevents concurrent duplicate or different-space rows and enables same-row reactivation without a new table or index.
+
+Selection uses two caller-owned transactions separated by provider I/O. The first validates and copies connector, credential, organization installation, and active knowledge-space identities. After a repository-restricted metadata-only GitHub proof completes with no database transaction open, the second locks and revalidates those rows, locks the canonical scope identity, and creates or reactivates it. Connector locking serializes absent-row creates with select/deselect and installation lifecycle changes; the unique constraint remains the database backstop. Repositories only flush and never commit, roll back, retry, or call providers.
+
+Removal is a local `status = removed` transition with `removed_at`; it does not hard-delete the row or claim to alter remote App access. Listing and removal make no provider call. The safe JSON contains only repository ID, name/full name, owner login, privacy/visibility, archived/disabled flags, and default branch. Tokens, App/installation/account IDs, URLs, permissions, provider payloads, and secret references are excluded. No source item, sync job/run, document, chunk, or index row is created by selection.
+
 ## Durable GitHub setup correlation (`20260827_000018`)
 
 The public GitHub setup redirect cannot authenticate with a platform bearer token, and GitHub explicitly warns that its browser-supplied `installation_id` is untrusted. Migration `20260827_000018` therefore adds only `provider_candidate_installation_id` and `provider_setup_completed_at` to the existing `oauth_authorization_transactions` row. The positive candidate ID is transaction-, organization-, connector-, initiating-user-, and provider-bound by the existing row and composite foreign keys. No account name, organization name, provider payload, redirect target, token, authorization code, or raw OAuth state is stored.
@@ -18,7 +26,7 @@ The App uses a setup step followed by GitHub's explicit web authorization flow s
 
 Required runtime configuration is the App ID, distinct client ID, App slug, exact callback and setup URLs, version-pinned private-key and client-secret references, GitHub API/web base URLs, bounded HTTP settings, and the nonsecret GCP Secret Manager project/prefix/environment. Production composition uses the Cloud Run service identity through ADC; there is deliberately no JSON-key, plaintext, or in-memory production fallback.
 
-Minimum installed-App permissions are repository `Metadata: read` and `Contents: read`; live repository discovery narrows its request-scoped token to `Metadata: read`. Discovery is intentionally not persisted: a short tenant-scoped transaction validates and copies connector/credential/installation primitives, closes before SecretStore and GitHub calls, and performs no database mutation. Repository inventory caching therefore requires no table or migration. Repository selection/scope persistence, content synchronization, webhooks, and ACL synchronization remain outside this revision. Google Drive follows the GitHub roadmap.
+Minimum installed-App permissions are repository `Metadata: read` and `Contents: read`; discovery and selection proof narrow their request-scoped tokens to `Metadata: read`. Discovery remains live and unpersisted. Explicit selection persists only fixed safe metadata in `connector_scopes` after a repository-ID-restricted proof; content synchronization, webhooks, and ACL synchronization remain outside this revision. Google Drive follows the GitHub roadmap.
 
 ## Purpose
 
@@ -507,14 +515,14 @@ These are the next tables that can be implemented once the migration slice is ap
 - Security: `safe_config` and the capability snapshot contain only non-secret JSON objects. Credentials, tokens, API keys, private keys, and passwords must never be persisted there; `secret_reference` contains only a reference to externally managed secret material. A future connector service must validate provider-specific schemas and reject secret-like configuration keys.
 - ACL declaration: `acl_support` is the typed security-relevant declaration (`none`, `partial`, or `complete`). Capability JSON is descriptive and is not authoritative for access security.
 - Lifecycle: connectors progress through draft, validation, active/degraded/auth-failed/paused, and archived states. Hard deletion cascades owned scopes, while normal behavior archives connectors.
-- Integration status: connector instance and scope persistence exist, but repositories, services, APIs, synchronization, source items, and document relationships are not implemented by this slice.
+- Integration status: connector instance/scope repositories and Local Folder/GitHub management services/APIs exist. GitHub repository scopes persist desired boundaries only; GitHub synchronization is not implemented.
 
 #### connector_scopes
 
 - Purpose: Store a selected folder, repository, branch, drive, bucket, or path within one connector.
-- Content boundary: every scope has exactly one required knowledge space. `access_mode` exists only on this table and is `platform_managed`, `source_acl`, or `hybrid`; Local Folder uses `platform_managed`.
+- Content boundary: every scope has exactly one required knowledge space. `access_mode` exists only on this table and is `platform_managed`, `source_acl`, or `hybrid`; Local Folder and current GitHub repository selection use `platform_managed`.
 - Lifecycle: scopes progress through draft, validation, active/invalid/paused, and removed states. Normal behavior removes a scope before hard-deleting its knowledge space; the database rejects deletion of a referenced knowledge space.
-- Service invariants: an active scope must reference an active connector and active knowledge space. `source_acl` and `hybrid` require connector `acl_support = complete`. These cross-row rules cannot be safely expressed as ordinary checks and must be enforced by a future connector service.
+- Service invariants: an active scope must reference an active connector and active knowledge space. Current connector services enforce these cross-row rules. `source_acl` and `hybrid` require future connector-specific support with `acl_support = complete`.
 - Safe configuration: `safe_config` contains only non-secret scope selection data. Provider-specific service validation must reject secret payloads before persistence.
 
 #### Connector repositories

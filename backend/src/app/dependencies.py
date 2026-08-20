@@ -16,6 +16,9 @@ from application.services.github_app_installation_service import GitHubAppInstal
 from application.services.github_repository_discovery_service import (
     GitHubRepositoryDiscoveryService,
 )
+from application.services.github_repository_selection_service import (
+    GitHubRepositorySelectionService,
+)
 from application.ports.secret_store import SecretStore
 from app.config import GitHubAppSettings
 from infrastructure.connectors.github import GitHubAppRestClient
@@ -114,6 +117,24 @@ def get_github_repository_discovery_service(
         db_session,
         GitHubAppRestClient(settings, secret_store),
     )
+
+
+def get_github_repository_selection_service(
+    db_session: Session = Depends(get_db_session),
+    secret_store: SecretStore = Depends(get_secret_store),
+    settings: GitHubAppSettings = Depends(get_github_app_settings),
+) -> GitHubRepositorySelectionService:
+    return GitHubRepositorySelectionService(
+        db_session,
+        GitHubAppRestClient(settings, secret_store),
+    )
+
+
+def get_github_repository_scope_service(
+    db_session: Session = Depends(get_db_session),
+) -> GitHubRepositorySelectionService:
+    """Compose provider-free persisted scope operations."""
+    return GitHubRepositorySelectionService(db_session)
 
 
 def get_local_document_indexing_service(

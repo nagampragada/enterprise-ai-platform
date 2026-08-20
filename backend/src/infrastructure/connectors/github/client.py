@@ -24,6 +24,7 @@ from application.ports.github_app import (
     GitHubProviderRateLimitError,
     GitHubProviderUnavailableError,
     GitHubRepository,
+    GitHubRepositoryAccessGrant,
     GitHubRepositoryPage,
     GitHubUser,
     GitHubUserAccessToken,
@@ -193,7 +194,52 @@ class GitHubAppRestClient(GitHubAppClient):
             json_data={"permissions": INSTALLATION_TOKEN_PERMISSIONS},
             expected_statuses=(201,),
         )
+        return self._installation_token(_json_object(response))
+
+    def create_repository_access_token(
+        self,
+        installation_id: int,
+        repository_id: int,
+        *,
+        account_id: int,
+        account_login: str,
+    ) -> GitHubRepositoryAccessGrant:
+        installation_id = _positive_int(installation_id)
+        repository_id = _positive_int(repository_id)
+        account_id = _positive_int(account_id)
+        if not isinstance(account_login, str) or _ACCOUNT_LOGIN.fullmatch(account_login) is None:
+            raise GitHubProviderAuthorizationError()
+        response = self._request(
+            "POST",
+            f"/app/installations/{installation_id}/access_tokens",
+            authorization=f"Bearer {self._app_jwt()}",
+            retry=False,
+            json_data={
+                "repository_ids": [repository_id],
+                "permissions": INSTALLATION_TOKEN_PERMISSIONS,
+            },
+            expected_statuses=(201,),
+        )
         body = _json_object(response)
+        token = self._installation_token(body)
+        raw_repositories = body.get("repositories")
+        if body.get("repository_selection") != "selected" or not isinstance(
+            raw_repositories, list
+        ) or len(raw_repositories) != 1:
+            raise GitHubProviderAuthorizationError()
+        repository = _repository(
+            raw_repositories[0],
+            account_id=account_id,
+            account_login=account_login,
+            web_base_url=self._settings.web_base_url,
+        )
+        if repository.repository_id != repository_id:
+            raise GitHubProviderAuthorizationError()
+        return GitHubRepositoryAccessGrant(token, repository)
+
+    def _installation_token(
+        self, body: dict[str, object]
+    ) -> GitHubInstallationAccessToken:
         try:
             token = GitHubInstallationAccessToken(
                 _opaque(body["token"], "GitHub installation token", 1, 8192),

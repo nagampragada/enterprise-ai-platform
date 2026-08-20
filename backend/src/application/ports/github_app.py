@@ -91,6 +91,14 @@ class GitHubRepositoryPage:
     total_count: int | None
 
 
+@dataclass(frozen=True, repr=False)
+class GitHubRepositoryAccessGrant:
+    """Ephemeral proof that one installation can access one repository."""
+
+    token: GitHubInstallationAccessToken
+    repository: GitHubRepository
+
+
 class GitHubAppClient(Protocol):
     @property
     def app_id(self) -> int: ...
@@ -109,6 +117,14 @@ class GitHubAppClient(Protocol):
     def create_installation_access_token(
         self, installation_id: int
     ) -> GitHubInstallationAccessToken: ...
+    def create_repository_access_token(
+        self,
+        installation_id: int,
+        repository_id: int,
+        *,
+        account_id: int,
+        account_login: str,
+    ) -> GitHubRepositoryAccessGrant: ...
     def list_installation_repositories(
         self,
         token: GitHubInstallationAccessToken,

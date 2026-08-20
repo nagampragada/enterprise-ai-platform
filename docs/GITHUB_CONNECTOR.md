@@ -1,6 +1,6 @@
 # GitHub connector
 
-The GitHub connector currently implements the secure GitHub App installation lifecycle and live, read-only repository discovery. Repository selection, scope persistence, content synchronization, webhooks, ACL synchronization, document/index creation, and retrieval remain unimplemented.
+The GitHub connector implements the secure GitHub App installation lifecycle, live read-only repository discovery, and explicit tenant-safe repository selection. Selection persists only a desired synchronization boundary; content synchronization, webhooks, ACL synchronization, document/index creation, and retrieval remain unimplemented.
 
 ## Repository discovery contract
 
@@ -20,6 +20,24 @@ Tenant identity comes only from the authenticated administrator. Connector, cred
 
 A short database read transaction loads and validates those rows and copies only primitive installation/account values into an immutable request context. The transaction is rolled back before Secret Manager or GitHub I/O. Discovery does not lock or mutate rows and does not persist repository results.
 
+## Repository selection contract
+
+Authenticated `organization_admin` users can create, list, and locally remove persisted selections:
+
+```http
+POST /api/v1/connectors/{connector_id}/github/repository-scopes
+GET /api/v1/connectors/{connector_id}/github/repository-scopes?limit=20&cursor=...
+DELETE /api/v1/connectors/{connector_id}/github/repository-scopes/{scope_id}
+```
+
+The POST body accepts exactly a positive `repository_id` and a tenant-owned active `knowledge_space_id`. Owner/name, installation/App/account identifiers, URLs, permissions, status, creator, tenant, and configuration are server-owned. The response exposes only the platform scope ID, connector/space IDs, validated repository administration metadata, lifecycle status, and platform timestamps. It never exposes raw `safe_config` or credentials.
+
+Selection first validates the tenant connector, active credential, connected organization installation, and active knowledge space in a short read transaction. After that transaction ends, it creates one installation token restricted to exactly the candidate repository ID and `Metadata: read`. GitHub's token response must report `repository_selection=selected` and exactly that repository. The restricted token then calls `GET /installation/repositories?per_page=1&page=1`; the page must contain exactly the same repository, total one, with no next page. Both proofs must agree with the verified installation account ID/login. Public repository visibility is never accepted as authorization.
+
+A new short write transaction re-locks the connector, credential, installation binding, and knowledge space, then compares all copied security-boundary identities before persistence. The canonical immutable identity is `github:repository:{repository_id}`. The existing unique `(organization_id, connector_id, external_scope_key)` constraint prevents duplicate or different-space selections, so no migration was required. Connector locking serializes create/reactivate/deselect races. Exact duplicates return one scope; a removed same-space scope is reactivated; a different-space assignment conflicts and is never moved implicitly.
+
+GET is a provider-free bounded `(created_at,id)` keyset page of persisted selections, including locally removed history. DELETE is provider-free and idempotently changes the exact tenant/connector-owned scope to `removed`; it does not revoke GitHub access, hard-delete history, or delete content. Neither operation requires GitHub configuration. No selection route enqueues a job, creates a schedule, retrieves content, or writes source/document/index rows. Existing synchronization APIs remain limited to Local Folder connectors.
+
 ## Request-scoped credentials and provider bounds
 
 The adapter retrieves the App private key through the configured `SecretStore`, creates an App JWT in memory, and makes one non-retried `POST /app/installations/{stored_id}/access_tokens` request for `Metadata: read` only. It validates token text, requested permissions, and an aware expiry between 30 seconds and 65 minutes from issuance. The installation token is passed only in memory to the immediately following repository request and is then discarded; it is never cached, persisted, returned, or rendered in object representations.
@@ -32,4 +50,4 @@ Provider responses are untrusted. Every repository must have a positive unique I
 
 The GitHub App registration still needs repository `Metadata: read` and `Contents: read` for the installed App because later read-only content synchronization will require Contents access. Discovery narrows its generated token to metadata only. Production operation requires a real organization-installed GitHub App, exact HTTPS setup/callback URLs, production Google Cloud Secret Manager resources and versions, ADC/IAM for the runtime identity, and the documented App settings. No public domain or real provider calls are needed for the deterministic implementation tests.
 
-The next GitHub slice is an explicit product-approved repository-selection contract and tenant-safe `ConnectorScope` persistence. Only after that should content identity/download and incremental synchronization be designed. Webhooks, ACLs, version history, deletion handling, indexing, search, and answers remain later work.
+The next GitHub slice is read-only repository content identity and download design. Only after that should incremental synchronization be designed. Webhooks, ACLs, version history, deletion handling, indexing, search, and answers remain later work.

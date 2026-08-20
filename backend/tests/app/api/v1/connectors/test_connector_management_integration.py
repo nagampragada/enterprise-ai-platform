@@ -254,10 +254,11 @@ def test_admin_creates_tenant_bound_draft_github_connector(factory):
     assert body["connector_type"] == "github" and body["status"] == "draft"
     assert body["acl_support"] == "none"
     assert body["capabilities"]["supports_repository_discovery"] is True
+    assert body["capabilities"]["supports_repository_selection"] is True
     assert {
         value
         for key, value in body["capabilities"].items()
-        if key != "supports_repository_discovery"
+        if key not in {"supports_repository_discovery", "supports_repository_selection"}
     } == {False}
     assert unsupported.status_code == forced_active.status_code == 422
     assert [item["connector_id"] for item in listing.json()["items"]] == [body["connector_id"]]

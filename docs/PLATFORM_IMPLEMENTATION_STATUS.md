@@ -27,7 +27,7 @@ This document treats executable code, migrations, runtime route registration, an
 
 The repository is building a multi-tenant enterprise knowledge platform. Organizations will eventually configure controlled data connectors, ingest and index documents, retrieve only content a user is authorized to see, and use a future answer/agent layer to produce grounded responses with citations.
 
-Operationally today, the FastAPI backend supports authentication and authenticated manual upload of TXT, Markdown, DOCX, and PDF files through a fully tested extraction, deterministic chunking, embedding, and PostgreSQL/pgvector persistence pipeline. The backend also contains secure Local Folder connector-management APIs, recurring interval schedules, a database-only scheduler host, a complete synchronization engine, durable job control, a continuous and one-shot worker host, immutable source versioning, and a permission-aware vector retrieval repository. GitHub is the first cloud connector: organization administrators can create a draft GitHub connector, complete its browser GitHub App installation lifecycle, and retrieve one bounded live page of repositories authorized to the verified organization installation. A production Google Cloud Secret Manager adapter supplies immutable GitHub configuration references, ephemeral PKCE storage, and on-demand private-key access through ADC-based, fail-closed composition. No GCP resource or Cloud Run deployment has been provisioned. Repository selection and synchronization are not implemented. Retrieval is not exposed by an API.
+Operationally today, the FastAPI backend supports authentication and authenticated manual upload of TXT, Markdown, DOCX, and PDF files through a fully tested extraction, deterministic chunking, embedding, and PostgreSQL/pgvector persistence pipeline. The backend also contains secure Local Folder connector-management APIs, recurring interval schedules, a database-only scheduler host, a complete synchronization engine, durable job control, a continuous and one-shot worker host, immutable source versioning, and a permission-aware vector retrieval repository. GitHub is the first cloud connector: organization administrators can complete its GitHub App installation lifecycle, discover a bounded live repository page, and persist explicit repository-to-knowledge-space selections after authoritative restricted-token revalidation. A production Google Cloud Secret Manager adapter supplies immutable GitHub configuration references, ephemeral PKCE storage, and on-demand private-key access through ADC-based, fail-closed composition. No GCP resource or Cloud Run deployment has been provisioned. GitHub repository content synchronization is not implemented. Retrieval is not exposed by an API.
 
 The product is therefore a **tested backend foundation and vertical-slice implementation, not a finished user-facing product**. Its strongest capability is the tenant-safe scheduled content ingestion/synchronization/indexing data plane with bounded leases, fencing, retries, rollback, continuous Local Folder execution, and authorization-before-ranking retrieval. Its primary gaps are cron/timezone scheduling, broader connector lifecycle operations, search APIs, answer generation, deployment supervision, and a frontend.
 
@@ -350,14 +350,14 @@ Operational connector implementation:
 | Connector type | Status |
 |---|---|
 | `local_folder` | Complete backend connector, synchronization service, execution control, bounded runner |
-| GitHub | Verified GitHub App installation lifecycle and live read-only repository discovery implemented; selection/sync not operational |
+| GitHub | Verified App installation, live discovery, and tenant-safe repository selection implemented; content sync not operational |
 | Google Drive | Placeholder directory only; follows GitHub |
 | SharePoint | Placeholder directory only; not operational |
 | PostgreSQL connector | Placeholder directory only; not operational |
 | SQL Server | Placeholder directory only; not operational |
 | Other domain enum values (OneDrive, Slack, Jira, Confluence, GitHub, Gmail, Outlook, Dropbox, Box, S3, Azure Blob) | Contract vocabulary only |
 
-`ConnectorManagementService` and authenticated APIs support Local Folder and GitHub connector creation/list/get; Local Folder additionally supports scope creation/list, asynchronous job enqueue, and job list/get. GitHub connectors are created in `draft`; `supports_repository_discovery` is true while content download/synchronization, ACL, folder, deletion, history, and webhook capabilities remain false. Organization-admin-only operations initiate App installation, return safe installation status, perform idempotent local disconnect, and discover a bounded live repository page after activation. Public GitHub browser redirects use single-use state instead of a platform bearer token. Responses omit `safe_config`, filesystem roots, secret references, tokens, provider payloads, lease/worker data, and ORM state. Connector update/delete/archive, cancellation, repository selection/scope persistence, synchronization, and UI remain absent. Audit persistence exists, but no reusable audit writer exists, so connector-management audit emission remains deferred rather than implemented ad hoc.
+`ConnectorManagementService` and authenticated APIs support Local Folder and GitHub connector creation/list/get; Local Folder additionally supports scope creation/list and synchronization operations. GitHub connectors declare dedicated discovery and selection capabilities while content download/synchronization, ACL, folder, deletion, history, and webhook capabilities remain false. Organization-admin-only operations manage App installation, discover a live page, and create/list/idempotently remove repository scopes. Selection never starts synchronization. Responses omit `safe_config`, secret references, credentials, provider payloads, and ORM state. Connector update/archive, cancellation, GitHub content synchronization, and UI remain absent.
 
 ### Google Cloud Secret Manager foundation
 
@@ -373,7 +373,7 @@ GitHub is integrated as a GitHub App rather than a classic OAuth App or personal
 
 Completion exchanges GitHub's temporary authorization code exactly once, retrieves the authenticated GitHub user with `GET /user`, and requires the candidate installation to appear in bounded, paginated `GET /user/installations` results authenticated by that user's temporary token. The installation must belong to the configured App and an `Organization`. An App-JWT `GET /app/installations/{id}` lookup then provides an additional App-identity and metadata consistency check; it is not the user-association proof. Database uniqueness prevents one App installation from being concurrently attached to two platform connectors.
 
-Persisted data is limited to the untrusted positive candidate installation ID and setup timestamp on the OAuth transaction, followed after verification by the GitHub App/installation IDs, safe external organization ID/login/type, repository-selection mode, provider timestamps, credential lifecycle metadata, and last verification time. OAuth state is stored only as a SHA-256 digest; the PKCE verifier, App private key, and OAuth client secret are available only through opaque `SecretStore` references. Temporary user tokens, callback codes, App JWTs, and discovery installation tokens are discarded after their immediate use. Repository discovery results are live and not persisted. No token, code, raw state, secret, private key, raw provider response, authorization header, browser account name, or arbitrary redirect is persisted or returned.
+Persisted installation data is limited to the untrusted positive candidate installation ID and setup timestamp, followed after verification by safe binding and credential metadata. Repository discovery results remain live and unpersisted; explicit repository choices persist only the canonical repository ID and a fixed safe metadata allowlist in `ConnectorScope`. OAuth state is stored only as a SHA-256 digest. Temporary user tokens, callback codes, App JWTs, discovery tokens, and repository-restricted selection tokens are discarded after immediate use. No credential, raw provider response, authorization header, browser-supplied repository metadata, or arbitrary redirect is persisted or returned.
 
 Required GitHub App registration/runtime settings are the App ID, distinct client ID, App slug, exact callback URL, setup URL, version-pinned private-key secret reference, version-pinned client-secret reference, GitHub API/web base URLs, and bounded timeout/retry controls. The App should not enable automatic OAuth-on-install for this sequence; the platform explicitly starts the documented web authorization flow with PKCE after installation. The production Secret Manager adapter is implemented, but GCP resources, IAM, runtime identity, and secrets remain operator prerequisites; no insecure fallback is provided.
 
@@ -387,6 +387,12 @@ For each request the adapter retrieves the App key through `SecretStore`, create
 
 Every page is fail-closed: repository IDs must be positive and unique; names, owner identity, full name, booleans, visibility, branch, timestamp, and URL are validated; owner account ID and login must agree with the verified organization; and HTML/Link URLs must use the exact trusted HTTPS host and expected path without credentials or extra controls. Link URLs are metadata only and are never followed. The response exposes only the platform repository/page contract. See `docs/GITHUB_CONNECTOR.md`.
 
+### GitHub repository selection
+
+`POST /api/v1/connectors/{connector_id}/github/repository-scopes` accepts only a positive repository ID and tenant-owned knowledge-space UUID. It validates persisted boundaries, ends that transaction, creates one token restricted to exactly that repository with Metadata read only, and requires both the token response and a one-item restricted repository listing to agree. A second transaction re-locks and revalidates every boundary before storing `github:repository:{id}` in `ConnectorScope`. Existing connector/external-key uniqueness and connector locking provide idempotency and concurrency safety without a migration or implicit knowledge-space movement.
+
+GET returns only a bounded deterministic page of persisted safe selections and never calls GitHub. DELETE is an idempotent provider-free local `removed` transition; it neither hard-deletes history nor changes remote App access. No route creates source items, documents, chunks, indexes, jobs, runs, or schedules. The next GitHub slice is read-only content identity/download design.
+
 ### GitHub App operator configuration
 
 - Register a **GitHub App**, not an OAuth App, and permit organization installations only.
@@ -396,7 +402,7 @@ Every page is fail-closed: repository IDs must be positive and unique; names, ow
 - Provision the App private key and OAuth client secret in Google Secret Manager using the safe process in `docs/GCP_SECRET_MANAGER.md`. The application receives only canonical numeric-version references through `GITHUB_APP_PRIVATE_KEY_REFERENCE` and `GITHUB_APP_CLIENT_SECRET_REFERENCE`.
 - Configure the App ID, distinct client ID, App slug, exact HTTPS setup/callback URLs, explicitly trusted GitHub API/web base origins, and bounded timeout/retry settings. Do not enable automatic OAuth-on-install for this explicit setup sequence.
 - User authorization and installation tokens are temporary, minted only on demand, and discarded without persistence.
-- Leave webhooks disabled/not configured for this slice. Repository selection/scope persistence is the next GitHub implementation slice; content retrieval, synchronization, ACLs, version history, deletions, folders, and webhooks are not operational.
+- Leave webhooks disabled/not configured. Content retrieval, synchronization, ACLs, version history, deletions, folders, and webhooks are not operational.
 
 ## 14. Local Folder connector
 
@@ -609,6 +615,9 @@ Generated OpenAPI verifies **26 application operations across 18 paths**. FastAP
 | GET | `/api/v1/connectors/{connector_id}/github/installation` | Bearer + `organization_admin` | Read safe installation status | UUID path | safe account/lifecycle metadata | Complete |
 | DELETE | `/api/v1/connectors/{connector_id}/github/installation` | Bearer + `organization_admin` | Idempotent local disconnect | UUID path | disconnected safe status | Complete |
 | GET | `/api/v1/connectors/{connector_id}/github/repositories` | Bearer + `organization_admin` | One live verified-installation repository page | UUID path; page 1–1,000; page size 1–100 | validated platform repository page | Complete |
+| POST | `/api/v1/connectors/{connector_id}/github/repository-scopes` | Bearer + `organization_admin` | Select one verified repository into one active tenant space | repository ID + knowledge-space UUID only | immutable safe repository scope | Complete |
+| GET | `/api/v1/connectors/{connector_id}/github/repository-scopes` | Bearer + `organization_admin` | Provider-free persisted selection page | bounded limit/cursor | immutable safe repository scope page | Complete |
+| DELETE | `/api/v1/connectors/{connector_id}/github/repository-scopes/{scope_id}` | Bearer + `organization_admin` | Idempotent local deselection | UUID paths | removed safe repository scope | Complete |
 | POST | `/api/v1/connectors/{connector_id}/scopes` | Bearer + `organization_admin` | Create active platform-managed Local Folder scope | space/name/slug + strict Local Folder config | redacted scope | Complete |
 | GET | `/api/v1/connectors/{connector_id}/scopes` | Bearer + `organization_admin` | Connector scope keyset page | limit/cursor/status | redacted page | Complete |
 | POST | `/api/v1/connectors/{connector_id}/scopes/{scope_id}/sync-jobs` | Bearer + `organization_admin` | Enqueue/coalesce durable asynchronous work | empty optional body; execution controls forbidden | safe job + `coalesced`, HTTP 202 | Complete |
@@ -860,7 +869,7 @@ Never display or request: password hashes, refresh-token hashes, connector secre
 | LangGraph, LangChain, LangSmith | Not dependencies; not used |
 | Tool calling and MCP server/tools | Not implemented |
 | Google Drive connector | Placeholder only |
-| GitHub selection/content sync/webhooks/ACL sync | Live repository discovery exists; selection/scope persistence and all data-plane slices remain future work |
+| GitHub content sync/webhooks/ACL sync | Installation, discovery, and selection exist; all GitHub data-plane slices remain future work |
 | SharePoint/OneDrive connector | Placeholder/contract vocabulary only |
 | Slack/Teams connectors | Not implemented (Teams structure is organizational data, not Microsoft Teams connector) |
 | PostgreSQL/SQL Server connectors | Placeholder directories only |
@@ -887,7 +896,7 @@ The current architecture supports this order because the data plane is stronger 
 | 6 | Minimal admin UI | Sign-in, connectors, scopes, sync history, upload | GPT-5.6 Luna, medium | Product design/branding required |
 | 7 | Search service and API | Server-side query embedding + existing authorized repository | GPT-5.6 Sol, high | Provider credentials and result contract |
 | 8 | Grounded answers/citations | Answer generation, citation evidence, refusal/guardrails | GPT-5.6 Sol, high | Model/provider, safety, prompt policy decisions |
-| 9 | GitHub repository selection | Persist an explicit product-approved repository choice as a tenant-safe connector scope; discovery is complete | GPT-5.6 Sol, high | Repository scope/product policy required |
+| 9 | GitHub repository selection | Completed: tenant-safe explicit repository scope with restricted-token proof | GPT-5.6 Sol, high | Operational GitHub/GCP setup required |
 | 10 | GitHub read-only synchronization | Content identity/download, incremental sync, then webhooks and ACL synchronization in later slices | GPT-5.6 Sol, high | GitHub App permission review required |
 | 11 | Google Drive + OAuth + ACL sync | Follows GitHub; provider adapter, secrets, directory/ACL generation, tests | GPT-5.6 Sol, high | Google credentials/admin consent required |
 | 12 | SharePoint/OneDrive connector | Microsoft OAuth, sites/drives, groups/ACLs | GPT-5.6 Sol, high | Microsoft tenant consent/credentials required |

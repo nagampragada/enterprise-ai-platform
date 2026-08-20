@@ -64,6 +64,20 @@ class ConnectorScopeRepository:
         _require_uuid("organization_id", organization_id); _require_uuid("scope_id", scope_id)
         return self._one(select(ConnectorScope).where(ConnectorScope.organization_id == organization_id, ConnectorScope.id == scope_id).with_for_update())
 
+    def lock_by_external_scope_key(
+        self, organization_id: UUID, connector_id: UUID, external_scope_key: str
+    ) -> ConnectorScope | None:
+        _require_uuid("organization_id", organization_id); _require_uuid("connector_id", connector_id)
+        if not isinstance(external_scope_key, str) or not external_scope_key.strip():
+            raise InvalidConnectorRepositoryRequest("external_scope_key must be nonblank")
+        return self._one(
+            select(ConnectorScope).where(
+                ConnectorScope.organization_id == organization_id,
+                ConnectorScope.connector_id == connector_id,
+                ConnectorScope.external_scope_key == external_scope_key,
+            ).with_for_update()
+        )
+
     def list_page(
         self,
         organization_id: UUID,
@@ -74,6 +88,7 @@ class ConnectorScopeRepository:
         knowledge_space_id: UUID | None = None,
         access_mode: str | None = None,
         status: str | None = None,
+        scope_type: str | None = None,
     ) -> ConnectorScopePage:
         _require_uuid("organization_id", organization_id); _require_limit(limit); _validate_cursor(cursor)
         statement = select(ConnectorScope).where(ConnectorScope.organization_id == organization_id)
@@ -81,6 +96,7 @@ class ConnectorScopeRepository:
         if knowledge_space_id is not None: statement = statement.where(ConnectorScope.knowledge_space_id == _require_uuid("knowledge_space_id", knowledge_space_id))
         if access_mode is not None: statement = statement.where(ConnectorScope.access_mode == _require_choice("access_mode", access_mode, ACCESS_MODES))
         if status is not None: statement = statement.where(ConnectorScope.status == _require_choice("status", status, SCOPE_STATUSES))
+        if scope_type is not None: statement = statement.where(ConnectorScope.scope_type == _require_code("scope_type", scope_type))
         if cursor is not None:
             statement = statement.where(or_(ConnectorScope.created_at > cursor.created_at, and_(ConnectorScope.created_at == cursor.created_at, ConnectorScope.id > cursor.scope_id)))
         statement = statement.order_by(ConnectorScope.created_at.asc(), ConnectorScope.id.asc()).limit(limit + 1)
@@ -104,6 +120,9 @@ class ConnectorScopeRepository:
         if removed_at is not None: _require_aware("removed_at", removed_at)
         if (normalized == "removed") != (removed_at is not None): raise InvalidConnectorRepositoryRequest("removed status and removed_at must be consistent")
         return self._update(organization_id, scope_id, status=normalized, removed_at=removed_at)
+
+    def flush(self, message: str = "connector scope could not be persisted") -> None:
+        self._flush(message)
 
     def _update(self, organization_id: UUID, scope_id: UUID, **values: object) -> ConnectorScope | None:
         _require_uuid("organization_id", organization_id); _require_uuid("scope_id", scope_id)

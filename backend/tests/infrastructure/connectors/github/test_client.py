@@ -161,6 +161,44 @@ def test_installation_token_uses_exact_installation_minimum_permission_and_one_p
     assert "ghs_temporary" not in repr(token) and "ghs_temporary" not in repr(value)
 
 
+def test_repository_token_is_restricted_to_one_id_and_metadata_only(monkeypatch):
+    monkeypatch.setattr(jwt,"encode",lambda *a,**k:"fake.jwt")
+    calls=[]
+    def handler(request):
+        calls.append(request)
+        assert request.method=="POST"
+        assert request.url.path=="/app/installations/77/access_tokens"
+        assert request.read()==b'{"repository_ids":[501],"permissions":{"metadata":"read"}}'
+        return httpx.Response(201,json={"token":"ghs_temporary",
+            "expires_at":"2026-08-20T13:00:00Z","permissions":{"metadata":"read"},
+            "repository_selection":"selected","repositories":[repository()]})
+    value,store=client(handler,max_retries=3)
+    grant=value.create_repository_access_token(77,501,account_id=99,account_login="fake-org")
+    assert grant.repository.repository_id==501
+    assert len(calls)==1 and store.retrieved==["fake://github-app-key"]
+    assert "ghs_temporary" not in repr(grant)
+
+
+@pytest.mark.parametrize("change",(
+    {"repository_selection":"all"},
+    {"repositories":[]},
+    {"repositories":[repository(),repository(502)]},
+    {"repositories":[repository(502)]},
+    {"repositories":[repository(owner={"id":100,"login":"fake-org"})]},
+    {"repositories":[repository(owner={"id":99,"login":"wrong-org"},full_name="wrong-org/docs",html_url="https://github.com/wrong-org/docs")]},
+))
+def test_repository_token_rejects_missing_duplicate_or_mismatched_proof(monkeypatch,change):
+    monkeypatch.setattr(jwt,"encode",lambda *a,**k:"fake.jwt")
+    body={"token":"ghs_temporary","expires_at":"2026-08-20T13:00:00Z",
+        "permissions":{"metadata":"read"},"repository_selection":"selected",
+        "repositories":[repository()]}
+    body.update(change);calls=[]
+    value,_=client(lambda request:(calls.append(request) or httpx.Response(201,json=body)),max_retries=3)
+    with pytest.raises(GitHubProviderAuthorizationError):
+        value.create_repository_access_token(77,501,account_id=99,account_login="fake-org")
+    assert len(calls)==1
+
+
 @pytest.mark.parametrize("body",(
     {"expires_at":"2026-08-20T13:00:00Z","permissions":{"metadata":"read"}},
     {"token":"ghs_temporary","expires_at":"not-a-date","permissions":{"metadata":"read"}},

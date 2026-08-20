@@ -86,6 +86,42 @@ class GitHubRepositoryPageResponse(BaseModel):
     total_count: int | None
 
 
+class CreateGitHubRepositoryScopeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    repository_id: int = Field(strict=True, gt=0, le=9_223_372_036_854_775_807)
+    knowledge_space_id: UUID
+
+
+class GitHubRepositoryScopeResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    scope_id: UUID
+    connector_id: UUID
+    knowledge_space_id: UUID
+    repository_id: int
+    repository_name: str
+    repository_full_name: str
+    owner_login: str
+    private: bool
+    visibility: Literal["public", "private", "internal"] | None
+    archived: bool
+    disabled: bool
+    default_branch: str | None
+    status: Literal["draft", "validating", "active", "invalid", "paused", "removed"]
+    created_at: datetime
+    updated_at: datetime
+
+
+class GitHubRepositoryScopePageResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    items: tuple[GitHubRepositoryScopeResponse, ...]
+    limit: int
+    has_more: bool
+    next_cursor: str | None
+
+
 class LocalFolderScopeConfiguration(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -122,6 +158,7 @@ class ConnectorCapabilitiesResponse(BaseModel):
     supports_webhooks: bool
     supports_content_download: bool
     supports_repository_discovery: bool = False
+    supports_repository_selection: bool = False
 
 
 class ConnectorResponse(BaseModel):

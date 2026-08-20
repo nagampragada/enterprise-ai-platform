@@ -17,3 +17,4 @@ class ConnectorCapabilities:
     supports_webhooks: bool
     supports_content_download: bool
     supports_repository_discovery: bool = False
+    supports_repository_selection: bool = False

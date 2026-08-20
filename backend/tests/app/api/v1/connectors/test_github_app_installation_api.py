@@ -13,6 +13,8 @@ from app.dependencies import (
     get_db_session,
     get_github_app_installation_service,
     get_github_repository_discovery_service,
+    get_github_repository_scope_service,
+    get_github_repository_selection_service,
     get_github_app_settings,
     get_secret_store,
 )
@@ -35,6 +37,14 @@ from application.services.github_repository_discovery_service import (
     GitHubRepositoryDiscoveryNotFound,
     GitHubRepositoryDiscoveryRejected,
 )
+from application.services.github_repository_selection_service import (
+    GitHubRepositoryScopePage,
+    GitHubRepositoryScopeView,
+    GitHubRepositorySelectionContext,
+    GitHubRepositorySelectionNotFound,
+    GitHubRepositorySelectionRejected,
+)
+from infrastructure.repositories.connector_scope_repository import ConnectorScopePageCursor
 
 
 NOW = datetime(2026, 8, 20, 12, tzinfo=timezone.utc)
@@ -53,7 +63,7 @@ class Session:
         self.rollbacks += 1
 
 
-def setup(service=None, admin=None, discovery=None):
+def setup(service=None, admin=None, discovery=None, selection=None, scopes=None):
     service = service or Mock()
     discovery = discovery or Mock()
     session = Session()
@@ -66,6 +76,10 @@ def setup(service=None, admin=None, discovery=None):
     app.dependency_overrides[get_connector_administrator] = lambda: admin
     app.dependency_overrides[get_github_app_installation_service] = lambda: service
     app.dependency_overrides[get_github_repository_discovery_service] = lambda: discovery
+    if selection is not None:
+        app.dependency_overrides[get_github_repository_selection_service] = lambda: selection
+    if scopes is not None:
+        app.dependency_overrides[get_github_repository_scope_service] = lambda: scopes
     return TestClient(app), service, session, admin
 
 
@@ -90,6 +104,77 @@ def installation_status(connected=True):
         NOW if connected else None,
         NOW if connected else None,
     )
+
+
+def repository_scope_view(scope_id=None, status="active"):
+    return GitHubRepositoryScopeView(
+        scope_id or uuid4(), uuid4(), uuid4(), 501, "docs", "fake-org/docs",
+        "fake-org", True, "private", False, False, "main", status, NOW, NOW,
+    )
+
+
+def test_repository_selection_request_is_minimal_and_staged_between_transactions():
+    selection=Mock();scopes=Mock();client,_,session,admin=setup(selection=selection,scopes=scopes)
+    connector_id,space_id=uuid4(),uuid4()
+    context=GitHubRepositorySelectionContext(
+        admin.organization_id,connector_id,space_id,uuid4(),77,123,99,"fake-org",501
+    )
+    repo=GitHubRepository(501,"docs","fake-org/docs","fake-org",True,"private",
+        False,False,"main","https://github.com/fake-org/docs",NOW)
+    view=repository_scope_view();view=GitHubRepositoryScopeView(
+        view.scope_id,connector_id,space_id,view.repository_id,view.repository_name,
+        view.repository_full_name,view.owner_login,view.private,view.visibility,
+        view.archived,view.disabled,view.default_branch,view.status,view.created_at,view.updated_at)
+    selection.prepare.return_value=context
+    def verify(value):
+        assert value is context and session.rollbacks==1 and session.commits==0
+        return repo
+    selection.verify.side_effect=verify;selection.persist.return_value=view
+    response=client.post(f"/api/v1/connectors/{connector_id}/github/repository-scopes",
+        json={"repository_id":501,"knowledge_space_id":str(space_id)})
+    assert response.status_code==200 and response.json()["scope_id"]==str(view.scope_id)
+    selection.prepare.assert_called_once_with(admin.organization_id,connector_id,space_id,501)
+    selection.persist.assert_called_once_with(context,repo,admin.user_id)
+    assert session.rollbacks==1 and session.commits==1
+    rejected=client.post(f"/api/v1/connectors/{connector_id}/github/repository-scopes",
+        json={"repository_id":501,"knowledge_space_id":str(space_id),"owner_login":"spoof"})
+    assert rejected.status_code==422 and rejected.json()=={"detail":"Connector request is invalid"}
+
+
+def test_repository_scope_list_and_delete_are_provider_free_and_idempotent_routes():
+    selection=Mock();scopes=Mock();client,_,session,admin=setup(selection=selection,scopes=scopes)
+    connector_id=uuid4();first=repository_scope_view();second=repository_scope_view(status="removed")
+    cursor=ConnectorScopePageCursor(first.created_at,first.scope_id)
+    scopes.list.return_value=GitHubRepositoryScopePage((first,),1,True,cursor)
+    response=client.get(f"/api/v1/connectors/{connector_id}/github/repository-scopes?limit=1")
+    assert response.status_code==200 and response.json()["has_more"] is True
+    assert "safe_config" not in response.text and "installation" not in response.text
+    scopes.deselect.return_value=second
+    deleted=client.delete(f"/api/v1/connectors/{connector_id}/github/repository-scopes/{second.scope_id}")
+    assert deleted.status_code==200 and deleted.json()["status"]=="removed"
+    scopes.deselect.assert_called_once_with(admin.organization_id,connector_id,second.scope_id)
+    assert session.commits==1
+    selection.create_repository_access_token.assert_not_called()
+
+
+@pytest.mark.parametrize(("error","status_code","detail"),(
+    (GitHubRepositorySelectionNotFound("unsafe tenant"),404,"Resource not found"),
+    (GitHubRepositorySelectionRejected("unsafe provider response"),422,"GitHub repository selection request is invalid"),
+))
+def test_repository_selection_errors_are_fixed_and_redacted(error,status_code,detail):
+    selection=Mock();client,_,session,_=setup(selection=selection)
+    selection.prepare.side_effect=error
+    response=client.post(f"/api/v1/connectors/{uuid4()}/github/repository-scopes",
+        json={"repository_id":501,"knowledge_space_id":str(uuid4())})
+    assert response.status_code==status_code and response.json()=={"detail":detail}
+    assert "unsafe" not in response.text and session.rollbacks==1
+
+
+def test_repository_scope_openapi_is_immutable_and_secret_free():
+    schema=app.openapi();operation=schema["paths"]["/api/v1/connectors/{connector_id}/github/repository-scopes"]["post"]
+    serialized=str(operation).lower()
+    for forbidden in ("token","private_key","secret_reference","installation_id","app_id","safe_config"):
+        assert forbidden not in serialized
 
 
 def test_admin_management_routes_remain_authenticated_and_redacted():
