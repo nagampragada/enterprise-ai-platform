@@ -64,7 +64,12 @@ def test_github_connector_creation_uses_draft_and_only_committed_capabilities():
     assert connector.status == "draft"
     assert connector.acl_support == "none"
     assert connector.safe_config == {}
-    assert set(connector.capabilities.values()) == {False}
+    assert connector.capabilities["supports_repository_discovery"] is True
+    assert {
+        value
+        for key, value in connector.capabilities.items()
+        if key != "supports_repository_discovery"
+    } == {False}
     session.commit.assert_not_called()
     session.rollback.assert_not_called()
 

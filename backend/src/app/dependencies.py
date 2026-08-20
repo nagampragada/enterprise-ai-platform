@@ -13,6 +13,9 @@ from sqlalchemy.orm import Session
 from application.services.authentication_service import AuthenticationService
 from application.services.connector_management_service import ConnectorManagementService
 from application.services.github_app_installation_service import GitHubAppInstallationService
+from application.services.github_repository_discovery_service import (
+    GitHubRepositoryDiscoveryService,
+)
 from application.ports.secret_store import SecretStore
 from app.config import GitHubAppSettings
 from infrastructure.connectors.github import GitHubAppRestClient
@@ -100,6 +103,17 @@ def get_github_app_installation_service(
     settings: GitHubAppSettings = Depends(get_github_app_settings),
 ) -> GitHubAppInstallationService:
     return GitHubAppInstallationService(db_session, secret_store, GitHubAppRestClient(settings, secret_store))
+
+
+def get_github_repository_discovery_service(
+    db_session: Session = Depends(get_db_session),
+    secret_store: SecretStore = Depends(get_secret_store),
+    settings: GitHubAppSettings = Depends(get_github_app_settings),
+) -> GitHubRepositoryDiscoveryService:
+    return GitHubRepositoryDiscoveryService(
+        db_session,
+        GitHubAppRestClient(settings, secret_store),
+    )
 
 
 def get_local_document_indexing_service(

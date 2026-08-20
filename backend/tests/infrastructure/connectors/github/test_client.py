@@ -1,4 +1,4 @@
-from datetime import datetime,timezone
+from datetime import datetime,timedelta,timezone
 from unittest.mock import Mock
 from urllib.parse import parse_qs
 
@@ -8,7 +8,8 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from app.config import GitHubAppSettings
 from application.ports.github_app import (GitHubProviderAuthenticationError,
-    GitHubProviderAuthorizationError,GitHubProviderUnavailableError,GitHubUserAccessToken)
+    GitHubInstallationAccessToken,GitHubProviderAuthorizationError,
+    GitHubProviderRateLimitError,GitHubProviderUnavailableError,GitHubUserAccessToken)
 from application.ports.secret_store import SecretReference,SecretValue
 from infrastructure.connectors.github.client import GitHubAppRestClient,MAX_RESPONSE_BYTES
 
@@ -35,6 +36,17 @@ def payload(identifier=77,**kw):
     value.update(kw);return value
 
 def response(status=200,**kw):return httpx.Response(status,json=payload(**kw))
+
+def repository(identifier=501,**kw):
+    value=dict(id=identifier,name="docs",full_name="fake-org/docs",
+        owner={"id":99,"login":"fake-org"},private=True,visibility="private",
+        archived=False,disabled=False,default_branch="main",
+        html_url="https://github.com/fake-org/docs",updated_at="2026-08-20T11:00:00Z")
+    value.update(kw);return value
+
+def repository_response(items=None,total_count=1,headers=None):
+    return httpx.Response(200,json={"total_count":total_count,
+        "repositories":items if items is not None else [repository()]},headers=headers)
 
 def client(handler,**kw):
     store=Store();http=httpx.Client(transport=httpx.MockTransport(handler))
@@ -128,3 +140,204 @@ def test_provider_errors_are_redacted(monkeypatch):
     value,_=client(timeout,max_retries=0)
     with pytest.raises(GitHubProviderUnavailableError) as caught:value.verify_installation(77)
     assert "FAKE" not in str(caught.value)
+
+
+def test_installation_token_uses_exact_installation_minimum_permission_and_one_post(monkeypatch):
+    monkeypatch.setattr(jwt,"encode",lambda *a,**k:"fake.jwt")
+    calls=[]
+    def handler(request):
+        calls.append(request)
+        assert request.method=="POST"
+        assert request.url.path=="/app/installations/77/access_tokens"
+        assert request.headers["Authorization"]=="Bearer fake.jwt"
+        assert request.headers["X-GitHub-Api-Version"]=="2022-11-28"
+        assert request.read()==b'{"permissions":{"metadata":"read"}}'
+        return httpx.Response(201,json={"token":"ghs_temporary",
+            "expires_at":"2026-08-20T13:00:00Z","permissions":{"metadata":"read"}})
+    value,store=client(handler,max_retries=3)
+    token=value.create_installation_access_token(77)
+    assert token.expires_at==NOW+timedelta(hours=1)
+    assert len(calls)==1 and store.retrieved==["fake://github-app-key"]
+    assert "ghs_temporary" not in repr(token) and "ghs_temporary" not in repr(value)
+
+
+@pytest.mark.parametrize("body",(
+    {"expires_at":"2026-08-20T13:00:00Z","permissions":{"metadata":"read"}},
+    {"token":"ghs_temporary","expires_at":"not-a-date","permissions":{"metadata":"read"}},
+    {"token":"ghs_temporary","expires_at":"2026-08-20T12:00:01Z","permissions":{"metadata":"read"}},
+    {"token":"ghs_temporary","expires_at":"2026-08-20T13:00:00Z","permissions":{"metadata":"write"}},
+    {"token":"ghs_temporary","expires_at":"2026-08-20T13:00:00Z","permissions":{"metadata":"read","contents":"read"}},
+))
+def test_installation_token_rejects_malformed_expiry_or_unrequested_permissions_without_retry(monkeypatch,body):
+    monkeypatch.setattr(jwt,"encode",lambda *a,**k:"fake.jwt");calls=[]
+    value,_=client(lambda request:(calls.append(request) or httpx.Response(201,json=body)),max_retries=3)
+    with pytest.raises(GitHubProviderUnavailableError):value.create_installation_access_token(77)
+    assert len(calls)==1
+
+
+def test_repository_page_returns_only_validated_public_metadata_and_one_exact_get():
+    calls=[]
+    def handler(request):
+        calls.append(request)
+        assert request.method=="GET"
+        assert str(request.url)=="https://api.github.com/installation/repositories?per_page=25&page=2"
+        assert request.headers["Authorization"]=="Bearer ghs_temporary"
+        return repository_response([repository(),repository(502,name="public",full_name="fake-org/public",
+            private=False,visibility="public",default_branch=None,
+            html_url="https://github.com/fake-org/public",updated_at=None)],total_count=27)
+    value,_=client(handler)
+    result=value.list_installation_repositories(
+        GitHubInstallationAccessToken("ghs_temporary",NOW+timedelta(hours=1)),
+        page=2,page_size=25,account_id=99,account_login="fake-org")
+    assert len(calls)==1 and result.page==2 and result.page_size==25
+    assert result.total_count==27 and result.has_next is False
+    assert result.items[0].private is True and result.items[1].private is False
+    assert result.items[1].default_branch is None and result.items[1].updated_at is None
+    assert not hasattr(result.items[0],"token") and "ghs_temporary" not in repr(result)
+
+
+def test_archived_and_disabled_flags_are_preserved_as_valid_metadata():
+    value,_=client(lambda request:repository_response(
+        [repository(503,archived=True,disabled=True)],total_count=1))
+    result=value.list_installation_repositories(
+        GitHubInstallationAccessToken("ghs_temporary",NOW+timedelta(hours=1)),
+        page=1,page_size=50,account_id=99,account_login="fake-org")
+    assert result.items[0].archived is True and result.items[0].disabled is True
+
+
+@pytest.mark.parametrize("change",(
+    {"id":0},{"id":True},{"name":"../unsafe"},{"name":"x"*101},
+    {"full_name":"other/docs"},{"owner":{"id":100,"login":"fake-org"}},
+    {"owner":{"id":99,"login":"other-org"}},{"owner":None},{"private":1},
+    {"visibility":"secret"},{"archived":"false"},{"disabled":0},
+    {"default_branch":"../main"},{"default_branch":"main.lock"},
+    {"html_url":"http://github.com/fake-org/docs"},
+    {"html_url":"https://github.com.evil.test/fake-org/docs"},
+    {"html_url":"https://user:password@github.com/fake-org/docs"},
+    {"html_url":"https://github.com/fake-org/docs?token=secret"},
+    {"html_url":"https://github.com/fake-org/docs#fragment"},
+    {"updated_at":"2026-08-20"},{"updated_at":"not-a-time"},
+))
+def test_any_malformed_or_cross_account_repository_rejects_the_whole_page(change):
+    item=repository();item.update(change)
+    value,_=client(lambda request:repository_response([repository(500),item],total_count=2))
+    with pytest.raises((GitHubProviderUnavailableError,GitHubProviderAuthorizationError)):
+        value.list_installation_repositories(
+            GitHubInstallationAccessToken("ghs_temporary",NOW+timedelta(hours=1)),
+            page=1,page_size=50,account_id=99,account_login="fake-org")
+
+
+def test_duplicate_repository_ids_reject_the_whole_page():
+    value,_=client(lambda request:repository_response(
+        [repository(),repository(name="other",full_name="fake-org/other",
+            html_url="https://github.com/fake-org/other")],total_count=2))
+    with pytest.raises(GitHubProviderUnavailableError):
+        value.list_installation_repositories(
+            GitHubInstallationAccessToken("ghs_temporary",NOW+timedelta(hours=1)),
+            page=1,page_size=50,account_id=99,account_login="fake-org")
+
+
+@pytest.mark.parametrize("total",(-1,True,1.5,1_000_001,0))
+def test_invalid_or_inconsistent_total_count_rejects_the_page(total):
+    value,_=client(lambda request:repository_response([repository()],total_count=total))
+    with pytest.raises(GitHubProviderUnavailableError):
+        value.list_installation_repositories(
+            GitHubInstallationAccessToken("ghs_temporary",NOW+timedelta(hours=1)),
+            page=1,page_size=50,account_id=99,account_login="fake-org")
+
+
+@pytest.mark.parametrize(("headers","total","items","expected"),(
+    (None,None,[],False),
+    (None,None,[repository()],False),
+    (None,101,[repository(i,name=f"r{i}",full_name=f"fake-org/r{i}",
+        html_url=f"https://github.com/fake-org/r{i}") for i in range(1,101)],True),
+    ({"Link":'<https://api.github.com/installation/repositories?per_page=50&page=2>; rel="next"'},51,[repository()],True),
+    ({"Link":'<https://api.github.com/installation/repositories?per_page=50&page=1>; rel="prev"'},1,[repository()],False),
+))
+def test_repository_pagination_metadata_is_bounded(headers,total,items,expected):
+    value,_=client(lambda request:repository_response(items,total,headers))
+    result=value.list_installation_repositories(
+        GitHubInstallationAccessToken("ghs_temporary",NOW+timedelta(hours=1)),
+        page=1,page_size=100 if len(items)==100 else 50,account_id=99,account_login="fake-org")
+    assert result.has_next is expected and result.total_count==total
+
+
+@pytest.mark.parametrize("link",(
+    '<https://evil.test/installation/repositories?per_page=50&page=2>; rel="next"',
+    '<https://api.github.com.evil/installation/repositories?per_page=50&page=2>; rel="next"',
+    '<https://api.github.com/user/installations?per_page=50&page=2>; rel="next"',
+    '<https://api.github.com/installation/repositories?per_page=50&page=3>; rel="next"',
+    '<https://api.github.com/installation/repositories?per_page=100&page=2>; rel="next"',
+    '<https://api.github.com/installation/repositories?per_page=50&page=2&token=x>; rel="next"',
+    'not-a-link',
+))
+def test_untrusted_or_inconsistent_link_metadata_is_rejected_and_never_followed(link):
+    calls=[]
+    value,_=client(lambda request:(calls.append(request) or repository_response(
+        [repository()],None,{"Link":link})))
+    with pytest.raises(GitHubProviderUnavailableError):
+        value.list_installation_repositories(
+            GitHubInstallationAccessToken("ghs_temporary",NOW+timedelta(hours=1)),
+            page=1,page_size=50,account_id=99,account_login="fake-org")
+    assert len(calls)==1
+
+
+def test_repository_get_retries_at_most_three_times_but_token_post_never_retries(monkeypatch):
+    calls=[]
+    value,_=client(lambda request:(calls.append(request) or httpx.Response(503)),max_retries=3)
+    value._sleep=Mock()
+    with pytest.raises(GitHubProviderUnavailableError):
+        value.list_installation_repositories(
+            GitHubInstallationAccessToken("ghs_temporary",NOW+timedelta(hours=1)),
+            page=1,page_size=50,account_id=99,account_login="fake-org")
+    assert len(calls)==3 and value._sleep.call_count==2
+    monkeypatch.setattr(jwt,"encode",lambda *a,**k:"fake.jwt");calls.clear()
+    with pytest.raises(GitHubProviderUnavailableError):value.create_installation_access_token(77)
+    assert len(calls)==1
+
+
+def test_transient_repository_get_succeeds_within_cap_and_auth_errors_do_not_retry():
+    calls=[]
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(503) if len(calls)<3 else repository_response()
+    value,_=client(handler,max_retries=3);value._sleep=Mock()
+    result=value.list_installation_repositories(
+        GitHubInstallationAccessToken("ghs_temporary",NOW+timedelta(hours=1)),
+        page=1,page_size=50,account_id=99,account_login="fake-org")
+    assert result.total_count==1 and len(calls)==3 and value._sleep.call_count==2
+    for status in (401,403):
+        calls.clear();value,_=client(lambda request:(calls.append(request) or httpx.Response(status)),max_retries=3)
+        with pytest.raises((GitHubProviderAuthenticationError,GitHubProviderAuthorizationError)):
+            value.list_installation_repositories(
+                GitHubInstallationAccessToken("ghs_temporary",NOW+timedelta(hours=1)),
+                page=1,page_size=50,account_id=99,account_login="fake-org")
+        assert len(calls)==1
+
+
+def test_rate_limit_retry_is_deadline_bounded_and_large_wait_fails_immediately():
+    calls=[]
+    value,_=client(lambda request:(calls.append(request) or httpx.Response(429,
+        headers={"Retry-After":"31"})),max_retries=3)
+    value._sleep=Mock()
+    with pytest.raises(GitHubProviderRateLimitError):
+        value.list_installation_repositories(
+            GitHubInstallationAccessToken("ghs_temporary",NOW+timedelta(hours=1)),
+            page=1,page_size=50,account_id=99,account_login="fake-org")
+    assert len(calls)==1 and value._sleep.call_count==0
+
+
+def test_rate_limit_reset_is_parsed_bounded_and_retried_once():
+    calls=[]
+    def handler(request):
+        calls.append(request)
+        if len(calls)==1:
+            return httpx.Response(403,headers={"X-RateLimit-Remaining":"0",
+                "X-RateLimit-Reset":str(int(NOW.timestamp())+1)})
+        return repository_response()
+    value,_=client(handler,max_retries=2);value._sleep=Mock()
+    result=value.list_installation_repositories(
+        GitHubInstallationAccessToken("ghs_temporary",NOW+timedelta(hours=1)),
+        page=1,page_size=50,account_id=99,account_login="fake-org")
+    assert result.total_count==1 and len(calls)==2
+    value._sleep.assert_called_once_with(1.0)

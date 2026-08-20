@@ -12,15 +12,28 @@ from app.dependencies import (
     get_connector_administrator,
     get_db_session,
     get_github_app_installation_service,
+    get_github_repository_discovery_service,
     get_github_app_settings,
     get_secret_store,
 )
 from app.main import app, configure_github_app
 from application.ports.secret_store import SecretReference, SecretValue
+from application.ports.github_app import (
+    GitHubProviderRateLimitError,
+    GitHubProviderUnavailableError,
+    GitHubRepository,
+    GitHubRepositoryPage,
+)
 from application.services.github_app_installation_service import (
     GitHubInstallationInitiation,
     GitHubInstallationStatus,
     GitHubSetupRedirect,
+)
+from application.services.github_repository_discovery_service import (
+    GitHubRepositoryDiscoveryConflict,
+    GitHubRepositoryDiscoveryContext,
+    GitHubRepositoryDiscoveryNotFound,
+    GitHubRepositoryDiscoveryRejected,
 )
 
 
@@ -40,8 +53,9 @@ class Session:
         self.rollbacks += 1
 
 
-def setup(service=None, admin=None):
+def setup(service=None, admin=None, discovery=None):
     service = service or Mock()
+    discovery = discovery or Mock()
     session = Session()
     admin = admin or ConnectorAdministrator(uuid4(), uuid4())
 
@@ -51,6 +65,7 @@ def setup(service=None, admin=None):
     app.dependency_overrides[get_db_session] = db
     app.dependency_overrides[get_connector_administrator] = lambda: admin
     app.dependency_overrides[get_github_app_installation_service] = lambda: service
+    app.dependency_overrides[get_github_repository_discovery_service] = lambda: discovery
     return TestClient(app), service, session, admin
 
 
@@ -227,3 +242,161 @@ def test_runtime_composition_requires_and_accepts_injected_secret_store():
     configure_github_app(app, store, settings=settings)
     assert get_secret_store(request) is store
     assert get_github_app_settings(request) is settings
+
+
+def test_repository_discovery_defaults_are_redacted_and_end_db_work_before_provider_io():
+    discovery = Mock()
+    client, _, session, admin = setup(discovery=discovery)
+    connector_id = uuid4()
+    context = GitHubRepositoryDiscoveryContext(77, 99, "fake-org")
+    discovery.prepare.return_value = context
+
+    def result(*args, **kwargs):
+        assert session.rollbacks == 1
+        return GitHubRepositoryPage(
+            (
+                GitHubRepository(
+                    501,
+                    "docs",
+                    "fake-org/docs",
+                    "fake-org",
+                    True,
+                    "private",
+                    False,
+                    False,
+                    "main",
+                    "https://github.com/fake-org/docs",
+                    NOW,
+                ),
+            ),
+            1,
+            50,
+            False,
+            1,
+        )
+
+    discovery.discover.side_effect = result
+    response = client.get(f"/api/v1/connectors/{connector_id}/github/repositories")
+    assert response.status_code == 200
+    assert response.json() == {
+        "items": [
+            {
+                "repository_id": 501,
+                "name": "docs",
+                "full_name": "fake-org/docs",
+                "owner_login": "fake-org",
+                "private": True,
+                "visibility": "private",
+                "archived": False,
+                "disabled": False,
+                "default_branch": "main",
+                "html_url": "https://github.com/fake-org/docs",
+                "updated_at": "2026-08-20T12:00:00Z",
+            }
+        ],
+        "page": 1,
+        "page_size": 50,
+        "has_next": False,
+        "total_count": 1,
+    }
+    discovery.prepare.assert_called_once_with(admin.organization_id, connector_id)
+    discovery.discover.assert_called_once_with(context, page=1, page_size=50)
+    assert "77" not in response.text and "token" not in response.text.lower()
+
+
+def test_repository_discovery_rejects_unauthenticated_requests_before_service_use():
+    session = Session()
+    discovery = Mock()
+
+    def db():
+        yield session
+
+    app.dependency_overrides[get_db_session] = db
+    app.dependency_overrides[get_github_repository_discovery_service] = lambda: discovery
+    response = TestClient(app).get(
+        f"/api/v1/connectors/{uuid4()}/github/repositories"
+    )
+    assert response.status_code == 401
+    discovery.prepare.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "params",
+    (
+        {"page": "0"},
+        {"page": "1001"},
+        {"page": "not-an-int"},
+        {"page_size": "0"},
+        {"page_size": "101"},
+        {"owner": "other-org"},
+        {"installation_id": "77"},
+        {"token": "attacker-controlled"},
+        {"all": "true"},
+        {"sort": "updated"},
+    ),
+)
+def test_repository_discovery_rejects_invalid_or_arbitrary_query_controls(params):
+    discovery = Mock()
+    client, _, _, _ = setup(discovery=discovery)
+    response = client.get(
+        f"/api/v1/connectors/{uuid4()}/github/repositories", params=params
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] in {
+        "Connector request is invalid",
+        "GitHub repository discovery request is invalid",
+    }
+    discovery.prepare.assert_not_called()
+    discovery.discover.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("error", "status_code", "detail"),
+    (
+        (GitHubRepositoryDiscoveryNotFound(), 404, "Resource not found"),
+        (GitHubRepositoryDiscoveryRejected(), 422, "GitHub repository discovery request is invalid"),
+        (GitHubRepositoryDiscoveryConflict(), 409, "Resource state conflict"),
+        (GitHubProviderUnavailableError("provider secret"), 502, "GitHub provider request failed"),
+        (GitHubProviderRateLimitError("provider secret"), 503, "GitHub provider is temporarily unavailable"),
+    ),
+)
+def test_repository_discovery_error_contract_is_fixed_and_redacted(error, status_code, detail):
+    discovery = Mock()
+    discovery.prepare.side_effect = error
+    client, _, session, _ = setup(discovery=discovery)
+    response = client.get(f"/api/v1/connectors/{uuid4()}/github/repositories")
+    assert response.status_code == status_code
+    assert response.json() == {"detail": detail}
+    assert "secret" not in response.text.lower()
+    assert session.rollbacks == 1
+
+
+def test_repository_discovery_openapi_exposes_only_platform_fields():
+    schema = app.openapi()
+    operation = schema["paths"][
+        "/api/v1/connectors/{connector_id}/github/repositories"
+    ]["get"]
+    assert {parameter["name"] for parameter in operation["parameters"]} == {
+        "connector_id",
+        "page",
+        "page_size",
+        "authorization",
+    }
+    repository_fields = set(
+        schema["components"]["schemas"]["GitHubRepositoryResponse"]["properties"]
+    )
+    assert repository_fields == {
+        "repository_id",
+        "name",
+        "full_name",
+        "owner_login",
+        "private",
+        "visibility",
+        "archived",
+        "disabled",
+        "default_branch",
+        "html_url",
+        "updated_at",
+    }
+    rendered = str(operation).lower()
+    assert all(term not in rendered for term in ("installation_id", "app_id", "private_key", "access_token"))

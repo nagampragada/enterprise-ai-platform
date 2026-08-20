@@ -51,6 +51,7 @@ GITHUB_PRECONNECTION_CAPABILITIES = ConnectorCapabilities(
     supports_version_history=False,
     supports_webhooks=False,
     supports_content_download=False,
+    supports_repository_discovery=True,
 )
 
 

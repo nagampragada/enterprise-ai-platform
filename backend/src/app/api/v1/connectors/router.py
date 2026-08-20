@@ -26,6 +26,8 @@ from app.api.v1.connectors.schemas import (
     GitHubInstallationCompletionResponse,
     GitHubInstallationInitiationResponse,
     GitHubInstallationStatusResponse,
+    GitHubRepositoryPageResponse,
+    GitHubRepositoryResponse,
     PatchSyncScheduleRequest,
     PutSyncScheduleRequest,
     SyncScheduleResponse,
@@ -40,6 +42,7 @@ from app.dependencies import (
     get_connector_management_service,
     get_connector_sync_schedule_service,
     get_github_app_installation_service,
+    get_github_repository_discovery_service,
     get_db_session,
 )
 from application.services.connector_management_service import (
@@ -59,7 +62,14 @@ from application.services.github_app_installation_service import (
     GitHubAppInstallationService, GitHubInstallationConflict,
     GitHubInstallationNotFound, GitHubInstallationRejected,
 )
-from application.ports.github_app import GitHubProviderError
+from application.services.github_repository_discovery_service import (
+    GitHubRepositoryDiscoveryConflict,
+    GitHubRepositoryDiscoveryNotFound,
+    GitHubRepositoryDiscoveryRejected,
+    GitHubRepositoryDiscoveryService,
+)
+from application.ports.github_app import GitHubProviderError, GitHubProviderRateLimitError
+from application.ports.secret_store import SecretStoreError
 from infrastructure.repositories.github_app_installation_repository import (
     GitHubInstallationConflict as GitHubBindingConflict,
     GitHubInstallationPersistenceError,
@@ -165,6 +175,41 @@ def disconnect_github_installation(connector_id:UUID,administrator:ConnectorAdmi
         result=service.disconnect(administrator.organization_id,connector_id);db_session.commit()
         return GitHubInstallationStatusResponse(**result.__dict__)
     except Exception as exc:db_session.rollback();_raise_http(exc)
+
+
+@connectors_router.get(
+    "/{connector_id}/github/repositories",
+    response_model=GitHubRepositoryPageResponse,
+)
+def list_github_repositories(
+    connector_id: UUID,
+    request: Request,
+    page: int = Query(default=1, ge=1, le=1_000),
+    page_size: int = Query(default=50, ge=1, le=100),
+    administrator: ConnectorAdministrator = Depends(get_connector_administrator),
+    service: GitHubRepositoryDiscoveryService = Depends(
+        get_github_repository_discovery_service
+    ),
+    db_session: Session = Depends(get_db_session),
+) -> GitHubRepositoryPageResponse:
+    try:
+        if set(request.query_params) - {"page", "page_size"}:
+            raise GitHubRepositoryDiscoveryRejected(
+                "GitHub repository discovery request is invalid"
+            )
+        context = service.prepare(administrator.organization_id, connector_id)
+        db_session.rollback()
+        result = service.discover(context, page=page, page_size=page_size)
+        return GitHubRepositoryPageResponse(
+            items=tuple(GitHubRepositoryResponse(**item.__dict__) for item in result.items),
+            page=result.page,
+            page_size=result.page_size,
+            has_next=result.has_next,
+            total_count=result.total_count,
+        )
+    except Exception as exc:
+        db_session.rollback()
+        _raise_http(exc)
 
 
 @connectors_router.post("", response_model=ConnectorResponse, status_code=status.HTTP_201_CREATED)
@@ -481,6 +526,10 @@ def delete_sync_schedule(
 
 
 def _connector_response(row) -> ConnectorResponse:
+    capabilities = {
+        **row.capabilities,
+        "supports_repository_discovery": row.connector_type == "github",
+    }
     return ConnectorResponse(
         connector_id=row.id,
         connector_type=row.connector_type,
@@ -488,7 +537,7 @@ def _connector_response(row) -> ConnectorResponse:
         slug=row.slug,
         status=row.status,
         acl_support=row.acl_support,
-        capabilities=ConnectorCapabilitiesResponse(**row.capabilities),
+        capabilities=ConnectorCapabilitiesResponse(**capabilities),
         created_at=row.created_at,
         updated_at=row.updated_at,
         last_validated_at=row.last_validated_at,
@@ -557,12 +606,22 @@ def _raise_http(exc: Exception) -> None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resource not found") from exc
     if isinstance(exc, GitHubInstallationNotFound):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resource not found") from exc
+    if isinstance(exc, GitHubRepositoryDiscoveryNotFound):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resource not found") from exc
     if isinstance(exc, GitHubInstallationRejected):
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="GitHub installation request is invalid") from exc
+    if isinstance(exc, GitHubRepositoryDiscoveryRejected):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="GitHub repository discovery request is invalid") from exc
     if isinstance(exc, (GitHubInstallationConflict, GitHubBindingConflict)):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Resource state conflict") from exc
+    if isinstance(exc, GitHubRepositoryDiscoveryConflict):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Resource state conflict") from exc
+    if isinstance(exc, GitHubProviderRateLimitError):
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="GitHub provider is temporarily unavailable") from exc
     if isinstance(exc, GitHubProviderError):
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="GitHub provider request failed") from exc
+    if isinstance(exc, SecretStoreError):
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Connector provider is unavailable") from exc
     if isinstance(exc, SyncScheduleNotFound):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resource not found") from exc
     if isinstance(exc, (ConnectorRepositoryConflict, SyncJobConflict, SyncScheduleConflict)):

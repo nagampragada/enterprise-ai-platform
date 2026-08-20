@@ -60,6 +60,32 @@ class GitHubInstallationStatusResponse(BaseModel):
     last_verified_at: datetime | None = None
 
 
+class GitHubRepositoryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    repository_id: int
+    name: str
+    full_name: str
+    owner_login: str
+    private: bool
+    visibility: Literal["public", "private", "internal"] | None
+    archived: bool
+    disabled: bool
+    default_branch: str | None
+    html_url: str
+    updated_at: datetime | None
+
+
+class GitHubRepositoryPageResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    items: tuple[GitHubRepositoryResponse, ...]
+    page: int
+    page_size: int
+    has_next: bool
+    total_count: int | None
+
+
 class LocalFolderScopeConfiguration(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -95,6 +121,7 @@ class ConnectorCapabilitiesResponse(BaseModel):
     supports_version_history: bool
     supports_webhooks: bool
     supports_content_download: bool
+    supports_repository_discovery: bool = False
 
 
 class ConnectorResponse(BaseModel):

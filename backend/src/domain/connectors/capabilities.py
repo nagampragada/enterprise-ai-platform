@@ -16,3 +16,4 @@ class ConnectorCapabilities:
     supports_version_history: bool
     supports_webhooks: bool
     supports_content_download: bool
+    supports_repository_discovery: bool = False

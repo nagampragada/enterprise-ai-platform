@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import threading
 import uuid
+from unittest.mock import Mock
 
 import pytest
 from fastapi import Depends
@@ -18,6 +19,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.dependencies import (
     CurrentUser,
     get_connector_management_service,
+    get_github_repository_discovery_service,
     get_current_user,
     get_db_session,
     get_connector_sync_schedule_service,
@@ -215,11 +217,15 @@ def _configure_app(factory, organization_id, user_id):
 def test_real_role_policy_denies_employee_and_disabled_admin(factory):
     employee_org, employee_id, _ = _identity_rows(factory, "Employee", admin=False)
     _configure_app(factory, employee_org, employee_id)
+    app.dependency_overrides[get_github_repository_discovery_service] = Mock
     with TestClient(app) as client:
         assert client.get("/api/v1/connectors").status_code == 403
         assert client.post(
             "/api/v1/connectors",
             json={"connector_type": "github", "display_name": "GitHub", "slug": "github"},
+        ).status_code == 403
+        assert client.get(
+            f"/api/v1/connectors/{uuid.uuid4()}/github/repositories"
         ).status_code == 403
 
 
@@ -247,7 +253,12 @@ def test_admin_creates_tenant_bound_draft_github_connector(factory):
     body = response.json()
     assert body["connector_type"] == "github" and body["status"] == "draft"
     assert body["acl_support"] == "none"
-    assert set(body["capabilities"].values()) == {False}
+    assert body["capabilities"]["supports_repository_discovery"] is True
+    assert {
+        value
+        for key, value in body["capabilities"].items()
+        if key != "supports_repository_discovery"
+    } == {False}
     assert unsupported.status_code == forced_active.status_code == 422
     assert [item["connector_id"] for item in listing.json()["items"]] == [body["connector_id"]]
     session = factory()
