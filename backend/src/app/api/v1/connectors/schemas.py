@@ -29,6 +29,33 @@ class CreateConnectorRequest(BaseModel):
         return value.strip()
 
 
+class GitHubInstallationInitiationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    installation_url: str
+    authorization_url: str
+    expires_at: datetime
+
+
+class CompleteGitHubInstallationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    state: str = Field(min_length=43, max_length=512)
+    code: str = Field(min_length=1, max_length=1024, pattern=r"^\S+$")
+    installation_id: int = Field(gt=0)
+
+
+class GitHubInstallationStatusResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    connected: bool
+    account_login: str | None = None
+    account_type: Literal["Organization", "User"] | None = None
+    external_account_id: str | None = None
+    repository_selection: Literal["all", "selected"] | None = None
+    credential_status: Literal["active", "expired", "revoked", "invalid"] | None = None
+    provider_created_at: datetime | None = None
+    provider_updated_at: datetime | None = None
+    last_verified_at: datetime | None = None
+
+
 class LocalFolderScopeConfiguration(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 

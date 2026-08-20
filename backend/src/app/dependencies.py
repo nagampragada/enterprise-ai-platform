@@ -7,10 +7,15 @@ from dataclasses import dataclass
 from uuid import UUID
 
 from fastapi import Depends, Header, HTTPException, status
+from fastapi import Request
 from sqlalchemy.orm import Session
 
 from application.services.authentication_service import AuthenticationService
 from application.services.connector_management_service import ConnectorManagementService
+from application.services.github_app_installation_service import GitHubAppInstallationService
+from application.ports.secret_store import SecretStore
+from app.config import GitHubAppSettings
+from infrastructure.connectors.github import GitHubAppRestClient
 from application.services.connector_sync_schedule_service import ConnectorSyncScheduleService
 from application.services.document_chunk_embedding_service import DocumentChunkEmbeddingService
 from application.services.local_document_indexing_service import LocalDocumentIndexingService
@@ -73,6 +78,28 @@ def get_connector_sync_schedule_service(
     db_session: Session = Depends(get_db_session),
 ) -> ConnectorSyncScheduleService:
     return ConnectorSyncScheduleService(db_session)
+
+
+def get_secret_store(request: Request) -> SecretStore:
+    value = getattr(request.app.state, "secret_store", None)
+    if value is None or any(not callable(getattr(value,name,None)) for name in ("store","retrieve","delete")):
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Connector provider is unavailable")
+    return value
+
+
+def get_github_app_settings(request: Request) -> GitHubAppSettings:
+    value = getattr(request.app.state, "github_app_settings", None)
+    if not isinstance(value, GitHubAppSettings):
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Connector provider is unavailable")
+    return value
+
+
+def get_github_app_installation_service(
+    db_session: Session = Depends(get_db_session),
+    secret_store: SecretStore = Depends(get_secret_store),
+    settings: GitHubAppSettings = Depends(get_github_app_settings),
+) -> GitHubAppInstallationService:
+    return GitHubAppInstallationService(db_session, secret_store, GitHubAppRestClient(settings, secret_store))
 
 
 def get_local_document_indexing_service(

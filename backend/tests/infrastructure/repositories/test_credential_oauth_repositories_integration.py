@@ -5,8 +5,10 @@ import pytest
 from sqlalchemy import create_engine,func,select,text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session,sessionmaker
+from application.ports.github_app import GitHubInstallation
 from infrastructure.db.models import ConnectorCredential,OAuthAuthorizationTransaction
 from infrastructure.repositories.connector_credential_repository import ConnectorCredentialRepository
+from infrastructure.repositories.github_app_installation_repository import GitHubAppInstallationRepository,GitHubInstallationConflict
 from infrastructure.repositories.oauth_authorization_transaction_repository import OAuthAuthorizationTransactionRepository,OAuthTransactionConflict
 
 ROOT=Path(__file__).resolve().parents[3];PYTHON=ROOT/".venv"/"Scripts"/"python.exe";INI=ROOT/"alembic.ini"
@@ -62,6 +64,27 @@ def test_oauth_concurrent_consumption_has_one_winner_and_expiration_is_bounded(f
     with pytest.raises(OAuthTransactionConflict):repo.consume(repo.lock_by_state_hash(b"b"*32),now=NOW+timedelta(minutes=2))
     assert repo.expire_stale(now=NOW+timedelta(minutes=2),limit=1)==1;s.commit()
     assert s.get(OAuthAuthorizationTransaction,expired.id).status=="expired";s.close()
+def test_concurrent_cross_tenant_installation_binding_has_one_winner(factory):
+    first_org,first_user,first_connector=_setup(factory,"first")
+    second_org,second_user,second_connector=_setup(factory,"second")
+    credentials=[]
+    for org,user,connector in ((first_org,first_user,first_connector),(second_org,second_user,second_connector)):
+        s=factory();value=ConnectorCredentialRepository(s).replace(org,connector,provider_key="github",
+            auth_scheme="app_installation",secret_reference=None,external_subject="77",display_label="Org",
+            granted_scopes=("metadata:read",),expires_at=None,created_by_user_id=user,now=NOW)
+        s.commit();credentials.append(value.metadata.credential_id);s.close()
+    candidate=GitHubInstallation(77,123,99,"org","Organization","selected",(("contents","read"),("metadata","read")),NOW,NOW)
+    barrier=threading.Barrier(2);outcomes=[]
+    def bind(org,connector,credential):
+        s=factory()
+        try:
+            barrier.wait();GitHubAppInstallationRepository(s).bind(org,connector,credential,candidate,now=NOW)
+            s.commit();outcomes.append("bound")
+        except GitHubInstallationConflict:s.rollback();outcomes.append("rejected")
+        finally:s.close()
+    threads=[threading.Thread(target=bind,args=args) for args in ((first_org,first_connector,credentials[0]),(second_org,second_connector,credentials[1]))]
+    [thread.start() for thread in threads];[thread.join() for thread in threads]
+    assert sorted(outcomes)==["bound","rejected"]
 def test_repository_errors_do_not_echo_sensitive_inputs(factory):
     org,user,connector=_setup(factory,"safe");s=factory();repo=OAuthAuthorizationTransactionRepository(s)
     repo.create(org,connector,user,provider_key="github",state_hash=b"z"*32,pkce_reference="secret-ref",callback_identifier="github_callback",created_at=NOW,expires_at=NOW+timedelta(minutes=1));s.commit()

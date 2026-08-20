@@ -494,6 +494,7 @@ class ConnectorCredential(Base):
             ondelete="SET NULL (created_by_user_id)",
         ),
         UniqueConstraint("organization_id", "id", name="uq_connector_credentials_org_id"),
+        UniqueConstraint("organization_id","connector_id","id",name="uq_connector_credentials_org_connector_id"),
         UniqueConstraint(
             "organization_id", "connector_id", name="uq_connector_credentials_connector"
         ),
@@ -502,7 +503,11 @@ class ConnectorCredential(Base):
             "auth_scheme IN ('oauth2', 'api_token', 'service_account', 'app_installation')",
             name="auth_scheme_valid",
         ),
-        CheckConstraint("btrim(secret_reference) <> ''", name="secret_reference_not_blank"),
+        CheckConstraint(
+            "(auth_scheme = 'app_installation' AND provider_key = 'github' AND secret_reference IS NULL) OR "
+            "(auth_scheme <> 'app_installation' AND secret_reference IS NOT NULL AND btrim(secret_reference) <> '')",
+            name="secret_reference_consistent",
+        ),
         CheckConstraint(
             "status IN ('active', 'expired', 'revoked', 'invalid')", name="status_valid"
         ),
@@ -546,7 +551,7 @@ class ConnectorCredential(Base):
     connector_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     provider_key: Mapped[str] = mapped_column(String(64), nullable=False)
     auth_scheme: Mapped[str] = mapped_column(String(32), nullable=False)
-    secret_reference: Mapped[str] = mapped_column(String(1024), nullable=False)
+    secret_reference: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'active'"))
     external_subject: Mapped[str | None] = mapped_column(String(255), nullable=True)
     display_label: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -643,6 +648,43 @@ class OAuthAuthorizationTransaction(Base):
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     failure_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
     schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("1"))
+
+
+class GitHubAppInstallation(Base):
+    __tablename__ = "github_app_installations"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_github_app_installations"),
+        ForeignKeyConstraint(["organization_id"], ["organizations.id"], name="fk_github_installations_organization", ondelete="CASCADE"),
+        ForeignKeyConstraint(["organization_id", "connector_id"], ["connectors.organization_id", "connectors.id"], name="fk_github_installations_connector_tenant", ondelete="CASCADE"),
+        ForeignKeyConstraint(["organization_id","connector_id","credential_id"], ["connector_credentials.organization_id","connector_credentials.connector_id","connector_credentials.id"], name="fk_github_installations_credential_connector_tenant", ondelete="CASCADE"),
+        UniqueConstraint("organization_id", "id", name="uq_github_installations_org_id"),
+        UniqueConstraint("organization_id", "connector_id", name="uq_github_installations_connector"),
+        UniqueConstraint("github_app_id", "github_installation_id", name="uq_github_installations_app_installation"),
+        CheckConstraint("github_app_id > 0 AND github_installation_id > 0 AND account_id > 0", name="github_installation_ids_positive"),
+        CheckConstraint("btrim(account_login) <> ''", name="github_installation_login_nonblank"),
+        CheckConstraint("account_type = 'Organization'", name="github_installation_account_type_valid"),
+        CheckConstraint("repository_selection IN ('all', 'selected')", name="github_installation_selection_valid"),
+        CheckConstraint("status IN ('connected', 'disconnected')", name="github_installation_status_valid"),
+        CheckConstraint("updated_at >= created_at", name="github_installation_updated_after_created"),
+        Index("ix_github_installations_org_status", "organization_id", "status"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    credential_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    github_app_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    github_installation_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    account_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    account_login: Mapped[str] = mapped_column(String(255), nullable=False)
+    account_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    repository_selection: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider_created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    provider_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    disconnected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class ConnectorScope(Base):

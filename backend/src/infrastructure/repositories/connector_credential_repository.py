@@ -31,11 +31,11 @@ class CredentialReplacement:
 class ConnectorCredentialRepository:
     def __init__(self,session:Session)->None:self._session=session
     def replace(self,organization_id:UUID,connector_id:UUID,*,provider_key:str,auth_scheme:str,
-        secret_reference:str,external_subject:str|None,display_label:str|None,
+        secret_reference:str|None,external_subject:str|None,display_label:str|None,
         granted_scopes:tuple[str,...],expires_at:datetime|None,created_by_user_id:UUID|None,
         now:datetime)->CredentialReplacement:
         _uuid(organization_id);_uuid(connector_id);provider_key=_code(provider_key);auth_scheme=_choice(auth_scheme,SCHEMES)
-        secret_reference=_reference(secret_reference);scopes=_scopes(granted_scopes);now=_aware(now)
+        secret_reference=_reference(secret_reference,auth_scheme,provider_key);scopes=_scopes(granted_scopes);now=_aware(now)
         if expires_at is not None: expires_at=_aware(expires_at)
         if expires_at is not None and expires_at<=now: raise InvalidCredentialRequest("credential expiry is invalid")
         current=self.lock(organization_id,connector_id);previous=current.secret_reference if current else None
@@ -88,7 +88,8 @@ def _code(v):
 def _choice(v,c):
     if v not in c:raise InvalidCredentialRequest("choice is invalid")
     return v
-def _reference(v):
+def _reference(v,scheme,provider):
+    if scheme=="app_installation" and provider=="github" and v is None:return None
     if not isinstance(v,str) or not v.strip() or len(v)>1024:raise InvalidCredentialRequest("secret reference is invalid")
     return v
 def _optional(v):

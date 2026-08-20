@@ -63,8 +63,8 @@ def engine():
 
 def test_schedule_schema_matches_orm_and_tenant_contract(engine):
     inspector = inspect(engine)
-    assert len(Base.metadata.tables) == 41
-    assert len(inspector.get_table_names(schema="public")) == 42
+    assert len(Base.metadata.tables) == 42
+    assert len(inspector.get_table_names(schema="public")) == 43
     reflected = inspector.get_columns(TABLE, schema="public")
     model = list(Base.metadata.tables[TABLE].columns)
     assert [item["name"] for item in reflected] == COLUMNS
@@ -181,7 +181,7 @@ def test_downgrade_removes_only_schedule_table_and_reupgrade_succeeds(engine):
     command.downgrade(_config(), "20260824_000015")
     at_schedule_head = set(inspect(engine).get_table_names(schema="public"))
     assert before - at_schedule_head == {
-        "connector_credentials", "oauth_authorization_transactions"
+        "connector_credentials", "oauth_authorization_transactions", "github_app_installations"
     }
     command.downgrade(_config(), PRIOR)
     after = set(inspect(engine).get_table_names(schema="public"))

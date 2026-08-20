@@ -77,7 +77,7 @@ def _setup(engine):
 
 def test_schema_matches_orm_and_removes_legacy_connector_source(engine):
     inspector = inspect(engine)
-    assert len(Base.metadata.tables) == 41
+    assert len(Base.metadata.tables) == 42
     assert {"connector_credentials", "oauth_authorization_transactions"}.issubset(
         inspector.get_table_names(schema="public")
     )
@@ -173,7 +173,7 @@ def test_downgrade_guard_and_reupgrade(engine):
     before = set(inspect(engine).get_table_names())
     command.downgrade(_config(), PRIOR)
     after = set(inspect(engine).get_table_names())
-    assert before - after == {"connector_credentials", "oauth_authorization_transactions"}
+    assert before - after == {"connector_credentials", "oauth_authorization_transactions", "github_app_installations"}
     connector_columns = {item["name"] for item in inspect(engine).get_columns("connectors")}
     assert {"secret_reference", "credential_status", "credential_expires_at"}.issubset(connector_columns)
     organization_id, _, connector_id = _setup(engine)

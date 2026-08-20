@@ -23,6 +23,9 @@ from app.api.v1.connectors.schemas import (
     CreateConnectorScopeRequest,
     EnqueueSyncJobRequest,
     EnqueueSyncJobResponse,
+    CompleteGitHubInstallationRequest,
+    GitHubInstallationInitiationResponse,
+    GitHubInstallationStatusResponse,
     PatchSyncScheduleRequest,
     PutSyncScheduleRequest,
     SyncScheduleResponse,
@@ -36,6 +39,7 @@ from app.dependencies import (
     get_connector_administrator,
     get_connector_management_service,
     get_connector_sync_schedule_service,
+    get_github_app_installation_service,
     get_db_session,
 )
 from application.services.connector_management_service import (
@@ -50,6 +54,15 @@ from application.services.connector_sync_schedule_service import (
     SyncScheduleNotFound,
     SyncScheduleResourceConflict,
     SyncScheduleView,
+)
+from application.services.github_app_installation_service import (
+    GitHubAppInstallationService, GitHubInstallationConflict,
+    GitHubInstallationNotFound, GitHubInstallationRejected,
+)
+from application.ports.github_app import GitHubProviderError
+from infrastructure.repositories.github_app_installation_repository import (
+    GitHubInstallationConflict as GitHubBindingConflict,
+    GitHubInstallationPersistenceError,
 )
 from infrastructure.repositories.connector_repository import (
     ConnectorPageCursor,
@@ -89,6 +102,43 @@ class SafeConnectorValidationRoute(APIRoute):
 connectors_router = APIRouter(
     prefix="/connectors", tags=["connectors"], route_class=SafeConnectorValidationRoute
 )
+
+
+@connectors_router.post("/{connector_id}/github/installation", response_model=GitHubInstallationInitiationResponse)
+def initiate_github_installation(connector_id:UUID,administrator:ConnectorAdministrator=Depends(get_connector_administrator),
+    service:GitHubAppInstallationService=Depends(get_github_app_installation_service),db_session:Session=Depends(get_db_session))->GitHubInstallationInitiationResponse:
+    try:
+        result=service.initiate(administrator.organization_id,connector_id,administrator.user_id);db_session.commit()
+        return GitHubInstallationInitiationResponse(installation_url=result.installation_url,
+            authorization_url=result.authorization_url,expires_at=result.expires_at)
+    except Exception as exc:db_session.rollback();_raise_http(exc)
+
+
+@connectors_router.post("/{connector_id}/github/installation/complete",response_model=GitHubInstallationStatusResponse)
+def complete_github_installation(connector_id:UUID,payload:CompleteGitHubInstallationRequest,
+    administrator:ConnectorAdministrator=Depends(get_connector_administrator),service:GitHubAppInstallationService=Depends(get_github_app_installation_service),
+    db_session:Session=Depends(get_db_session))->GitHubInstallationStatusResponse:
+    try:
+        result=service.complete(administrator.organization_id,connector_id,administrator.user_id,
+            state=payload.state,code=payload.code,installation_id=payload.installation_id)
+        db_session.commit();return GitHubInstallationStatusResponse(**result.__dict__)
+    except Exception as exc:db_session.rollback();_raise_http(exc)
+
+
+@connectors_router.get("/{connector_id}/github/installation",response_model=GitHubInstallationStatusResponse)
+def get_github_installation(connector_id:UUID,administrator:ConnectorAdministrator=Depends(get_connector_administrator),
+    service:GitHubAppInstallationService=Depends(get_github_app_installation_service))->GitHubInstallationStatusResponse:
+    try:return GitHubInstallationStatusResponse(**service.status(administrator.organization_id,connector_id).__dict__)
+    except Exception as exc:_raise_http(exc)
+
+
+@connectors_router.delete("/{connector_id}/github/installation",response_model=GitHubInstallationStatusResponse)
+def disconnect_github_installation(connector_id:UUID,administrator:ConnectorAdministrator=Depends(get_connector_administrator),
+    service:GitHubAppInstallationService=Depends(get_github_app_installation_service),db_session:Session=Depends(get_db_session))->GitHubInstallationStatusResponse:
+    try:
+        result=service.disconnect(administrator.organization_id,connector_id);db_session.commit()
+        return GitHubInstallationStatusResponse(**result.__dict__)
+    except Exception as exc:db_session.rollback();_raise_http(exc)
 
 
 @connectors_router.post("", response_model=ConnectorResponse, status_code=status.HTTP_201_CREATED)
@@ -469,6 +519,14 @@ def _raise_http(exc: Exception) -> None:
         raise exc
     if isinstance(exc, ConnectorManagementNotFound):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resource not found") from exc
+    if isinstance(exc, GitHubInstallationNotFound):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resource not found") from exc
+    if isinstance(exc, GitHubInstallationRejected):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="GitHub installation request is invalid") from exc
+    if isinstance(exc, (GitHubInstallationConflict, GitHubBindingConflict)):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Resource state conflict") from exc
+    if isinstance(exc, GitHubProviderError):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="GitHub provider request failed") from exc
     if isinstance(exc, SyncScheduleNotFound):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resource not found") from exc
     if isinstance(exc, (ConnectorRepositoryConflict, SyncJobConflict, SyncScheduleConflict)):
@@ -492,6 +550,7 @@ def _raise_http(exc: Exception) -> None:
             ConnectorRepositoryPersistenceError,
             SyncJobPersistenceError,
             SyncSchedulePersistenceError,
+            GitHubInstallationPersistenceError,
             SQLAlchemyError,
         ),
     ):

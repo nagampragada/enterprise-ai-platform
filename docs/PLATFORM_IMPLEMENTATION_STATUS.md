@@ -8,7 +8,7 @@
 | Snapshot branch | `main` |
 | Snapshot commit | `4b82821357cdf3e3976c4cade950a594abb4b1a1` (implementation baseline) |
 | Snapshot date | 2026-08-19 |
-| Alembic head | `20260825_000016` |
+| Alembic head | `20260826_000017` |
 | Purpose | Authoritative, code-evidenced inventory of implemented, exposed, partial, planned, deferred, and excluded capabilities |
 | Audiences | Product owners, backend/data/security/connector/operations/UI/QA engineers, and future repository agents |
 
@@ -27,7 +27,7 @@ This document treats executable code, migrations, runtime route registration, an
 
 The repository is building a multi-tenant enterprise knowledge platform. Organizations will eventually configure controlled data connectors, ingest and index documents, retrieve only content a user is authorized to see, and use a future answer/agent layer to produce grounded responses with citations.
 
-Operationally today, the FastAPI backend supports authentication and authenticated manual upload of TXT, Markdown, DOCX, and PDF files through a fully tested extraction, deterministic chunking, embedding, and PostgreSQL/pgvector persistence pipeline. The backend also contains secure Local Folder connector-management APIs, recurring interval schedules, a database-only scheduler host, a complete synchronization engine, durable job control, a continuous and one-shot worker host, immutable source versioning, and a permission-aware vector retrieval repository. Retrieval is not exposed by an API.
+Operationally today, the FastAPI backend supports authentication and authenticated manual upload of TXT, Markdown, DOCX, and PDF files through a fully tested extraction, deterministic chunking, embedding, and PostgreSQL/pgvector persistence pipeline. The backend also contains secure Local Folder connector-management APIs, recurring interval schedules, a database-only scheduler host, a complete synchronization engine, durable job control, a continuous and one-shot worker host, immutable source versioning, and a permission-aware vector retrieval repository. GitHub is the first cloud connector: its GitHub App installation initiation, authenticated verification, safe status, and local disconnect lifecycle is implemented, while repository discovery and synchronization are not. Retrieval is not exposed by an API.
 
 The product is therefore a **tested backend foundation and vertical-slice implementation, not a finished user-facing product**. Its strongest capability is the tenant-safe scheduled content ingestion/synchronization/indexing data plane with bounded leases, fencing, retries, rollback, continuous Local Folder execution, and authorization-before-ranking retrieval. Its primary gaps are cron/timezone scheduling, broader connector lifecycle operations, search APIs, answer generation, deployment supervision, and a frontend.
 
@@ -123,7 +123,7 @@ Evidence: `backend/pyproject.toml`, `infra/docker/docker-compose.postgres.yml`, 
 
 ## 6. Database architecture
 
-SQLAlchemy metadata contains **41 live tables**. Alembic head is `20260825_000016`; migrations are forward-ordered, tested against real PostgreSQL, and generally provide narrow downgrades. The pgvector extension downgrade is intentionally conservative because extensions can be shared infrastructure.
+SQLAlchemy metadata contains **42 live tables**. Alembic head is `20260826_000017`; migrations are forward-ordered, tested against real PostgreSQL, and generally provide narrow downgrades. The pgvector extension downgrade is intentionally conservative because extensions can be shared infrastructure.
 
 ### Organizations, users, authentication, and structure
 
@@ -350,13 +350,26 @@ Operational connector implementation:
 | Connector type | Status |
 |---|---|
 | `local_folder` | Complete backend connector, synchronization service, execution control, bounded runner |
-| Google Drive | Placeholder directory only; not operational |
+| GitHub | First cloud connector; verified GitHub App installation lifecycle implemented; repository discovery/sync not operational |
+| Google Drive | Placeholder directory only; follows GitHub |
 | SharePoint | Placeholder directory only; not operational |
 | PostgreSQL connector | Placeholder directory only; not operational |
 | SQL Server | Placeholder directory only; not operational |
 | Other domain enum values (OneDrive, Slack, Jira, Confluence, GitHub, Gmail, Outlook, Dropbox, Box, S3, Azure Blob) | Contract vocabulary only |
 
-`ConnectorManagementService` and eight authenticated API operations now support Local Folder connector creation/list/get, scope creation/list, asynchronous job enqueue, and job list/get. They are restricted to active tenant `organization_admin` users. Responses explicitly omit `safe_config`, filesystem root, secret/credential references, lease/worker data, provider payloads, and ORM state. The internal credential/OAuth lifecycle foundation exists, but public credential routes, update/delete/archive, cancellation, production secret-manager integration, cloud providers, and UI remain absent. Audit persistence exists, but no reusable audit writer exists, so connector-management audit emission remains deferred rather than implemented ad hoc.
+`ConnectorManagementService` and authenticated APIs support Local Folder connector creation/list/get, scope creation/list, asynchronous job enqueue, and job list/get. Organization-admin-only GitHub operations initiate App installation plus explicit PKCE-protected GitHub user authorization, complete verified organization binding, return safe installation status, and perform idempotent local disconnect. Responses omit `safe_config`, filesystem roots, secret references, tokens, provider payloads, lease/worker data, and ORM state. Connector update/delete/archive, cancellation, production secret-manager integration, GitHub repository operations, and UI remain absent. Audit persistence exists, but no reusable audit writer exists, so connector-management audit emission remains deferred rather than implemented ad hoc.
+
+### GitHub App installation lifecycle
+
+GitHub is integrated as a GitHub App rather than a classic OAuth App or personal access token. The chosen documented sequence is an installation setup step followed by an explicit GitHub App web authorization step. This preserves platform-generated state, an exact callback URL, and PKCE, which GitHub's automatic “request OAuth during installation” redirect does not let the initiating request control. The setup URL's browser-supplied `installation_id` is only a candidate selection and is never identity proof.
+
+Completion exchanges GitHub's temporary authorization code exactly once, retrieves the authenticated GitHub user with `GET /user`, and requires the candidate installation to appear in bounded, paginated `GET /user/installations` results authenticated by that user's temporary token. The installation must belong to the configured App and an `Organization`. An App-JWT `GET /app/installations/{id}` lookup then provides an additional App-identity and metadata consistency check; it is not the user-association proof. Database uniqueness prevents one App installation from being concurrently attached to two platform connectors.
+
+Persisted data is limited to the GitHub App/installation IDs, safe external organization ID/login/type, repository-selection mode, provider timestamps, credential lifecycle metadata, and last verification time. OAuth state is stored only as a SHA-256 digest; the PKCE verifier, App private key, and OAuth client secret are available only through opaque `SecretStore` references. The temporary user token, callback code, and App JWT are discarded after verification. Installation tokens are not generated by this slice. No token, code, raw state, secret, private key, raw provider response, or authorization header is persisted or returned.
+
+Required GitHub App registration/runtime settings are the App ID, distinct client ID, App slug, exact callback URL, setup URL, private-key secret reference, client-secret reference, GitHub API/web base URLs, and bounded timeout/retry controls. The App should not enable automatic OAuth-on-install for this sequence; the platform explicitly starts the documented web authorization flow with PKCE after installation. A production `SecretStore` adapter remains a deployment prerequisite and no insecure fallback is provided.
+
+The App requests only `Metadata: read` and `Contents: read`, which are the minimum intended permissions for the next repository-discovery and read-only content synchronization slices. It requests no write, organization-member, administration, issues, pull-request, or workflow permission. Remote uninstall remains an explicit GitHub-side administrator action; local disconnect does not uninstall the App.
 
 ## 14. Local Folder connector
 
@@ -759,7 +772,7 @@ Known output at snapshot:
 | Local PostgreSQL | Docker Compose uses `pgvector/pgvector:pg16`, localhost port, health check, named volume; development credentials only |
 | pgvector | Extension migration and vector column complete |
 | Local configuration | Environment-driven database/JWT/OpenAI settings; no secrets are documented here |
-| Migrations | 16 revisions, head `20260825_000016`, real PostgreSQL lifecycle tests |
+| Migrations | 17 revisions, head `20260826_000017`, real PostgreSQL lifecycle tests |
 | Worker runner | Bounded staged callable class implemented |
 | Continuous worker host | Direct module with continuous and one-shot modes implemented |
 | Scheduler/automatic recovery | Continuous/one-shot interval scheduler and worker expired recovery implemented |
@@ -814,7 +827,7 @@ Never display or request: password hashes, refresh-token hashes, connector secre
 | LangGraph, LangChain, LangSmith | Not dependencies; not used |
 | Tool calling and MCP server/tools | Not implemented |
 | Google Drive connector | Placeholder only |
-| GitHub connector | Contract vocabulary only |
+| GitHub repository discovery/content sync/webhooks/ACL sync | Installation lifecycle only; these remain future GitHub slices |
 | SharePoint/OneDrive connector | Placeholder/contract vocabulary only |
 | Slack/Teams connectors | Not implemented (Teams structure is organizational data, not Microsoft Teams connector) |
 | PostgreSQL/SQL Server connectors | Placeholder directories only |
@@ -841,12 +854,13 @@ The current architecture supports this order because the data plane is stronger 
 | 6 | Minimal admin UI | Sign-in, connectors, scopes, sync history, upload | GPT-5.6 Luna, medium | Product design/branding required |
 | 7 | Search service and API | Server-side query embedding + existing authorized repository | GPT-5.6 Sol, high | Provider credentials and result contract |
 | 8 | Grounded answers/citations | Answer generation, citation evidence, refusal/guardrails | GPT-5.6 Sol, high | Model/provider, safety, prompt policy decisions |
-| 9 | Google Drive + OAuth + ACL sync | Provider adapter, secrets, directory/ACL generation, tests | GPT-5.6 Sol, high | Google credentials/admin consent required |
-| 10 | GitHub connector | Repository scope, content identity, permissions | GPT-5.6 Sol, high | GitHub App/OAuth and product scope decisions |
-| 11 | SharePoint/OneDrive connector | Microsoft OAuth, sites/drives, groups/ACLs | GPT-5.6 Sol, high | Microsoft tenant consent/credentials required |
-| 12 | Usage metering, budgets, circuit breakers | Tenant usage persistence and fail-safe provider controls | GPT-5.6 Sol, high | Pricing/budget policies required |
-| 13 | Audit emission and observability | Emit sensitive lifecycle events; metrics/traces/log correlation | GPT-5.6 Sol, high | Retention/compliance/SIEM decisions required |
-| 14 | Production security/deployment hardening | Secrets, TLS, images, CI/CD, backups, scaling, pen test | GPT-5.6 Sol, high | Cloud, compliance, SLO/RTO/RPO decisions required |
+| 9 | GitHub repository discovery | Enumerate authorized installations/repositories using verified App binding | GPT-5.6 Sol, high | Repository scope/product policy required |
+| 10 | GitHub read-only synchronization | Content identity/download, incremental sync, then webhooks and ACL synchronization in later slices | GPT-5.6 Sol, high | GitHub App permission review required |
+| 11 | Google Drive + OAuth + ACL sync | Follows GitHub; provider adapter, secrets, directory/ACL generation, tests | GPT-5.6 Sol, high | Google credentials/admin consent required |
+| 12 | SharePoint/OneDrive connector | Microsoft OAuth, sites/drives, groups/ACLs | GPT-5.6 Sol, high | Microsoft tenant consent/credentials required |
+| 13 | Usage metering, budgets, circuit breakers | Tenant usage persistence and fail-safe provider controls | GPT-5.6 Sol, high | Pricing/budget policies required |
+| 14 | Audit emission and observability | Emit sensitive lifecycle events; metrics/traces/log correlation | GPT-5.6 Sol, high | Retention/compliance/SIEM decisions required |
+| 15 | Production security/deployment hardening | Secrets, TLS, images, CI/CD, backups, scaling, pen test | GPT-5.6 Sol, high | Cloud, compliance, SLO/RTO/RPO decisions required |
 
 ## 33. Final current-state checklist
 

@@ -27,10 +27,15 @@ class OAuthAuthorizationTransactionRepository:
         self._session.add(row);self._flush("OAuth authorization transaction could not be created");return row
     def lock_by_state_hash(self,state_hash:bytes)->OAuthAuthorizationTransaction|None:
         return self._one(select(OAuthAuthorizationTransaction).where(OAuthAuthorizationTransaction.state_hash==_hash(state_hash)).with_for_update())
+    def lock_by_id(self,transaction_id:UUID)->OAuthAuthorizationTransaction|None:
+        _uuid(transaction_id)
+        return self._one(select(OAuthAuthorizationTransaction).where(
+            OAuthAuthorizationTransaction.id==transaction_id).with_for_update())
     def consume(self,row:OAuthAuthorizationTransaction,*,now:datetime)->OAuthAuthorizationTransaction:
         now=_aware(now);result=self._updated(update(OAuthAuthorizationTransaction).where(
             OAuthAuthorizationTransaction.id==row.id,OAuthAuthorizationTransaction.status=="pending",
-            OAuthAuthorizationTransaction.expires_at>now).values(status="consumed",consumed_at=now).returning(OAuthAuthorizationTransaction))
+            OAuthAuthorizationTransaction.expires_at>now).values(status="consumed",consumed_at=now,
+            pkce_verifier_secret_reference=None).returning(OAuthAuthorizationTransaction))
         if result is None:raise OAuthTransactionConflict("OAuth authorization transaction is unavailable")
         return result
     def mark_failed(self,row,*,failure_code:str)->None:
