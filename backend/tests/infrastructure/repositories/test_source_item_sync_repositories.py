@@ -53,6 +53,23 @@ def test_membership_reconciliation_validation_and_active_existence():
         with pytest.raises(InvalidConnectorRepositoryRequest):repo.list_active_memberships_before(*args,**kwargs)
     session.execute.assert_not_called();session.execute.return_value.scalar_one_or_none.return_value=uuid4();assert repo.has_active_membership(org,connector,source)
 
+def test_github_reconciliation_page_is_repository_bounded_and_allows_hard_maximum():
+    org,connector,scope=uuid4(),uuid4(),uuid4();memberships=[_membership(org,connector) for _ in range(2)]
+    for membership in memberships:membership.connector_scope_id=scope;membership.last_seen_at=NOW
+    session=Mock();session.execute.return_value.scalars.return_value.all.return_value=memberships
+    page=SourceItemRepository(session).list_active_github_memberships_before(org,connector,scope,501,NOW,limit=500)
+    statement=session.execute.call_args.args[0];sql=str(statement).upper()
+    assert page.items==tuple(memberships) and not page.has_more and statement._limit_clause.value==501
+    for term in ("SOURCE_ITEMS", "ORGANIZATION_ID", "CONNECTOR_ID", "CONNECTOR_SCOPE_ID", "LAST_SEEN_AT"):
+        assert term in sql
+    parameter_values=list(statement.compile().params.values())
+    assert "github" in parameter_values and "501" in parameter_values
+    session.reset_mock()
+    for repository_id,limit in ((True,100),(0,100),(501,501)):
+        with pytest.raises(InvalidConnectorRepositoryRequest):
+            SourceItemRepository(session).list_active_github_memberships_before(org,connector,scope,repository_id,NOW,limit=limit)
+    session.execute.assert_not_called()
+
 def test_sync_validation_locks_counters_and_pages():
     session=Mock();repo=ConnectorSyncRepository(session);org,connector,scope=uuid4(),uuid4(),uuid4();run=_run(org,connector,scope);repo.add_run(org,connector,scope,run)
     bad=_run(org,connector,scope);bad.mode="bad"

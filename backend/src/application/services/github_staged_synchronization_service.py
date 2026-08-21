@@ -31,6 +31,7 @@ from application.services.github_repository_content_service import (
     GitHubRepositoryContentRejected,
     GitHubRepositoryContentService,
     GitHubRepositoryContentUnavailable,
+    GitHubRepositoryContentUnsupported,
     GitHubRepositoryEntry,
     GitHubRepositorySnapshot,
     GitHubTreeDescriptor,
@@ -60,14 +61,18 @@ from infrastructure.repositories.connector_sync_job_repository import (
     SyncJobLease,
 )
 from infrastructure.repositories.connector_sync_repository import ConnectorSyncRepository
+from infrastructure.repositories.connector_sync_repository import SafeSyncError
 from infrastructure.repositories.document_chunk_repository import DocumentChunkRepository
 from infrastructure.repositories.document_indexing_repository import DocumentIndexingRepository
 from infrastructure.repositories.document_repository import DocumentRepository
 from infrastructure.repositories.document_version_repository import DocumentVersionRepository
-from infrastructure.repositories.source_item_repository import SourceItemRepository
+from infrastructure.repositories.source_item_repository import (
+    MembershipReconciliationCursor,
+    SourceItemRepository,
+)
 
 
-CURSOR_SCHEMA_VERSION = 1
+CURSOR_SCHEMA_VERSION = 2
 CURSOR_TYPE = "github_repository_progress"
 MAX_CURSOR_BYTES = 96 * 1024
 MAX_PREPARED_CHUNKS = 500
@@ -89,6 +94,22 @@ MAX_RUN_ENTRIES = 100_000
 MAX_RUN_FILES = 10_000
 MAX_RUN_DOWNLOAD_BYTES = 10 * 1024 * 1024 * 1024
 MAX_RUN_CHUNKS = 500_000
+
+DEFAULT_RECONCILIATION_BATCH_SIZE = 100
+HARD_MAX_RECONCILIATION_BATCH_SIZE = 500
+MAX_RUN_RECONCILIATION_ITEMS = 100_000
+MAX_RUN_RECONCILIATION_BATCHES = 100_001
+MAX_RECONCILIATION_SECONDS = 30 * 60
+
+_CURSOR_PHASES = frozenset({"traversal", "reconciliation", "complete"})
+_SAFE_UNINDEXABLE_REASONS = frozenset(
+    {
+        "unsupported_format",
+        "oversized",
+        "unsupported_object_type",
+        "git_lfs_unsupported",
+    }
+)
 
 _MIME_TYPES = {
     ".pdf": "application/pdf",
@@ -154,16 +175,35 @@ class GitHubTraversalCursor:
     frames: tuple[GitHubTraversalFrame, ...]
     totals: GitHubRunBudget
     scan_complete: bool = False
+    phase: str = "traversal"
+    scan_generation: UUID = UUID(int=0)
+    authorization_fingerprint: str = "0" * 64
+    authoritative_traversal_complete: bool = False
+    reconciliation_cursor: MembershipReconciliationCursor | None = None
+    reconciled_items: int = 0
+    reconciliation_batches: int = 0
+    reconciliation_started_at: datetime | None = None
+    completion_marker: bool = False
 
     def __post_init__(self) -> None:
         _validate_cursor(self)
 
     @classmethod
-    def initial(cls, snapshot: GitHubRepositorySnapshot) -> GitHubTraversalCursor:
+    def initial(
+        cls,
+        snapshot: GitHubRepositorySnapshot,
+        authorization: GitHubRepositoryContentAuthorization | None = None,
+    ) -> GitHubTraversalCursor:
         return cls(
             snapshot,
             (GitHubTraversalFrame("", snapshot.root_tree_object_id, 0),),
             GitHubRunBudget(),
+            scan_generation=uuid4(),
+            authorization_fingerprint=(
+                _authorization_fingerprint(authorization)
+                if authorization is not None
+                else _snapshot_fingerprint(snapshot)
+            ),
         )
 
     def to_safe_json(self) -> dict[str, object]:
@@ -191,6 +231,30 @@ class GitHubTraversalCursor:
                 "prepared_chunks": self.totals.prepared_chunks,
             },
             "scan_complete": self.scan_complete,
+            "phase": self.phase,
+            "scan_generation": str(self.scan_generation),
+            "authorization_fingerprint": self.authorization_fingerprint,
+            "authoritative_traversal_complete": self.authoritative_traversal_complete,
+            "reconciliation": (
+                None
+                if self.reconciliation_started_at is None
+                else {
+                    "started_at": self.reconciliation_started_at.isoformat(),
+                    "items_reconciled": self.reconciled_items,
+                    "batches_completed": self.reconciliation_batches,
+                    "last_seen_at": (
+                        self.reconciliation_cursor.last_seen_at.isoformat()
+                        if self.reconciliation_cursor is not None
+                        else None
+                    ),
+                    "membership_id": (
+                        str(self.reconciliation_cursor.membership_id)
+                        if self.reconciliation_cursor is not None
+                        else None
+                    ),
+                }
+            ),
+            "completion_marker": self.completion_marker,
         }
         _require_cursor_size(value)
         return value
@@ -206,7 +270,19 @@ class GitHubTraversalCursor:
         if not isinstance(value, dict):
             raise InvalidGitHubStagedSynchronizationRequest("GitHub cursor is invalid")
         _require_cursor_size(value)
-        if set(value) != {"schema_version", "snapshot", "frames", "totals", "scan_complete"}:
+        if set(value) != {
+            "schema_version",
+            "snapshot",
+            "frames",
+            "totals",
+            "scan_complete",
+            "phase",
+            "scan_generation",
+            "authorization_fingerprint",
+            "authoritative_traversal_complete",
+            "reconciliation",
+            "completion_marker",
+        }:
             raise InvalidGitHubStagedSynchronizationRequest("GitHub cursor fields are invalid")
         if value["schema_version"] != CURSOR_SCHEMA_VERSION:
             raise InvalidGitHubStagedSynchronizationRequest("GitHub cursor version is unsupported")
@@ -259,7 +335,87 @@ class GitHubTraversalCursor:
         )
         if not isinstance(value["scan_complete"], bool):
             raise InvalidGitHubStagedSynchronizationRequest("GitHub cursor completion is invalid")
-        return cls(snapshot, frames, totals, value["scan_complete"])
+        phase = value["phase"]
+        if phase not in _CURSOR_PHASES:
+            raise InvalidGitHubStagedSynchronizationRequest("GitHub cursor phase is invalid")
+        try:
+            scan_generation = UUID(str(value["scan_generation"]))
+        except (TypeError, ValueError) as exc:
+            raise InvalidGitHubStagedSynchronizationRequest(
+                "GitHub cursor scan generation is invalid"
+            ) from exc
+        authorization_fingerprint = _sha256(value["authorization_fingerprint"])
+        if not isinstance(value["authoritative_traversal_complete"], bool):
+            raise InvalidGitHubStagedSynchronizationRequest(
+                "GitHub cursor traversal authority is invalid"
+            )
+        if not isinstance(value["completion_marker"], bool):
+            raise InvalidGitHubStagedSynchronizationRequest(
+                "GitHub cursor completion marker is invalid"
+            )
+        reconciliation_cursor = None
+        reconciled_items = 0
+        reconciliation_batches = 0
+        reconciliation_started_at = None
+        if value["reconciliation"] is not None:
+            raw_reconciliation = _exact_dict(
+                value["reconciliation"],
+                {
+                    "started_at",
+                    "items_reconciled",
+                    "batches_completed",
+                    "last_seen_at",
+                    "membership_id",
+                },
+            )
+            try:
+                reconciliation_started_at = datetime.fromisoformat(
+                    str(raw_reconciliation["started_at"])
+                )
+            except (TypeError, ValueError) as exc:
+                raise InvalidGitHubStagedSynchronizationRequest(
+                    "GitHub reconciliation start is invalid"
+                ) from exc
+            reconciled_items = _bounded_total(
+                "items_reconciled",
+                raw_reconciliation["items_reconciled"],
+                MAX_RUN_RECONCILIATION_ITEMS,
+            )
+            reconciliation_batches = _bounded_total(
+                "batches_completed",
+                raw_reconciliation["batches_completed"],
+                MAX_RUN_RECONCILIATION_BATCHES,
+            )
+            last_seen_at = raw_reconciliation["last_seen_at"]
+            membership_id = raw_reconciliation["membership_id"]
+            if (last_seen_at is None) != (membership_id is None):
+                raise InvalidGitHubStagedSynchronizationRequest(
+                    "GitHub reconciliation keyset is invalid"
+                )
+            if last_seen_at is not None:
+                try:
+                    reconciliation_cursor = MembershipReconciliationCursor(
+                        datetime.fromisoformat(str(last_seen_at)), UUID(str(membership_id))
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise InvalidGitHubStagedSynchronizationRequest(
+                        "GitHub reconciliation keyset is invalid"
+                    ) from exc
+        return cls(
+            snapshot,
+            frames,
+            totals,
+            value["scan_complete"],
+            phase,
+            scan_generation,
+            authorization_fingerprint,
+            value["authoritative_traversal_complete"],
+            reconciliation_cursor,
+            reconciled_items,
+            reconciliation_batches,
+            reconciliation_started_at,
+            value["completion_marker"],
+        )
 
 
 @dataclass(frozen=True, repr=False)
@@ -328,9 +484,10 @@ class PreparedGitHubFile:
     mime_type: str | None
     chunks: tuple[PreparedGitHubChunk, ...]
     embedding_model: str | None
+    retirement_reason: str | None = None
 
     def __post_init__(self) -> None:
-        if self.outcome not in {"already_complete", "unchanged", "skipped", "indexed"}:
+        if self.outcome not in {"already_complete", "unchanged", "indexed", "unsupported"}:
             raise InvalidGitHubStagedSynchronizationRequest("prepared GitHub outcome is invalid")
         if self.outcome == "indexed":
             if (
@@ -343,6 +500,12 @@ class PreparedGitHubFile:
             _sha256(self.content_checksum)
         elif self.content_checksum is not None or self.chunks or self.embedding_model is not None:
             raise InvalidGitHubStagedSynchronizationRequest("unindexed GitHub file has content")
+        if (self.outcome == "unsupported") != (
+            self.retirement_reason in _SAFE_UNINDEXABLE_REASONS
+        ):
+            raise InvalidGitHubStagedSynchronizationRequest(
+                "prepared GitHub retirement classification is invalid"
+            )
 
 
 @dataclass(frozen=True)
@@ -358,6 +521,7 @@ class GitHubPersistenceOutcome:
     outcome: str
     files_persisted: int
     scan_complete: bool
+    phase: str = "traversal"
 
 
 def classify_github_synchronization_failure(error: BaseException) -> FailureClassification:
@@ -420,7 +584,7 @@ class GitHubSynchronizationPreparationService:
         self, authorization: GitHubRepositoryContentAuthorization
     ) -> GitHubTraversalCursor:
         return GitHubTraversalCursor.initial(
-            self._content.resolve_default_branch_snapshot(authorization)
+            self._content.resolve_default_branch_snapshot(authorization), authorization
         )
 
     def discover_batch(
@@ -431,6 +595,10 @@ class GitHubSynchronizationPreparationService:
         limits: GitHubSynchronizationLimits = GitHubSynchronizationLimits(),
     ) -> GitHubDiscoveryBatch:
         _validate_authorization_cursor(authorization, cursor)
+        if cursor.phase != "traversal":
+            raise InvalidGitHubStagedSynchronizationRequest(
+                "GitHub cursor is not in traversal"
+            )
         if cursor.scan_complete:
             return GitHubDiscoveryBatch((), cursor, 0, 0)
         work = cursor
@@ -479,16 +647,20 @@ class GitHubSynchronizationPreparationService:
                     frames=work.frames + (GitHubTraversalFrame(entry.path, entry.object_id, 0),),
                 )
                 continue
-            extension = PurePosixPath(entry.path).suffix.casefold()
-            if extension not in SUPPORTED_CONTENT_EXTENSIONS:
-                continue
-            skip_reason = None
             if len(_source_identity(entry.repository_id, entry.path)) > MAX_SOURCE_IDENTITY_CHARACTERS:
-                skip_reason = "source_identity_too_long"
+                continue
+            extension = PurePosixPath(entry.path).suffix.casefold()
+            skip_reason = None
+            if entry.entry_type != "regular_blob":
+                skip_reason = "unsupported_object_type"
+            elif extension not in SUPPORTED_CONTENT_EXTENSIONS:
+                skip_reason = "unsupported_format"
             elif entry.size_bytes is None:
-                skip_reason = "missing_size"
+                raise InvalidGitHubStagedSynchronizationRequest(
+                    "GitHub regular blob size is unavailable"
+                )
             elif entry.size_bytes > MAX_GITHUB_BLOB_BYTES:
-                skip_reason = "file_too_large"
+                skip_reason = "oversized"
             if len(files) >= limits.max_files:
                 work = before
                 break
@@ -522,7 +694,12 @@ class GitHubSynchronizationPreparationService:
             if discovered.cursor_before.totals.entries_examined < cursor_after.totals.entries_examined:
                 raise InvalidGitHubStagedSynchronizationRequest("GitHub batch order is invalid")
             if discovered.skip_reason is not None:
-                item = _prepared_without_content(discovered, snapshot, "skipped")
+                item = _prepared_without_content(
+                    discovered,
+                    snapshot,
+                    "unsupported",
+                    discovered.skip_reason,
+                )
             elif (
                 snapshot.run_item_status in {"succeeded", "skipped"}
                 and snapshot.run_item_blob_id == discovered.entry.object_id
@@ -568,7 +745,17 @@ class GitHubSynchronizationPreparationService:
         discovered: GitHubDiscoveredFile,
         item_snapshot: GitHubItemSnapshot,
     ) -> PreparedGitHubFile:
-        raw = self._content.download_blob(authorization, discovered.cursor_after.snapshot, discovered.entry)
+        try:
+            raw = self._content.download_blob(
+                authorization, discovered.cursor_after.snapshot, discovered.entry
+            )
+        except GitHubRepositoryContentUnsupported as exc:
+            return _prepared_without_content(
+                discovered,
+                item_snapshot,
+                "unsupported",
+                exc.classification,
+            )
         extension = PurePosixPath(discovered.entry.path).suffix.casefold()
         temporary_path: Path | None = None
         try:
@@ -730,13 +917,20 @@ class GitHubStagedSynchronizationService:
         now: datetime,
     ) -> None:
         self._execution.validate_attempt(lease, snapshot.sync_run_id, worker_id=worker_id)
+        _require_persistence_time(snapshot, now)
         self._require_context(snapshot)
         if snapshot.cursor is not None:
             if snapshot.cursor != cursor:
                 raise StalePreparedGitHubBatch("GitHub snapshot was already pinned")
             return
         _validate_authorization_cursor(snapshot.authorization, cursor)
-        if cursor != GitHubTraversalCursor.initial(cursor.snapshot):
+        if (
+            cursor.phase != "traversal"
+            or cursor.scan_complete
+            or cursor.frames
+            != (GitHubTraversalFrame("", cursor.snapshot.root_tree_object_id, 0),)
+            or cursor.totals != GitHubRunBudget()
+        ):
             raise InvalidGitHubStagedSynchronizationRequest(
                 "new GitHub snapshot cursor must be at the traversal root"
             )
@@ -757,6 +951,7 @@ class GitHubStagedSynchronizationService:
         now: datetime,
     ) -> GitHubPersistenceOutcome:
         self._execution.validate_attempt(lease, snapshot.sync_run_id, worker_id=worker_id)
+        _require_persistence_time(snapshot, now)
         self._require_context(snapshot)
         _validate_authorization_cursor(snapshot.authorization, prepared.cursor_after)
         current_row = self._sync.get_active_cursor(
@@ -778,32 +973,154 @@ class GitHubStagedSynchronizationService:
         _validate_prepared_batch(current, prepared)
         for item in prepared.files:
             self._persist_file(snapshot, item, now)
-        self._replace_cursor(snapshot, prepared.cursor_after, current_row, now)
-        if prepared.cursor_after.scan_complete:
-            run = self._sync.get_run(
-                lease.organization_id,
-                lease.connector_id,
-                lease.connector_scope_id,
-                snapshot.sync_run_id,
+        target = prepared.cursor_after
+        if target.scan_complete:
+            target = replace(
+                target,
+                phase="reconciliation",
+                authoritative_traversal_complete=True,
+                reconciliation_cursor=None,
+                reconciled_items=0,
+                reconciliation_batches=0,
+                reconciliation_started_at=now,
+                completion_marker=False,
             )
-            if run is None or run.status != "running" or run.started_at is None:
-                raise StalePreparedGitHubBatch("GitHub synchronization run is unavailable")
-            self._sync.set_run_state(
-                lease.organization_id,
-                lease.connector_id,
-                lease.connector_scope_id,
-                snapshot.sync_run_id,
-                status="completed",
-                started_at=run.started_at,
-                heartbeat_at=now,
-                finished_at=now,
-            )
-            self._execution.complete_success(lease, worker_id=worker_id)
+        self._replace_cursor(snapshot, target, current_row, now)
         return GitHubPersistenceOutcome(
-            "completed" if prepared.cursor_after.scan_complete else "in_progress",
+            "in_progress",
             len(prepared.files),
-            prepared.cursor_after.scan_complete,
+            False,
+            target.phase,
         )
+
+    def reconcile(
+        self,
+        lease: SyncJobLease,
+        snapshot: GitHubSynchronizationSnapshot,
+        *,
+        worker_id: str,
+        now: datetime,
+        limit: int = DEFAULT_RECONCILIATION_BATCH_SIZE,
+    ) -> GitHubPersistenceOutcome:
+        """Retire one bounded keyset page after authoritative traversal."""
+        self._execution.validate_attempt(lease, snapshot.sync_run_id, worker_id=worker_id)
+        self._require_context(snapshot)
+        _require_persistence_time(snapshot, now)
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= HARD_MAX_RECONCILIATION_BATCH_SIZE
+        ):
+            raise InvalidGitHubStagedSynchronizationRequest(
+                f"reconciliation limit must be between 1 and {HARD_MAX_RECONCILIATION_BATCH_SIZE}"
+            )
+        current_row = self._sync.get_active_cursor(
+            lease.organization_id,
+            lease.connector_id,
+            lease.connector_scope_id,
+            lock=True,
+        )
+        if (
+            current_row is None
+            or current_row.created_by_run_id != snapshot.sync_run_id
+            or current_row.cursor_type != CURSOR_TYPE
+            or current_row.safe_cursor is None
+        ):
+            raise StalePreparedGitHubBatch("GitHub reconciliation cursor is unavailable")
+        current = GitHubTraversalCursor.from_safe_json(
+            current_row.safe_cursor,
+            connector_id=lease.connector_id,
+            scope_id=lease.connector_scope_id,
+        )
+        _validate_authorization_cursor(snapshot.authorization, current)
+        _validate_reconciliation_snapshot(snapshot, current)
+        if (
+            current.phase != "reconciliation"
+            or not current.scan_complete
+            or not current.authoritative_traversal_complete
+            or current.completion_marker
+            or current.reconciliation_started_at is None
+        ):
+            raise InvalidGitHubStagedSynchronizationRequest(
+                "GitHub reconciliation authority is unavailable"
+            )
+        if now < current.reconciliation_started_at:
+            raise InvalidGitHubStagedSynchronizationRequest(
+                "GitHub reconciliation time moved backward"
+            )
+        if (now - current.reconciliation_started_at).total_seconds() > MAX_RECONCILIATION_SECONDS:
+            raise GitHubSynchronizationBudgetExceeded(
+                "GitHub reconciliation wall-clock budget was exceeded"
+            )
+        remaining = MAX_RUN_RECONCILIATION_ITEMS - current.reconciled_items
+        query_limit = min(limit, max(1, remaining))
+        page = self._sources.list_active_github_memberships_before(
+            lease.organization_id,
+            lease.connector_id,
+            lease.connector_scope_id,
+            current.snapshot.repository_id,
+            snapshot.run_started_at,
+            limit=query_limit,
+            cursor=current.reconciliation_cursor,
+        )
+        if remaining == 0 and page.items:
+            raise GitHubSynchronizationBudgetExceeded(
+                "GitHub reconciliation item budget was exceeded"
+            )
+        retired = 0
+        for membership in page.items:
+            if self._retire_unseen(snapshot, membership.source_item_id, now):
+                retired += 1
+        next_count = current.reconciled_items + len(page.items)
+        next_batches = current.reconciliation_batches + 1
+        if next_count > MAX_RUN_RECONCILIATION_ITEMS:
+            raise GitHubSynchronizationBudgetExceeded(
+                "GitHub reconciliation item budget was exceeded"
+            )
+        if page.has_more:
+            if page.next_cursor is None:
+                raise InvalidGitHubStagedSynchronizationRequest(
+                    "GitHub reconciliation continuation is invalid"
+                )
+            target = replace(
+                current,
+                reconciliation_cursor=page.next_cursor,
+                reconciled_items=next_count,
+                reconciliation_batches=next_batches,
+            )
+            self._replace_cursor(snapshot, target, current_row, now)
+            return GitHubPersistenceOutcome(
+                "in_progress", retired, False, "reconciliation"
+            )
+        target = replace(
+            current,
+            phase="complete",
+            reconciliation_cursor=None,
+            reconciled_items=next_count,
+            reconciliation_batches=next_batches,
+            completion_marker=True,
+        )
+        self._replace_cursor(snapshot, target, current_row, now)
+        run = self._sync.get_run(
+            lease.organization_id,
+            lease.connector_id,
+            lease.connector_scope_id,
+            snapshot.sync_run_id,
+        )
+        if run is None or run.status != "running" or run.started_at is None:
+            raise StalePreparedGitHubBatch("GitHub synchronization run is unavailable")
+        self._sync.set_run_state(
+            lease.organization_id,
+            lease.connector_id,
+            lease.connector_scope_id,
+            snapshot.sync_run_id,
+            status="completed",
+            started_at=run.started_at,
+            heartbeat_at=now,
+            finished_at=now,
+        )
+        self._execution.complete_success(lease, worker_id=worker_id)
+        return GitHubPersistenceOutcome("completed", retired, True, "complete")
 
     def _persist_file(
         self,
@@ -849,7 +1166,7 @@ class GitHubStagedSynchronizationService:
                 "new"
                 if prepared.expected_source_item_id is None
                 else "unchanged"
-                if prepared.outcome in {"already_complete", "unchanged", "skipped"}
+                if prepared.outcome in {"already_complete", "unchanged"}
                 else "changed"
             ),
             processing_status="pending",
@@ -865,6 +1182,9 @@ class GitHubStagedSynchronizationService:
                 snapshot.sync_run_id,
                 item,
             )
+        if prepared.outcome == "unsupported":
+            self._persist_unindexable(snapshot, source, item, prepared, now)
+            return
         if prepared.outcome != "indexed":
             self._finish_item(snapshot, item, "skipped", now)
             deltas = {"items_discovered": 1, "items_skipped": 1}
@@ -892,6 +1212,8 @@ class GitHubStagedSynchronizationService:
             "file_extension": PurePosixPath(entry.path).suffix.casefold(),
             "size_bytes": entry.size_bytes,
         }
+        if prepared.retirement_reason is not None:
+            metadata["availability_reason"] = prepared.retirement_reason
         checksum = prepared.content_checksum or (existing.source_checksum if existing else None)
         if existing is None:
             source = SourceItem(
@@ -903,7 +1225,7 @@ class GitHubStagedSynchronizationService:
                 source_item_type="file",
                 title=PurePosixPath(entry.path).name,
                 source_url=None,
-                mime_type=_MIME_TYPES[PurePosixPath(entry.path).suffix.casefold()],
+                mime_type=_MIME_TYPES.get(PurePosixPath(entry.path).suffix.casefold()),
                 source_checksum=checksum,
                 source_version=entry.object_id,
                 size_bytes=entry.size_bytes,
@@ -943,6 +1265,201 @@ class GitHubStagedSynchronizationService:
             )
         return source, restored
 
+    def _persist_unindexable(self, snapshot, source, item, prepared, now):
+        reason = prepared.retirement_reason
+        if reason not in _SAFE_UNINDEXABLE_REASONS:
+            raise InvalidGitHubStagedSynchronizationRequest(
+                "GitHub retirement classification is invalid"
+            )
+        current = self._versions.get_current(
+            snapshot.authorization.organization_id, source.id
+        )
+        materialization = (
+            self._versions.get_current_materialization(
+                snapshot.authorization.organization_id, source.id
+            )
+            if current is not None
+            else None
+        )
+        current_reason = current.version_metadata.get("reason") if current else None
+        if (
+            current is None
+            or current.lifecycle != "unavailable"
+            or current.provider_version_id != prepared.discovered.entry.object_id
+            or current_reason != reason
+        ):
+            self._versions.create_current_version(
+                snapshot.authorization.organization_id,
+                source.id,
+                version_cause="tombstone",
+                lifecycle="unavailable",
+                discovered_at=now,
+                provider_version_id=prepared.discovered.entry.object_id,
+                metadata={
+                    "provider": "github",
+                    "repository_id": prepared.discovered.entry.repository_id,
+                    "reason": reason,
+                },
+            )
+        if materialization is not None:
+            self._documents.soft_delete(
+                snapshot.authorization.organization_id,
+                materialization.document_id,
+                now,
+            )
+        self._sources.set_lifecycle(
+            snapshot.authorization.organization_id,
+            snapshot.authorization.connector_id,
+            source.id,
+            "unavailable",
+        )
+        self._finish_item(snapshot, item, "skipped", now)
+        self._sync.add_error(
+            snapshot.authorization.organization_id,
+            snapshot.authorization.connector_id,
+            snapshot.authorization.scope_id,
+            snapshot.sync_run_id,
+            SafeSyncError(
+                "extraction",
+                reason,
+                "GitHub content is not indexable",
+                False,
+                1,
+                {"classification": reason},
+                now,
+            ),
+            item_id=item.id,
+        )
+        counter = (
+            "items_new" if prepared.expected_source_item_id is None else "items_changed"
+        )
+        self._sync.increment_counters(
+            snapshot.authorization.organization_id,
+            snapshot.authorization.connector_id,
+            snapshot.authorization.scope_id,
+            snapshot.sync_run_id,
+            items_discovered=1,
+            items_skipped=1,
+            **{counter: 1},
+        )
+
+    def _retire_unseen(self, snapshot, source_item_id, now):
+        source = self._sources.lock_by_id(
+            snapshot.authorization.organization_id,
+            snapshot.authorization.connector_id,
+            source_item_id,
+        )
+        membership = self._sources.lock_membership(
+            snapshot.authorization.organization_id,
+            snapshot.authorization.connector_id,
+            snapshot.authorization.scope_id,
+            source_item_id,
+        )
+        if source is None or membership is None:
+            return False
+        metadata = source.source_metadata
+        prefix = f"github:repository:{snapshot.authorization.repository_id}:path:"
+        if (
+            membership.status != "active"
+            or membership.removed_at is not None
+            or membership.last_seen_at >= snapshot.run_started_at
+            or source.last_seen_at >= snapshot.run_started_at
+            or source.source_item_type != "file"
+            or source.status == "deleted"
+            or not source.source_item_key.startswith(prefix)
+            or metadata.get("provider") != "github"
+            or metadata.get("repository_id") != snapshot.authorization.repository_id
+        ):
+            return False
+        prior = self._sync.get_item_by_key(
+            snapshot.authorization.organization_id,
+            snapshot.authorization.connector_id,
+            snapshot.sync_run_id,
+            source.source_item_key,
+        )
+        if prior is not None:
+            return False
+        current = self._versions.get_current(
+            snapshot.authorization.organization_id, source.id
+        )
+        materialization = (
+            self._versions.get_current_materialization(
+                snapshot.authorization.organization_id, source.id
+            )
+            if current is not None
+            else None
+        )
+        self._sources.remove_membership(
+            snapshot.authorization.organization_id,
+            snapshot.authorization.connector_id,
+            snapshot.authorization.scope_id,
+            source.id,
+            now,
+        )
+        if not self._sources.has_active_membership(
+            snapshot.authorization.organization_id,
+            snapshot.authorization.connector_id,
+            source.id,
+        ):
+            self._sources.set_lifecycle(
+                snapshot.authorization.organization_id,
+                snapshot.authorization.connector_id,
+                source.id,
+                "deleted",
+                deleted_at=now,
+            )
+            if current is None or current.lifecycle != "deleted":
+                self._versions.create_current_version(
+                    snapshot.authorization.organization_id,
+                    source.id,
+                    version_cause="tombstone",
+                    lifecycle="deleted",
+                    discovered_at=now,
+                    provider_version_id=(current.provider_version_id if current else None),
+                    metadata={
+                        "provider": "github",
+                        "repository_id": snapshot.authorization.repository_id,
+                        "reason": "provider_deleted",
+                    },
+                )
+            if materialization is not None:
+                self._documents.soft_delete(
+                    snapshot.authorization.organization_id,
+                    materialization.document_id,
+                    now,
+                )
+        item = ConnectorSyncItem(
+            id=uuid4(),
+            organization_id=snapshot.authorization.organization_id,
+            connector_id=snapshot.authorization.connector_id,
+            connector_scope_id=snapshot.authorization.scope_id,
+            sync_run_id=snapshot.sync_run_id,
+            source_item_id=source.id,
+            source_item_key=source.source_item_key,
+            change_type="deleted",
+            processing_status="pending",
+            previous_checksum=source.source_checksum,
+            current_checksum=None,
+            attempt_count=0,
+        )
+        self._sync.add_item(
+            snapshot.authorization.organization_id,
+            snapshot.authorization.connector_id,
+            snapshot.authorization.scope_id,
+            snapshot.sync_run_id,
+            item,
+        )
+        self._finish_item(snapshot, item, "succeeded", now)
+        self._sync.increment_counters(
+            snapshot.authorization.organization_id,
+            snapshot.authorization.connector_id,
+            snapshot.authorization.scope_id,
+            snapshot.sync_run_id,
+            items_deleted=1,
+            items_succeeded=1,
+        )
+        return True
+
     def _persist_membership(self, snapshot, source_id, now):
         membership = self._sources.lock_membership(
             snapshot.authorization.organization_id,
@@ -977,7 +1494,11 @@ class GitHubStagedSynchronizationService:
     def _persist_indexed(self, snapshot, source, item, prepared, restored, now):
         entry = prepared.discovered.entry
         current = self._versions.get_current(snapshot.authorization.organization_id, source.id)
-        if current is None or current.provider_version_id != entry.object_id:
+        if (
+            current is None
+            or current.provider_version_id != entry.object_id
+            or current.lifecycle != "available"
+        ):
             current = self._versions.create_current_version(
                 snapshot.authorization.organization_id,
                 source.id,
@@ -1172,8 +1693,31 @@ class GitHubStagedSynchronizationService:
             or scope.status != "active"
         ):
             raise InvalidGitHubStagedSynchronizationRequest("GitHub synchronization context is unavailable")
+        run = self._sync.get_run(
+            snapshot.authorization.organization_id,
+            snapshot.authorization.connector_id,
+            snapshot.authorization.scope_id,
+            snapshot.sync_run_id,
+        )
+        if (
+            run is None
+            or run.status != "running"
+            or run.started_at is None
+            or run.started_at != snapshot.run_started_at
+        ):
+            raise StalePreparedGitHubBatch("GitHub synchronization run changed")
 
     def _replace_cursor(self, snapshot, cursor, current, now):
+        _validate_cursor(cursor)
+        if current is not None and current.created_by_run_id == snapshot.sync_run_id:
+            if current.safe_cursor is None:
+                raise StalePreparedGitHubBatch("GitHub synchronization cursor is unavailable")
+            previous = GitHubTraversalCursor.from_safe_json(
+                current.safe_cursor,
+                connector_id=snapshot.authorization.connector_id,
+                scope_id=snapshot.authorization.scope_id,
+            )
+            _validate_cursor_transition(previous, cursor)
         self._sync.replace_active_cursor(
             snapshot.authorization.organization_id,
             snapshot.authorization.connector_id,
@@ -1186,7 +1730,7 @@ class GitHubStagedSynchronizationService:
         )
 
 
-def _prepared_without_content(discovered, snapshot, outcome):
+def _prepared_without_content(discovered, snapshot, outcome, retirement_reason=None):
     return PreparedGitHubFile(
         discovered,
         snapshot.source_item_id,
@@ -1197,6 +1741,7 @@ def _prepared_without_content(discovered, snapshot, outcome):
         None,
         (),
         None,
+        retirement_reason,
     )
 
 
@@ -1222,8 +1767,21 @@ def _validate_authorization_cursor(authorization, cursor):
         or cursor.snapshot.canonical_repository_identity
         != authorization.canonical_repository_identity
         or cursor.snapshot.default_branch_name != authorization.default_branch_name
+        or cursor.authorization_fingerprint != _authorization_fingerprint(authorization)
     ):
         raise InvalidGitHubStagedSynchronizationRequest("GitHub cursor authorization is invalid")
+
+
+def _validate_reconciliation_snapshot(snapshot, cursor):
+    supplied = snapshot.cursor
+    if supplied is None:
+        return
+    if (
+        supplied.snapshot != cursor.snapshot
+        or supplied.scan_generation != cursor.scan_generation
+        or supplied.authorization_fingerprint != cursor.authorization_fingerprint
+    ):
+        raise StalePreparedGitHubBatch("GitHub reconciliation snapshot changed")
 
 
 def _validate_cursor(cursor):
@@ -1236,6 +1794,13 @@ def _validate_cursor(cursor):
         raise InvalidGitHubStagedSynchronizationRequest("GitHub cursor repository is invalid")
     if cursor.scan_complete != (len(cursor.frames) == 0):
         raise InvalidGitHubStagedSynchronizationRequest("GitHub cursor completion is invalid")
+    if cursor.phase not in _CURSOR_PHASES:
+        raise InvalidGitHubStagedSynchronizationRequest("GitHub cursor phase is invalid")
+    if not isinstance(cursor.scan_generation, UUID) or cursor.scan_generation.int == 0:
+        raise InvalidGitHubStagedSynchronizationRequest(
+            "GitHub cursor scan generation is invalid"
+        )
+    _sha256(cursor.authorization_fingerprint)
     if len(cursor.frames) > MAX_REPOSITORY_PATH_SEGMENTS:
         raise InvalidGitHubStagedSynchronizationRequest("GitHub cursor depth is invalid")
     for index, frame in enumerate(cursor.frames):
@@ -1254,10 +1819,79 @@ def _validate_cursor(cursor):
                     "GitHub cursor frame ancestry is invalid"
                 )
     _enforce_run_totals(cursor.totals)
+    if (
+        isinstance(cursor.reconciled_items, bool)
+        or not isinstance(cursor.reconciled_items, int)
+        or not 0 <= cursor.reconciled_items <= MAX_RUN_RECONCILIATION_ITEMS
+    ):
+        raise InvalidGitHubStagedSynchronizationRequest(
+            "GitHub reconciliation total is invalid"
+        )
+    if (
+        isinstance(cursor.reconciliation_batches, bool)
+        or not isinstance(cursor.reconciliation_batches, int)
+        or not 0 <= cursor.reconciliation_batches <= MAX_RUN_RECONCILIATION_BATCHES
+    ):
+        raise InvalidGitHubStagedSynchronizationRequest(
+            "GitHub reconciliation batch total is invalid"
+        )
+    if cursor.reconciliation_cursor is not None:
+        _require_aware_datetime(
+            "reconciliation last_seen_at", cursor.reconciliation_cursor.last_seen_at
+        )
+        if not isinstance(cursor.reconciliation_cursor.membership_id, UUID):
+            raise InvalidGitHubStagedSynchronizationRequest(
+                "GitHub reconciliation keyset is invalid"
+            )
+    if cursor.reconciliation_started_at is not None:
+        _require_aware_datetime(
+            "reconciliation started_at", cursor.reconciliation_started_at
+        )
+    if cursor.phase == "traversal":
+        if (
+            cursor.authoritative_traversal_complete
+            or cursor.reconciliation_cursor is not None
+            or cursor.reconciled_items != 0
+            or cursor.reconciliation_batches != 0
+            or cursor.reconciliation_started_at is not None
+            or cursor.completion_marker
+        ):
+            raise InvalidGitHubStagedSynchronizationRequest(
+                "GitHub traversal cursor contains reconciliation state"
+            )
+    elif (
+        not cursor.scan_complete
+        or not cursor.authoritative_traversal_complete
+        or cursor.reconciliation_started_at is None
+        or cursor.completion_marker != (cursor.phase == "complete")
+    ):
+        raise InvalidGitHubStagedSynchronizationRequest(
+            "GitHub reconciliation phase is invalid"
+        )
+    if cursor.phase == "reconciliation" and (
+        cursor.reconciliation_batches > cursor.reconciled_items
+    ):
+        raise InvalidGitHubStagedSynchronizationRequest(
+            "GitHub reconciliation counters are inconsistent"
+        )
+    if cursor.phase == "complete" and (
+        cursor.reconciliation_batches < 1
+        or cursor.reconciliation_batches > cursor.reconciled_items + 1
+    ):
+        raise InvalidGitHubStagedSynchronizationRequest(
+            "GitHub completion counters are inconsistent"
+        )
 
 
 def _require_forward_progress(current, target, has_files):
-    if current.snapshot != target.snapshot or current.scan_complete:
+    if (
+        current.snapshot != target.snapshot
+        or current.scan_generation != target.scan_generation
+        or current.authorization_fingerprint != target.authorization_fingerprint
+        or current.phase != "traversal"
+        or target.phase != "traversal"
+        or current.scan_complete
+    ):
         raise StalePreparedGitHubBatch("GitHub synchronization cursor is stale")
     if target.totals.entries_examined < current.totals.entries_examined:
         raise StalePreparedGitHubBatch("GitHub synchronization cursor moved backward")
@@ -1272,6 +1906,43 @@ def _require_forward_progress(current, target, has_files):
             raise StalePreparedGitHubBatch("GitHub synchronization budget moved backward")
     if target == current:
         raise StalePreparedGitHubBatch("GitHub synchronization made no progress")
+
+
+def _validate_cursor_transition(current, target):
+    if (
+        current.snapshot != target.snapshot
+        or current.scan_generation != target.scan_generation
+        or current.authorization_fingerprint != target.authorization_fingerprint
+    ):
+        raise StalePreparedGitHubBatch("GitHub synchronization identity changed")
+    allowed = {
+        "traversal": {"traversal", "reconciliation"},
+        "reconciliation": {"reconciliation", "complete"},
+        "complete": {"complete"},
+    }
+    if target.phase not in allowed[current.phase]:
+        raise StalePreparedGitHubBatch("GitHub synchronization phase regressed")
+    if target.reconciled_items < current.reconciled_items:
+        raise StalePreparedGitHubBatch("GitHub reconciliation total moved backward")
+    if target.reconciliation_batches < current.reconciliation_batches:
+        raise StalePreparedGitHubBatch("GitHub reconciliation batch total moved backward")
+    if current.phase == "reconciliation" and target.reconciliation_batches != (
+        current.reconciliation_batches + 1
+    ):
+        raise StalePreparedGitHubBatch("GitHub reconciliation batch total is stale")
+    if current.reconciliation_cursor is not None:
+        if target.reconciliation_cursor is None and target.phase != "complete":
+            raise StalePreparedGitHubBatch("GitHub reconciliation keyset regressed")
+        if target.reconciliation_cursor is not None and (
+            target.reconciliation_cursor.last_seen_at,
+            target.reconciliation_cursor.membership_id,
+        ) <= (
+            current.reconciliation_cursor.last_seen_at,
+            current.reconciliation_cursor.membership_id,
+        ):
+            raise StalePreparedGitHubBatch("GitHub reconciliation keyset moved backward")
+    if current.phase == "complete" and target != current:
+        raise StalePreparedGitHubBatch("GitHub completion cursor changed")
 
 
 def _validate_prepared_batch(current, prepared):
@@ -1311,7 +1982,18 @@ def _validate_prepared_batch(current, prepared):
                 raise InvalidGitHubStagedSynchronizationRequest("indexed GitHub file is ineligible")
             calculated_bytes += discovered.entry.size_bytes
             calculated_chunks += len(item.chunks)
-        elif (item.outcome == "skipped") != (discovered.skip_reason is not None):
+        elif item.outcome == "unsupported":
+            if item.retirement_reason == "git_lfs_unsupported":
+                if discovered.skip_reason is not None or discovered.entry.size_bytes is None:
+                    raise InvalidGitHubStagedSynchronizationRequest(
+                        "prepared GitHub LFS classification is invalid"
+                    )
+                calculated_bytes += discovered.entry.size_bytes
+            elif item.retirement_reason != discovered.skip_reason:
+                raise InvalidGitHubStagedSynchronizationRequest(
+                    "prepared GitHub classification changed"
+                )
+        elif discovered.skip_reason is not None:
             raise InvalidGitHubStagedSynchronizationRequest(
                 "prepared GitHub skip outcome is invalid"
             )
@@ -1324,7 +2006,7 @@ def _validate_prepared_batch(current, prepared):
 def _validate_discovered_file(discovered, snapshot):
     if (
         not isinstance(discovered, GitHubDiscoveredFile)
-        or discovered.entry.entry_type != "regular_blob"
+        or discovered.entry.entry_type not in {"regular_blob", "symlink", "submodule"}
         or discovered.cursor_before.snapshot != snapshot
         or discovered.cursor_after.snapshot != snapshot
         or discovered.cursor_after.totals.entries_examined
@@ -1335,8 +2017,6 @@ def _validate_discovered_file(discovered, snapshot):
         or discovered.entry.canonical_repository_identity != snapshot.canonical_repository_identity
         or discovered.entry.commit_object_id != snapshot.commit_object_id
         or discovered.entry.root_tree_object_id != snapshot.root_tree_object_id
-        or PurePosixPath(discovered.entry.path).suffix.casefold()
-        not in SUPPORTED_CONTENT_EXTENSIONS
     ):
         raise InvalidGitHubStagedSynchronizationRequest("discovered GitHub file is invalid")
     entry = discovered.entry
@@ -1357,17 +2037,20 @@ def _validate_discovered_file(discovered, snapshot):
                 or entry.size_bytes < 0
             )
         )
-        or discovered.skip_reason
-        not in {None, "source_identity_too_long", "missing_size", "file_too_large"}
+        or discovered.skip_reason not in {None, *_SAFE_UNINDEXABLE_REASONS}
     ):
         raise InvalidGitHubStagedSynchronizationRequest("discovered GitHub descriptor is invalid")
     expected_reason = None
-    if len(_source_identity(entry.repository_id, entry.path)) > MAX_SOURCE_IDENTITY_CHARACTERS:
-        expected_reason = "source_identity_too_long"
+    if entry.entry_type != "regular_blob":
+        expected_reason = "unsupported_object_type"
+    elif PurePosixPath(entry.path).suffix.casefold() not in SUPPORTED_CONTENT_EXTENSIONS:
+        expected_reason = "unsupported_format"
     elif entry.size_bytes is None:
-        expected_reason = "missing_size"
+        raise InvalidGitHubStagedSynchronizationRequest(
+            "discovered GitHub descriptor is invalid"
+        )
     elif entry.size_bytes > MAX_GITHUB_BLOB_BYTES:
-        expected_reason = "file_too_large"
+        expected_reason = "oversized"
     if discovered.skip_reason != expected_reason:
         raise InvalidGitHubStagedSynchronizationRequest("discovered GitHub eligibility is invalid")
 
@@ -1449,6 +2132,66 @@ def _sha256(value):
     ):
         raise InvalidGitHubStagedSynchronizationRequest("prepared GitHub checksum is invalid")
     return value
+
+
+def _authorization_fingerprint(authorization):
+    if not isinstance(authorization, GitHubRepositoryContentAuthorization):
+        raise InvalidGitHubStagedSynchronizationRequest(
+            "GitHub authorization binding is invalid"
+        )
+    value = {
+        "organization_id": str(authorization.organization_id),
+        "connector_id": str(authorization.connector_id),
+        "scope_id": str(authorization.scope_id),
+        "knowledge_space_id": str(authorization.knowledge_space_id),
+        "credential_id": str(authorization.credential_id),
+        "installation_id": authorization.installation_id,
+        "app_id": authorization.app_id,
+        "account_id": authorization.account_id,
+        "account_login": authorization.account_login,
+        "repository_id": authorization.repository_id,
+        "repository_name": authorization.repository_name,
+        "repository_full_name": authorization.repository_full_name,
+        "owner_login": authorization.owner_login,
+        "canonical_repository_identity": authorization.canonical_repository_identity,
+        "default_branch_name": authorization.default_branch_name,
+    }
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _snapshot_fingerprint(snapshot):
+    value = {
+        "connector_id": str(snapshot.connector_id),
+        "scope_id": str(snapshot.scope_id),
+        "repository_id": snapshot.repository_id,
+        "canonical_repository_identity": snapshot.canonical_repository_identity,
+        "default_branch_name": snapshot.default_branch_name,
+    }
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _require_aware_datetime(name, value):
+    if (
+        not isinstance(value, datetime)
+        or value.tzinfo is None
+        or value.utcoffset() is None
+    ):
+        raise InvalidGitHubStagedSynchronizationRequest(f"GitHub {name} is invalid")
+    return value
+
+
+def _require_persistence_time(snapshot, now):
+    _require_aware_datetime("persistence time", now)
+    _require_aware_datetime("run start", snapshot.run_started_at)
+    if now < snapshot.run_started_at:
+        raise InvalidGitHubStagedSynchronizationRequest(
+            "GitHub persistence time precedes the run"
+        )
+    return now
 
 
 def _repository_path(value, *, allow_empty):

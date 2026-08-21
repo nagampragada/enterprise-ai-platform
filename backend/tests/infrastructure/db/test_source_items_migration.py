@@ -230,7 +230,7 @@ def test_schema_matches_models_candidate_keys_and_indexes(engine):
     }
     expected_indexes = {
         "source_items": {"ix_source_items_org_connector_status", "ix_source_items_org_connector_type", "ix_source_items_org_connector_seen"},
-        "source_item_scope_memberships": {"ix_source_scope_memberships_org_scope_status", "ix_source_scope_memberships_org_item_status"},
+        "source_item_scope_memberships": {"ix_source_scope_memberships_org_scope_status", "ix_source_scope_memberships_org_item_status", "ix_source_scope_memberships_reconciliation"},
     }
     nullable_columns = {
         "source_items": {"parent_source_item_key", "source_url", "mime_type", "source_checksum", "source_version", "size_bytes", "source_created_at", "source_modified_at", "deleted_at"},
@@ -264,6 +264,40 @@ def test_schema_matches_models_candidate_keys_and_indexes(engine):
     assert source_columns["metadata"]["default"] is not None
     assert source_columns["metadata_schema_version"]["default"] is not None
     assert not {"sync_run_id", "document_id", "acl", "permissions"}.intersection(source_columns)
+    with engine.connect() as connection:
+        index_definition = connection.execute(
+            text(
+                "SELECT indexdef FROM pg_indexes "
+                "WHERE schemaname = 'public' AND tablename = 'source_item_scope_memberships' "
+                "AND indexname = 'ix_source_scope_memberships_reconciliation'"
+            )
+        ).scalar_one()
+    normalized_index = " ".join(index_definition.lower().split())
+    assert "(organization_id, connector_id, connector_scope_id, last_seen_at, id)" in normalized_index
+    assert "where" in normalized_index
+    assert "status" in normalized_index and "= 'active'::text" in normalized_index
+    assert "removed_at is null" in normalized_index
+
+
+def test_reconciliation_keyset_plan_uses_the_partial_ordering_index(engine):
+    with engine.connect() as connection:
+        connection.execute(text("SET LOCAL enable_seqscan = off"))
+        plan = connection.execute(
+            text(
+                "EXPLAIN (COSTS OFF) SELECT id FROM source_item_scope_memberships "
+                "WHERE organization_id = :org AND connector_id = :connector "
+                "AND connector_scope_id = :scope AND status = 'active' "
+                "AND removed_at IS NULL AND last_seen_at < :cutoff "
+                "ORDER BY last_seen_at, id LIMIT 100"
+            ),
+            {
+                "org": uuid.uuid4(),
+                "connector": uuid.uuid4(),
+                "scope": uuid.uuid4(),
+                "cutoff": datetime.now(timezone.utc),
+            },
+        ).scalars().all()
+    assert "ix_source_scope_memberships_reconciliation" in "\n".join(plan)
 
 
 def test_canonical_identity_is_connector_wide_case_sensitive(engine):

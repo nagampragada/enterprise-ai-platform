@@ -21,6 +21,7 @@ from application.services.github_repository_content_service import (
     GitHubRepositoryContentConflict,
     GitHubRepositoryContentNotFound,
     GitHubRepositoryContentRejected,
+    GitHubRepositoryContentUnsupported,
     GitHubRepositoryContentService,
     GitHubRepositorySnapshot,
     MAX_GITHUB_TREE_ENTRIES,
@@ -162,7 +163,14 @@ def test_authorize_copies_only_validated_active_tenant_scope_identifiers():
     value, _, auth = configured_authorization_service()
     result = value.authorize(auth.organization_id, auth.connector_id, auth.scope_id)
     assert result == auth
-    assert "fake-org" not in repr(result) and "77" not in repr(result)
+    rendered = repr(result)
+    assert rendered.startswith(
+        "<application.services.github_repository_content_service."
+        "GitHubRepositoryContentAuthorization object at 0x"
+    )
+    assert rendered.endswith(">")
+    assert "fake-org" not in rendered
+    assert "installation_id" not in rendered and "account_login" not in rendered
     value._scopes.get_by_id.assert_called_once_with(auth.organization_id, auth.scope_id)
 
 
@@ -251,7 +259,7 @@ def test_snapshot_rejects_repeated_movement_and_mixed_commit_tree():
         value.resolve_default_branch_snapshot(authorization())
 
 
-def test_tree_is_non_recursive_ordered_and_skips_symlink_and_submodule():
+def test_tree_is_non_recursive_ordered_and_classifies_symlink_and_submodule():
     auth = authorization()
     client = Client()
     client.tree = GitHubGitTree(TREE_1, (
@@ -263,7 +271,14 @@ def test_tree_is_non_recursive_ordered_and_skips_symlink_and_submodule():
     ), False)
     value, _ = service(client)
     page = value.list_tree(auth, snapshot(auth), snapshot(auth).root_tree())
-    assert [entry.name for entry in page.entries] == ["folder", "readme.md", "run.txt"]
+    assert [entry.name for entry in page.entries] == [
+        "folder",
+        "readme.md",
+        "run.txt",
+        "link",
+        "module",
+    ]
+    assert [entry.entry_type for entry in page.entries[-2:]] == ["symlink", "submodule"]
     assert page.entries[0].entry_type == "tree"
     assert page.entries[2].executable is True
     assert client.tree_calls[0]["tree_object_id"] == TREE_1
@@ -349,8 +364,9 @@ def test_blob_rejects_unsupported_policy_size_mismatch_lfs_and_context_mismatch(
     client = Client()
     client.raw = GitHubRawBlob(pointer, len(pointer), hashlib.sha256(pointer).hexdigest())
     value, _ = service(client)
-    with pytest.raises(GitHubRepositoryContentRejected, match="LFS"):
+    with pytest.raises(GitHubRepositoryContentUnsupported) as failure:
         value.download_blob(auth, snapshot(auth), blob_entry(auth, size=len(pointer)))
+    assert failure.value.classification == "git_lfs_unsupported"
     other = snapshot(auth)
     object.__setattr__(other, "commit_object_id", COMMIT_2)
     with pytest.raises(GitHubRepositoryContentRejected, match="descriptor"):

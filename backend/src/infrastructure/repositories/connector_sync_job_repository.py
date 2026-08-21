@@ -419,14 +419,16 @@ class ConnectorSyncJobRepository:
                 *_ownership_predicates(lease, worker_id, now),
                 ConnectorSyncRun.id == sync_run_id,
                 ConnectorSyncRun.status == "running",
+                ConnectorSyncJob.cancel_requested_at.is_(None),
             )
+            .with_for_update(of=ConnectorSyncJob)
         )
         try:
             row = self._session.execute(statement).one_or_none()
         except SQLAlchemyError as exc:
             raise SyncJobPersistenceError("synchronization attempt could not be validated") from exc
         if row is None:
-            self._raise_lost_lease(lease, worker_id)
+            self._raise_lost_lease(lease, worker_id, cancellation=True)
         job, run_id = row
         return SyncJobAttemptState(
             job.organization_id,

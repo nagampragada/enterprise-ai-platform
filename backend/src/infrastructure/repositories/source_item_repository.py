@@ -6,7 +6,13 @@ from uuid import UUID
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
-from infrastructure.db.models import SourceItem, SourceItemScopeMembership
+from infrastructure.db.models import (
+    Document,
+    DocumentVersion,
+    DocumentVersionDocument,
+    SourceItem,
+    SourceItemScopeMembership,
+)
 from infrastructure.repositories.connector_repository import (
     ConnectorRepositoryConflict, ConnectorRepositoryPersistenceError,
     InvalidConnectorRepositoryRequest, _require_aware, _require_choice,
@@ -14,6 +20,7 @@ from infrastructure.repositories.connector_repository import (
 )
 
 MAX_SOURCE_ITEM_PAGE_LIMIT = 100
+MAX_MEMBERSHIP_RECONCILIATION_PAGE_LIMIT = 500
 SOURCE_STATUSES = frozenset({"active", "deleted", "unavailable"})
 MEMBERSHIP_STATUSES = frozenset({"active", "removed"})
 
@@ -106,6 +113,110 @@ class SourceItemRepository:
         statement = select(SourceItemScopeMembership).where(SourceItemScopeMembership.organization_id == organization_id, SourceItemScopeMembership.connector_id == connector_id, SourceItemScopeMembership.connector_scope_id == scope_id, SourceItemScopeMembership.status == "active", SourceItemScopeMembership.last_seen_at < cutoff)
         if cursor is not None: statement = statement.where(or_(SourceItemScopeMembership.last_seen_at > cursor.last_seen_at, and_(SourceItemScopeMembership.last_seen_at == cursor.last_seen_at, SourceItemScopeMembership.id > cursor.membership_id)))
         rows = self._all(statement.order_by(SourceItemScopeMembership.last_seen_at, SourceItemScopeMembership.id).limit(limit + 1)); items = tuple(rows[:limit]); more = len(rows) > limit; next_cursor = MembershipReconciliationCursor(items[-1].last_seen_at, items[-1].id) if more and items else None; return MembershipReconciliationPage(items, limit, more, next_cursor)
+
+    def list_active_github_memberships_before(
+        self,
+        organization_id: UUID,
+        connector_id: UUID,
+        scope_id: UUID,
+        repository_id: int,
+        cutoff: datetime,
+        *,
+        limit: int = 100,
+        cursor: MembershipReconciliationCursor | None = None,
+    ) -> MembershipReconciliationPage:
+        """Page stale GitHub memberships inside one exact repository scope."""
+        _require_uuid("organization_id", organization_id)
+        _require_uuid("connector_id", connector_id)
+        _require_uuid("scope_id", scope_id)
+        _require_aware("cutoff", cutoff)
+        if (
+            isinstance(repository_id, bool)
+            or not isinstance(repository_id, int)
+            or repository_id < 1
+        ):
+            raise InvalidConnectorRepositoryRequest("repository_id must be positive")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_MEMBERSHIP_RECONCILIATION_PAGE_LIMIT:
+            raise InvalidConnectorRepositoryRequest(
+                f"limit must be between 1 and {MAX_MEMBERSHIP_RECONCILIATION_PAGE_LIMIT}"
+            )
+        _validate_membership_cursor(cursor)
+        prefix = f"github:repository:{repository_id}:path:"
+        statement = (
+            select(SourceItemScopeMembership)
+            .join(
+                SourceItem,
+                and_(
+                    SourceItem.organization_id == SourceItemScopeMembership.organization_id,
+                    SourceItem.connector_id == SourceItemScopeMembership.connector_id,
+                    SourceItem.id == SourceItemScopeMembership.source_item_id,
+                ),
+            )
+            .join(
+                DocumentVersion,
+                and_(
+                    DocumentVersion.organization_id == SourceItem.organization_id,
+                    DocumentVersion.source_item_id == SourceItem.id,
+                    DocumentVersion.is_current.is_(True),
+                    DocumentVersion.lifecycle == "available",
+                ),
+            )
+            .join(
+                DocumentVersionDocument,
+                and_(
+                    DocumentVersionDocument.organization_id == DocumentVersion.organization_id,
+                    DocumentVersionDocument.document_version_id == DocumentVersion.id,
+                ),
+            )
+            .join(
+                Document,
+                and_(
+                    Document.organization_id == DocumentVersionDocument.organization_id,
+                    Document.id == DocumentVersionDocument.document_id,
+                    Document.deleted_at.is_(None),
+                ),
+            )
+            .where(
+                SourceItemScopeMembership.organization_id == organization_id,
+                SourceItemScopeMembership.connector_id == connector_id,
+                SourceItemScopeMembership.connector_scope_id == scope_id,
+                SourceItemScopeMembership.status == "active",
+                SourceItemScopeMembership.removed_at.is_(None),
+                SourceItemScopeMembership.last_seen_at < cutoff,
+                SourceItem.organization_id == organization_id,
+                SourceItem.connector_id == connector_id,
+                SourceItem.source_item_type == "file",
+                SourceItem.status.in_(("active", "unavailable")),
+                SourceItem.last_seen_at < cutoff,
+                SourceItem.source_item_key.startswith(prefix),
+                SourceItem.source_metadata["provider"].astext == "github",
+                SourceItem.source_metadata["repository_id"].astext == str(repository_id),
+            )
+        )
+        if cursor is not None:
+            statement = statement.where(
+                or_(
+                    SourceItemScopeMembership.last_seen_at > cursor.last_seen_at,
+                    and_(
+                        SourceItemScopeMembership.last_seen_at == cursor.last_seen_at,
+                        SourceItemScopeMembership.id > cursor.membership_id,
+                    ),
+                )
+            )
+        rows = self._all(
+            statement.order_by(
+                SourceItemScopeMembership.last_seen_at,
+                SourceItemScopeMembership.id,
+            ).limit(limit + 1)
+        )
+        items = tuple(rows[:limit])
+        has_more = len(rows) > limit
+        next_cursor = (
+            MembershipReconciliationCursor(items[-1].last_seen_at, items[-1].id)
+            if has_more and items
+            else None
+        )
+        return MembershipReconciliationPage(items, limit, has_more, next_cursor)
 
     def has_active_membership(self, organization_id: UUID, connector_id: UUID, source_item_id: UUID) -> bool:
         _require_uuid("organization_id", organization_id); _require_uuid("connector_id", connector_id); _require_uuid("source_item_id", source_item_id)

@@ -892,6 +892,11 @@ class SourceItemScopeMembership(Base):
             "ix_source_scope_memberships_org_item_status",
             "organization_id", "source_item_id", "status",
         ),
+        Index(
+            "ix_source_scope_memberships_reconciliation",
+            "organization_id", "connector_id", "connector_scope_id", "last_seen_at", "id",
+            postgresql_where=text("status = 'active' AND removed_at IS NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

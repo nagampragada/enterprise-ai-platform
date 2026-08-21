@@ -8,7 +8,7 @@
 | Snapshot branch | `main` |
 | Snapshot commit | `6352fa2c09cf09bddd6428d04c67cd88caee6460` (clean implementation baseline) |
 | Snapshot date | 2026-08-21 |
-| Alembic head | `20260827_000018` |
+| Alembic head | `20260828_000019` |
 | Purpose | Authoritative, code-evidenced inventory of implemented, exposed, partial, planned, deferred, and excluded capabilities |
 | Audiences | Product owners, backend/data/security/connector/operations/UI/QA engineers, and future repository agents |
 
@@ -27,7 +27,7 @@ This document treats executable code, migrations, runtime route registration, an
 
 The repository is building a multi-tenant enterprise knowledge platform. Organizations will eventually configure controlled data connectors, ingest and index documents, retrieve only content a user is authorized to see, and use a future answer/agent layer to produce grounded responses with citations.
 
-Operationally today, the FastAPI backend supports authentication and authenticated manual upload of TXT, Markdown, DOCX, and PDF files through a fully tested extraction, deterministic chunking, embedding, and PostgreSQL/pgvector persistence pipeline. The backend also contains secure Local Folder connector-management APIs, recurring interval schedules, a database-only scheduler host, a complete synchronization engine, durable job control, a continuous and one-shot worker host, immutable source versioning, and a permission-aware vector retrieval repository. GitHub is the first cloud connector: organization administrators can complete its GitHub App installation lifecycle, discover a bounded live repository page, and persist explicit repository-to-knowledge-space selections after authoritative restricted-token revalidation. An internal staged service now pins an immutable snapshot, traverses non-recursive trees with a durable DFS cursor, skips unchanged content before download, and atomically creates or updates source/document/version/index/chunk state under existing lease fencing. It has no public API and is not yet routed through the production worker host. A production Google Cloud Secret Manager adapter supplies immutable GitHub configuration references, ephemeral PKCE storage, and on-demand private-key access through ADC-based, fail-closed composition. No GCP resource or Cloud Run deployment has been provisioned. GitHub deletion reconciliation and worker routing are not implemented. Retrieval is not exposed by an API.
+Operationally today, the FastAPI backend supports authentication and authenticated manual upload of TXT, Markdown, DOCX, and PDF files through a fully tested extraction, deterministic chunking, embedding, and PostgreSQL/pgvector persistence pipeline. The backend also contains secure Local Folder connector-management APIs, recurring interval schedules, a database-only scheduler host, a complete synchronization engine, durable job control, a continuous and one-shot worker host, immutable source versioning, and a permission-aware vector retrieval repository. GitHub is the first cloud connector: organization administrators can complete its GitHub App installation lifecycle, discover a bounded live repository page, and persist explicit repository-to-knowledge-space selections after authoritative restricted-token revalidation. An internal staged service pins an immutable snapshot, traverses non-recursive trees with a durable DFS cursor, skips unchanged content before download, safely retires present-but-unindexable content, and enters bounded resumable reconciliation only after authoritative traversal. It applies rename as create-plus-delete and preserves immutable history while removing stale content from retrieval. It has no public API and is not yet routed through the production worker host. A production Google Cloud Secret Manager adapter supplies immutable GitHub configuration references, ephemeral PKCE storage, and on-demand private-key access through ADC-based, fail-closed composition. No GCP resource or Cloud Run deployment has been provisioned. GitHub worker routing and heartbeat orchestration are not implemented. Retrieval is not exposed by an API.
 
 The product is therefore a **tested backend foundation and vertical-slice implementation, not a finished user-facing product**. Its strongest capability is the tenant-safe scheduled content ingestion/synchronization/indexing data plane with bounded leases, fencing, retries, rollback, continuous Local Folder execution, and authorization-before-ranking retrieval. Its primary gaps are cron/timezone scheduling, broader connector lifecycle operations, search APIs, answer generation, deployment supervision, and a frontend.
 
@@ -123,7 +123,7 @@ Evidence: `backend/pyproject.toml`, `infra/docker/docker-compose.postgres.yml`, 
 
 ## 6. Database architecture
 
-SQLAlchemy metadata contains **42 live tables**. Alembic head is `20260827_000018`; migrations are forward-ordered, tested against real PostgreSQL, and generally provide narrow downgrades. The pgvector extension downgrade is intentionally conservative because extensions can be shared infrastructure.
+SQLAlchemy metadata contains **42 live tables**. Alembic head is `20260828_000019`; migrations are forward-ordered, tested against real PostgreSQL, and generally provide narrow downgrades. The pgvector extension downgrade is intentionally conservative because extensions can be shared infrastructure.
 
 ### Organizations, users, authentication, and structure
 
@@ -350,7 +350,7 @@ Operational connector implementation:
 | Connector type | Status |
 |---|---|
 | `local_folder` | Complete backend connector, synchronization service, execution control, bounded runner |
-| GitHub | Verified App installation, live discovery, tenant-safe selection, and internal immutable snapshot/tree/bounded-blob reader implemented; content sync not operational |
+| GitHub | Verified App installation, live discovery, tenant-safe selection, bounded content reading, and internal staged create/update/retirement/reconciliation implemented; not production-worker-routed |
 | Google Drive | Placeholder directory only; follows GitHub |
 | SharePoint | Placeholder directory only; not operational |
 | PostgreSQL connector | Placeholder directory only; not operational |
@@ -395,7 +395,7 @@ GET returns only a bounded deterministic page of persisted safe selections and n
 
 ### Internal GitHub content identity and bounded download
 
-`GitHubRepositoryContentService` stages a tenant-qualified active connector/scope/credential/installation read before provider access and requires the caller to end that transaction. Every operation creates one exact-repository installation token with only Metadata and Contents read. Snapshot resolution accepts only the persisted default branch, supports canonical lowercase 40- and 64-character Git object IDs, rechecks branch movement, and returns immutable commit/root-tree identity. Tree listing performs exactly one non-recursive Git Trees request, is capped by the existing 1 MiB raw response guard and a 1,000-entry platform limit, preserves order, validates paths and normalization/case-fold collisions, and excludes symlinks/submodules. Blob download accepts only a context-matching regular-file descriptor for the existing `.pdf/.docx/.txt/.md/.markdown` pipeline, rejects redirects and Git LFS pointers, streams at most 10 MiB, verifies declared/actual size, and computes platform SHA-256 over exact bytes in memory.
+`GitHubRepositoryContentService` stages a tenant-qualified active connector/scope/credential/installation read before provider access and requires the caller to end that transaction. Every operation creates one exact-repository installation token with only Metadata and Contents read. Snapshot resolution accepts only the persisted default branch, supports canonical lowercase 40- and 64-character Git object IDs, rechecks branch movement, and returns immutable commit/root-tree identity. Tree listing performs exactly one non-recursive Git Trees request, is capped by the existing 1 MiB raw response guard and a 1,000-entry platform limit, preserves order, validates paths and normalization/case-fold collisions, and returns symlink/submodule descriptors only so traversal can record them as present and unindexable. Blob download accepts only a context-matching regular-file descriptor for the existing `.pdf/.docx/.txt/.md/.markdown` pipeline, rejects redirects and classifies Git LFS pointers, streams at most 10 MiB, verifies declared/actual size, and computes platform SHA-256 over exact bytes in memory.
 
 This low-level capability is backend-internal and OpenAPI is unchanged. The staged synchronization layer now uses it for bounded iterative DFS, fixed-format extraction, embedding, and source/document/version/chunk/index persistence. There is still no recursive Git Trees request, browser-controlled branch/ref, webhook, ACL sync, clone, archive, raw-content metadata, or provider-token persistence.
 
@@ -403,9 +403,9 @@ This low-level capability is backend-internal and OpenAPI is unchanged. The stag
 
 `GitHubStagedSynchronizationService` reuses existing durable jobs, runs, items, cursors, immutable versions, materializations, indexing states/attempts, documents, pgvector chunks, and full lease owner/UUID/fencing validation. `GitHubSynchronizationPreparationService` performs immutable-snapshot resolution, iterative DFS tree reads, exact-blob download, extraction, deterministic chunking, and bounded provider-batch embedding only after the database transaction has ended. Frozen redacted DTOs cross those boundaries.
 
-Cursor schema version 1 pins repository/default-branch/commit/root-tree identity and stores at most 64 DFS frames plus cumulative budgets and completion. It uses a fixed allowlist and 96 KiB cap. Per-continuation hard bounds are 25 tree calls, 1,000 entries, 10 supported files, 25 MiB, and 500 chunks/embedding inputs; per-run bounds are 100,000 entries, 10,000 supported files, 10 GiB, and 500,000 chunks. One file remains capped at 10 MiB. Extension matching is case-insensitive for `.pdf`, `.docx`, `.txt`, `.md`, and `.markdown` only.
+Cursor schema version 2 pins repository/default-branch/commit/root-tree identity plus an authorization fingerprint and scan generation. It stores explicit traversal/reconciliation/complete phase, at most 64 DFS frames, cumulative budgets, authoritative traversal completion, bounded reconciliation keyset/item/batch counters, and final completion. It uses a fixed allowlist and 96 KiB cap, rejects phase/keyset/counter regression, and fails closed on incompatible state. Per-continuation hard bounds are 25 tree calls, 1,000 entries, 10 observed files, 25 MiB, and 500 chunks/embedding inputs; per-run traversal bounds are 100,000 entries, 10,000 observed files, 10 GiB, and 500,000 chunks. One file remains capped at 10 MiB. Reconciliation defaults to 100 items, caps one page at 500, and has 100,000-item and 30-minute run limits.
 
-Stable identity is `github:repository:{repository_id}:path:{exact_path}` and provider revision is the Git blob ID. Matching source/version blob IDs plus a complete current indexing profile skip blob download and all extraction/embedding cost. A short write transaction revalidates the lease/fence and current connector/scope/credential/installation/knowledge-space binding, then atomically persists the batch and cursor. Completion never treats the scan as deletion authority. Staged synchronization is backend-complete for creates and updates; incremental synchronization remains false until deletion reconciliation. Production GitHub job claiming/routing, independent heartbeat orchestration, deletion/rename reconciliation, APIs, ACLs, and webhooks remain absent.
+Stable identity is `github:repository:{repository_id}:path:{exact_path}` and provider revision is the Git blob ID. Matching source/version blob IDs plus a complete current indexing profile skip blob download and all extraction/embedding cost. A short caller-owned write transaction locks and revalidates lease owner/UUID/fence/attempt/expiry/cancellation, durable run start, current connector/scope/credential/installation/knowledge-space binding, and cursor authority before atomically persisting retirement/counters/cursor. Only a genuine terminal traversal enters deletion authority, and reconciliation makes no provider, SecretStore, extraction, chunking, or embedding calls. Exact-scope indexed keyset reconciliation rechecks freshness under lock, removes unseen membership, writes deleted tombstones, and soft-retires documents without deleting versions, materialization links, indexing attempts, or chunks. Permission-aware retrieval excludes retired state after commit; another active membership preserves access, and explicit reactivation safely restores the same source/document identity through a new available version. Equal blob hashes never imply rename: a distinct new path is created and the unseen old path is retired; rename lineage remains future work. Present unsupported/oversized/object-type/LFS paths use fixed unavailable classifications rather than provider deletion. Production GitHub job claiming/routing, independent heartbeat orchestration, public sync/status APIs, ACL synchronization, and webhooks remain absent.
 
 ### GitHub App operator configuration
 
@@ -416,7 +416,7 @@ Stable identity is `github:repository:{repository_id}:path:{exact_path}` and pro
 - Provision the App private key and OAuth client secret in Google Secret Manager using the safe process in `docs/GCP_SECRET_MANAGER.md`. The application receives only canonical numeric-version references through `GITHUB_APP_PRIVATE_KEY_REFERENCE` and `GITHUB_APP_CLIENT_SECRET_REFERENCE`.
 - Configure the App ID, distinct client ID, App slug, exact HTTPS setup/callback URLs, explicitly trusted GitHub API/web base origins, and bounded timeout/retry settings. Do not enable automatic OAuth-on-install for this explicit setup sequence.
 - User authorization and installation tokens are temporary, minted only on demand, and discarded without persistence.
-- Leave webhooks disabled/not configured. Content retrieval, synchronization, ACLs, version history, deletions, folders, and webhooks are not operational.
+- Leave webhooks disabled/not configured. Internal bounded content reading and staged create/update/retirement logic are implemented, but production GitHub worker routing, independent heartbeat orchestration, public sync/status operations, ACL synchronization, branch history, folders, and webhooks are not operational.
 
 ## 14. Local Folder connector
 
@@ -804,7 +804,7 @@ Required command executed at this snapshot:
 python -m pytest --import-mode=importlib -q
 ```
 
-Result: **1258 passed, 1 skipped, 55 warnings; exit code 0**.
+Result: **1280 passed, 1 skipped, 55 warnings; exit code 0**.
 
 Coverage categories include pure domain/unit tests, API tests, real PostgreSQL repositories, migration downgrade/re-upgrade tests, filesystem/extractor integration, deterministic fake embeddings, concurrent enqueue/acquisition/recovery/version allocation, rollback/pre-commit failure, tenant isolation, ACL authorization, permission-aware retrieval, query-plan/index availability, worker session cleanup, GitHub setup/callback concurrency and rollback, GitHub discovery/selection/content-reader tenant and transaction isolation, branch-movement and commit/tree consistency, hostile tree/path/blob payloads, bounded raw streaming and response sizes, request-scoped exact-permission tokens, retry/rate-limit bounds, and Google Secret Manager parser/integrity/retry/cleanup/composition attacks. GitHub and Google tests use injected deterministic fakes and make no live provider calls.
 
@@ -828,7 +828,7 @@ Known output at snapshot:
 | Local PostgreSQL | Docker Compose uses `pgvector/pgvector:pg16`, localhost port, health check, named volume; development credentials only |
 | pgvector | Extension migration and vector column complete |
 | Local configuration | Environment-driven database/JWT/OpenAI settings; no secrets are documented here |
-| Migrations | 18 revisions, head `20260827_000018`, real PostgreSQL lifecycle tests |
+| Migrations | 19 revisions, head `20260828_000019`, real PostgreSQL lifecycle tests |
 | Worker runner | Bounded staged callable class implemented |
 | Continuous worker host | Direct module with continuous and one-shot modes implemented |
 | Scheduler/automatic recovery | Continuous/one-shot interval scheduler and worker expired recovery implemented |
@@ -883,7 +883,7 @@ Never display or request: password hashes, refresh-token hashes, connector secre
 | LangGraph, LangChain, LangSmith | Not dependencies; not used |
 | Tool calling and MCP server/tools | Not implemented |
 | Google Drive connector | Placeholder only |
-| GitHub content sync/webhooks/ACL sync | Internal bounded staged create/update persistence exists; deletion reconciliation, production worker routing, webhooks, and ACL sync remain future work |
+| GitHub content sync/webhooks/ACL sync | Internal bounded staged create/update/unindexable/deletion reconciliation exists; production worker routing, webhooks, and ACL sync remain future work |
 | SharePoint/OneDrive connector | Placeholder/contract vocabulary only |
 | Slack/Teams connectors | Not implemented (Teams structure is organizational data, not Microsoft Teams connector) |
 | PostgreSQL/SQL Server connectors | Placeholder directories only |
@@ -911,7 +911,7 @@ The current architecture supports this order because the data plane is stronger 
 | 7 | Search service and API | Server-side query embedding + existing authorized repository | GPT-5.6 Sol, high | Provider credentials and result contract |
 | 8 | Grounded answers/citations | Answer generation, citation evidence, refusal/guardrails | GPT-5.6 Sol, high | Model/provider, safety, prompt policy decisions |
 | 9 | GitHub repository selection | Completed: tenant-safe explicit repository scope with restricted-token proof | GPT-5.6 Sol, high | Operational GitHub/GCP setup required |
-| 10 | GitHub staged read-only synchronization | Internal create/update persistence complete; next add deletion reconciliation and production worker routing | GPT-5.6 Sol, high | GitHub App permission review required |
+| 10 | GitHub staged read-only synchronization | Internal create/update/deletion reconciliation complete; next add production worker routing and heartbeat orchestration | GPT-5.6 Sol, high | GitHub App permission review required |
 | 11 | Google Drive + OAuth + ACL sync | Follows GitHub; provider adapter, secrets, directory/ACL generation, tests | GPT-5.6 Sol, high | Google credentials/admin consent required |
 | 12 | SharePoint/OneDrive connector | Microsoft OAuth, sites/drives, groups/ACLs | GPT-5.6 Sol, high | Microsoft tenant consent/credentials required |
 | 13 | Usage metering, budgets, circuit breakers | Tenant usage persistence and fail-safe provider controls | GPT-5.6 Sol, high | Pricing/budget policies required |

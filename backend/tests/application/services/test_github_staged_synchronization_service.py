@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, replace
+from datetime import datetime, timedelta, timezone
 import hashlib
+from types import SimpleNamespace
 from unittest.mock import Mock
 from uuid import uuid4
 
@@ -17,7 +19,10 @@ from application.services.github_repository_content_service import (
 )
 from application.services.github_staged_synchronization_service import (
     CURSOR_SCHEMA_VERSION,
+    HARD_MAX_RECONCILIATION_BATCH_SIZE,
     MAX_CURSOR_BYTES,
+    MAX_RECONCILIATION_SECONDS,
+    MAX_RUN_RECONCILIATION_ITEMS,
     GitHubDiscoveredFile,
     GitHubDiscoveryBatch,
     GitHubItemSnapshot,
@@ -37,9 +42,14 @@ from application.services.github_staged_synchronization_service import (
 from application.services.connector_sync_retry_policy import SyncFailureKind
 from application.services.github_repository_content_service import (
     GitHubRepositoryContentRejected,
+    GitHubRepositoryContentUnsupported,
     GitHubRepositoryContentUnavailable,
 )
 from infrastructure.repositories.connector_sync_job_repository import StaleSyncJobFence
+from infrastructure.repositories.source_item_repository import (
+    MembershipReconciliationCursor,
+    MembershipReconciliationPage,
+)
 from application.services.local_document_indexing_service import LocalDocumentIndexingProfile
 from domain.content_chunking.models import ChunkResult
 from domain.content_extraction.models import ExtractedContent
@@ -70,6 +80,34 @@ def _snapshot(authorization=None):
         authorization.default_branch_name,
         OBJECT,
         ROOT,
+    )
+
+
+def _cursor(authorization, snapshot=None):
+    return GitHubTraversalCursor.initial(
+        snapshot or _snapshot(authorization), authorization
+    )
+
+
+def _reconciliation_cursor(authorization, *, started_at=None, **changes):
+    value = _cursor(authorization)
+    return replace(
+        value,
+        frames=(),
+        scan_complete=True,
+        phase="reconciliation",
+        authoritative_traversal_complete=True,
+        reconciliation_started_at=started_at
+        or datetime(2026, 8, 21, tzinfo=timezone.utc),
+        **changes,
+    )
+
+
+def _lease(authorization):
+    return SimpleNamespace(
+        organization_id=authorization.organization_id,
+        connector_id=authorization.connector_id,
+        connector_scope_id=authorization.scope_id,
     )
 
 
@@ -119,7 +157,7 @@ def _item_snapshot(*, blob=None, complete=False, status=None, run_blob=None):
 
 def test_cursor_is_immutable_round_trips_and_contains_only_allowlisted_safe_state():
     authorization = _authorization()
-    cursor = GitHubTraversalCursor.initial(_snapshot(authorization))
+    cursor = _cursor(authorization)
     encoded = cursor.to_safe_json()
     assert encoded["schema_version"] == CURSOR_SCHEMA_VERSION
     assert "token" not in repr(encoded).lower()
@@ -144,7 +182,7 @@ def test_cursor_is_immutable_round_trips_and_contains_only_allowlisted_safe_stat
 )
 def test_corrupted_cursor_is_rejected(mutation, error):
     authorization = _authorization()
-    value = GitHubTraversalCursor.initial(_snapshot(authorization)).to_safe_json()
+    value = _cursor(authorization).to_safe_json()
     mutation(value)
     with pytest.raises(InvalidGitHubStagedSynchronizationRequest, match=error):
         GitHubTraversalCursor.from_safe_json(
@@ -156,7 +194,7 @@ def test_corrupted_cursor_is_rejected(mutation, error):
 
 def test_oversized_cursor_is_rejected_before_deserialization():
     authorization = _authorization()
-    value = GitHubTraversalCursor.initial(_snapshot(authorization)).to_safe_json()
+    value = _cursor(authorization).to_safe_json()
     value["padding"] = "x" * MAX_CURSOR_BYTES
     with pytest.raises(InvalidGitHubStagedSynchronizationRequest, match="too large"):
         GitHubTraversalCursor.from_safe_json(
@@ -166,7 +204,7 @@ def test_oversized_cursor_is_rejected_before_deserialization():
         )
 
 
-def test_nonrecursive_dfs_skips_unsupported_and_resumes_from_exact_pinned_tree():
+def test_nonrecursive_dfs_classifies_unsupported_and_resumes_from_exact_pinned_tree():
     authorization = _authorization()
     snapshot = _snapshot(authorization)
     content = Mock()
@@ -185,10 +223,11 @@ def test_nonrecursive_dfs_skips_unsupported_and_resumes_from_exact_pinned_tree()
     service, *_ = _preparation(content)
     first = service.discover_batch(
         authorization,
-        GitHubTraversalCursor.initial(snapshot),
-        limits=GitHubSynchronizationLimits(max_files=1),
+        _cursor(authorization, snapshot),
+        limits=GitHubSynchronizationLimits(max_files=2),
     )
-    assert [item.entry.path for item in first.files] == ["docs/readme.md"]
+    assert [item.entry.path for item in first.files] == ["ignore.py", "docs/readme.md"]
+    assert first.files[0].skip_reason == "unsupported_format"
     assert first.tree_requests == 2
     assert first.cursor_after.snapshot.commit_object_id == OBJECT
     second = service.discover_batch(
@@ -212,10 +251,10 @@ def test_entry_and_tree_request_limits_return_resumable_progress_without_looping
     service, *_ = _preparation(content)
     batch = service.discover_batch(
         authorization,
-        GitHubTraversalCursor.initial(snapshot),
+            _cursor(authorization, snapshot),
         limits=GitHubSynchronizationLimits(max_entries=2, max_tree_requests=1),
     )
-    assert not batch.files and batch.entries_examined == 2 and batch.tree_requests == 1
+    assert len(batch.files) == 2 and batch.entries_examined == 2 and batch.tree_requests == 1
     assert batch.cursor_after.frames[0].next_entry_index == 2
     assert content.list_tree.call_count == 1
 
@@ -228,12 +267,11 @@ def test_depth_and_total_run_budgets_fail_safely_and_finitely():
         for index in range(65)
     )
     with pytest.raises(InvalidGitHubStagedSynchronizationRequest, match="depth"):
-        GitHubTraversalCursor(snapshot, frames, GitHubRunBudget())
+        replace(_cursor(authorization, snapshot), frames=frames)
     with pytest.raises(GitHubSynchronizationBudgetExceeded, match="entries"):
-        GitHubTraversalCursor(
-            snapshot,
-            (GitHubTraversalFrame("", ROOT, 0),),
-            GitHubRunBudget(entries_examined=100_001),
+        replace(
+            _cursor(authorization, snapshot),
+            totals=GitHubRunBudget(entries_examined=100_001),
         )
 
 
@@ -244,9 +282,11 @@ def test_unsupported_extension_never_downloads_extracts_or_embeds():
     tree = snapshot.root_tree()
     content.list_tree.return_value = GitHubTreePage(tree, (_entry(snapshot, "code.py"),))
     service, _, registry, chunker, provider = _preparation(content)
-    discovered = service.discover_batch(authorization, GitHubTraversalCursor.initial(snapshot))
-    prepared = service.prepare_batch(authorization, (), discovered)
-    assert not prepared.files and prepared.cursor_after.scan_complete
+    discovered = service.discover_batch(authorization, _cursor(authorization, snapshot))
+    prepared = service.prepare_batch(authorization, (_item_snapshot(),), discovered)
+    assert prepared.files[0].outcome == "unsupported"
+    assert prepared.files[0].retirement_reason == "unsupported_format"
+    assert prepared.cursor_after.scan_complete
     content.download_blob.assert_not_called()
     registry.extract.assert_not_called()
     chunker.chunk.assert_not_called()
@@ -262,10 +302,10 @@ def test_oversized_supported_file_is_seen_as_skipped_without_download():
         tree, (_entry(snapshot, "large.txt", size=MAX_GITHUB_BLOB_BYTES + 1),)
     )
     service, _, registry, chunker, provider = _preparation(content)
-    discovered = service.discover_batch(authorization, GitHubTraversalCursor.initial(snapshot))
-    assert discovered.files[0].skip_reason == "file_too_large"
+    discovered = service.discover_batch(authorization, _cursor(authorization, snapshot))
+    assert discovered.files[0].skip_reason == "oversized"
     prepared = service.prepare_batch(authorization, (_item_snapshot(),), discovered)
-    assert prepared.files[0].outcome == "skipped"
+    assert prepared.files[0].outcome == "unsupported"
     content.download_blob.assert_not_called()
     registry.extract.assert_not_called()
     chunker.chunk.assert_not_called()
@@ -287,7 +327,7 @@ def test_declared_byte_budget_stops_before_next_file_and_preserves_resume_cursor
     service, *_ = _preparation(content)
     batch = service.discover_batch(
         authorization,
-        GitHubTraversalCursor.initial(snapshot),
+        _cursor(authorization, snapshot),
         limits=GitHubSynchronizationLimits(max_download_bytes=10),
     )
     assert [item.entry.path for item in batch.files] == ["one.txt"]
@@ -303,14 +343,14 @@ def test_supported_extension_policy_is_case_insensitive(suffix):
     tree = snapshot.root_tree()
     content.list_tree.return_value = GitHubTreePage(tree, (_entry(snapshot, f"file.{suffix}"),))
     service, *_ = _preparation(content)
-    result = service.discover_batch(authorization, GitHubTraversalCursor.initial(snapshot))
+    result = service.discover_batch(authorization, _cursor(authorization, snapshot))
     assert len(result.files) == 1
 
 
 def test_unchanged_and_completed_items_skip_all_expensive_work():
     authorization = _authorization()
     snapshot = _snapshot(authorization)
-    cursor = GitHubTraversalCursor.initial(snapshot)
+    cursor = _cursor(authorization, snapshot)
     entry = _entry(snapshot, "file.txt")
     after = replace(cursor, totals=GitHubRunBudget(entries_examined=1))
     final = replace(cursor, totals=GitHubRunBudget(entries_examined=2))
@@ -336,7 +376,7 @@ def test_unchanged_and_completed_items_skip_all_expensive_work():
 def test_changed_file_downloads_extracts_chunks_and_embeds_without_raw_content_in_dto():
     authorization = _authorization()
     snapshot = _snapshot(authorization)
-    cursor = GitHubTraversalCursor.initial(snapshot)
+    cursor = _cursor(authorization, snapshot)
     entry = _entry(snapshot, "file.txt")
     after = replace(cursor, totals=GitHubRunBudget(entries_examined=1))
     discovered = GitHubDiscoveredFile(entry, cursor, after, None)
@@ -361,10 +401,45 @@ def test_changed_file_downloads_extracts_chunks_and_embeds_without_raw_content_i
     assert provider.embed_batch.call_count == 1
 
 
+def test_git_lfs_is_seen_and_classified_without_extraction_or_embedding():
+    authorization = _authorization()
+    snapshot = _snapshot(authorization)
+    cursor = _cursor(authorization, snapshot)
+    entry = _entry(snapshot, "file.txt")
+    after = replace(cursor, frames=(), totals=GitHubRunBudget(entries_examined=1), scan_complete=True)
+    discovered = GitHubDiscoveredFile(entry, cursor, after, None)
+    service, content, registry, chunker, provider = _preparation()
+    content.download_blob.side_effect = GitHubRepositoryContentUnsupported(
+        "git_lfs_unsupported"
+    )
+    result = service.prepare_batch(
+        authorization,
+        (_item_snapshot(blob="1" * 40),),
+        GitHubDiscoveryBatch((discovered,), after, 1, 1),
+    )
+    assert result.files[0].outcome == "unsupported"
+    assert result.files[0].retirement_reason == "git_lfs_unsupported"
+    assert result.downloaded_bytes == entry.size_bytes
+    registry.extract.assert_not_called()
+    chunker.chunk.assert_not_called()
+    provider.embed_batch.assert_not_called()
+
+
+def test_cursor_authorization_binding_rejects_credential_replacement():
+    authorization = _authorization()
+    cursor = _cursor(authorization)
+    service, *_ = _preparation()
+    with pytest.raises(InvalidGitHubStagedSynchronizationRequest, match="authorization"):
+        service.discover_batch(
+            replace(authorization, credential_id=uuid4()),
+            cursor,
+        )
+
+
 def test_invalid_embedding_and_chunk_overflow_do_not_loop():
     authorization = _authorization()
     snapshot = _snapshot(authorization)
-    cursor = GitHubTraversalCursor.initial(snapshot)
+    cursor = _cursor(authorization, snapshot)
     entry = _entry(snapshot, "file.txt")
     after = replace(cursor, totals=GitHubRunBudget(entries_examined=1))
     discovered = GitHubDiscoveredFile(entry, cursor, after, None)
@@ -388,7 +463,7 @@ def test_invalid_embedding_and_chunk_overflow_do_not_loop():
 def test_more_than_500_file_chunks_fails_before_any_embedding_call():
     authorization = _authorization()
     snapshot = _snapshot(authorization)
-    cursor = GitHubTraversalCursor.initial(snapshot)
+    cursor = _cursor(authorization, snapshot)
     entry = _entry(snapshot, "file.txt")
     after = replace(cursor, totals=GitHubRunBudget(entries_examined=1))
     discovered = GitHubDiscoveredFile(entry, cursor, after, None)
@@ -435,7 +510,7 @@ def test_failure_classification_is_fixed_safe_and_bounded(error, kind, retryable
 
 def test_persistence_rejects_missing_or_stale_cursor_before_writes():
     authorization = _authorization()
-    cursor = GitHubTraversalCursor.initial(_snapshot(authorization))
+    cursor = _cursor(authorization)
     profile = LocalDocumentIndexingProfile(
         "extract", "v1", "chunk", "v1", "fake", "fake:model:1536", 1536, "f" * 64
     )
@@ -444,7 +519,173 @@ def test_persistence_rejects_missing_or_stale_cursor_before_writes():
     service._require_context = Mock()  # type: ignore[method-assign]
     service._sync = Mock()
     service._sync.get_active_cursor.return_value = None
-    sync_snapshot = GitHubSynchronizationSnapshot(authorization, uuid4(), Mock(), cursor, profile)
+    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    sync_snapshot = GitHubSynchronizationSnapshot(authorization, uuid4(), now, cursor, profile)
     prepared = PreparedGitHubBatch((), replace(cursor, scan_complete=True, frames=()), 0, 0)
     with pytest.raises(StalePreparedGitHubBatch, match="cursor is unavailable"):
-        service.persist_batch(Mock(), sync_snapshot, prepared, worker_id="worker", now=Mock())
+        service.persist_batch(Mock(), sync_snapshot, prepared, worker_id="worker", now=now)
+
+
+def test_reconciliation_accepts_exact_maximum_batch_and_rejects_larger_limit():
+    authorization = _authorization()
+    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    cursor = _reconciliation_cursor(authorization, started_at=now)
+    run_id = uuid4()
+    profile = LocalDocumentIndexingProfile(
+        "extract", "v1", "chunk", "v1", "fake", "fake:model:1536", 1536, "f" * 64
+    )
+    execution, content = Mock(), Mock()
+    service = GitHubStagedSynchronizationService(Mock(), execution, content, profile)
+    service._require_context = Mock()  # type: ignore[method-assign]
+    service._sync = Mock()
+    service._sources = Mock()
+    service._retire_unseen = Mock(return_value=True)  # type: ignore[method-assign]
+    row = SimpleNamespace(
+        created_by_run_id=run_id,
+        cursor_type="github_repository_progress",
+        safe_cursor=cursor.to_safe_json(),
+        cursor_version=1,
+    )
+    service._sync.get_active_cursor.return_value = row
+    next_cursor = MembershipReconciliationCursor(now, uuid4())
+    service._sources.list_active_github_memberships_before.return_value = (
+        MembershipReconciliationPage(
+            (SimpleNamespace(source_item_id=uuid4()),),
+            HARD_MAX_RECONCILIATION_BATCH_SIZE,
+            True,
+            next_cursor,
+        )
+    )
+    snapshot = GitHubSynchronizationSnapshot(
+        authorization, run_id, now, cursor, profile
+    )
+    service.reconcile(_lease(authorization), snapshot, worker_id="worker", now=now)
+    assert service._sources.list_active_github_memberships_before.call_args.kwargs["limit"] == 100
+    service._sync.replace_active_cursor.reset_mock()
+    outcome = service.reconcile(
+        _lease(authorization),
+        snapshot,
+        worker_id="worker",
+        now=now,
+        limit=HARD_MAX_RECONCILIATION_BATCH_SIZE,
+    )
+    assert outcome.outcome == "in_progress"
+    assert outcome.files_persisted == 1
+    assert service._sources.list_active_github_memberships_before.call_args.kwargs["limit"] == 500
+    promoted = service._sync.replace_active_cursor.call_args.kwargs["safe_cursor"]
+    assert promoted["reconciliation"]["items_reconciled"] == 1
+    assert promoted["reconciliation"]["batches_completed"] == 1
+    with pytest.raises(InvalidGitHubStagedSynchronizationRequest, match="between 1 and 500"):
+        service.reconcile(
+            _lease(authorization),
+            snapshot,
+            worker_id="worker",
+            now=now,
+            limit=HARD_MAX_RECONCILIATION_BATCH_SIZE + 1,
+        )
+
+
+def test_reconciliation_item_and_wall_clock_budgets_fail_before_retirement():
+    authorization = _authorization()
+    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    profile = LocalDocumentIndexingProfile(
+        "extract", "v1", "chunk", "v1", "fake", "fake:model:1536", 1536, "f" * 64
+    )
+
+    def service_for(cursor):
+        run_id = uuid4()
+        service = GitHubStagedSynchronizationService(Mock(), Mock(), Mock(), profile)
+        service._require_context = Mock()  # type: ignore[method-assign]
+        service._sync = Mock()
+        service._sources = Mock()
+        service._retire_unseen = Mock(return_value=True)  # type: ignore[method-assign]
+        service._sync.get_active_cursor.return_value = SimpleNamespace(
+            created_by_run_id=run_id,
+            cursor_type="github_repository_progress",
+            safe_cursor=cursor.to_safe_json(),
+            cursor_version=1,
+        )
+        return service, GitHubSynchronizationSnapshot(
+            authorization, run_id, now, cursor, profile
+        )
+
+    expired = _reconciliation_cursor(authorization, started_at=now)
+    service, snapshot = service_for(expired)
+    with pytest.raises(GitHubSynchronizationBudgetExceeded, match="wall-clock"):
+        service.reconcile(
+            _lease(authorization),
+            snapshot,
+            worker_id="worker",
+            now=now + timedelta(seconds=MAX_RECONCILIATION_SECONDS + 1),
+        )
+    service._sources.list_active_github_memberships_before.assert_not_called()
+
+    exhausted = _reconciliation_cursor(
+        authorization,
+        started_at=now,
+        reconciled_items=MAX_RUN_RECONCILIATION_ITEMS,
+    )
+    service, snapshot = service_for(exhausted)
+    service._sources.list_active_github_memberships_before.return_value = (
+        MembershipReconciliationPage(
+            (SimpleNamespace(source_item_id=uuid4()),), 1, False, None
+        )
+    )
+    with pytest.raises(GitHubSynchronizationBudgetExceeded, match="item budget"):
+        service.reconcile(
+            _lease(authorization), snapshot, worker_id="worker", now=now
+        )
+    service._retire_unseen.assert_not_called()
+    service._sync.replace_active_cursor.assert_not_called()
+
+
+def test_reconciliation_rejects_incomplete_cross_generation_and_completed_cursors():
+    authorization = _authorization()
+    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    profile = LocalDocumentIndexingProfile(
+        "extract", "v1", "chunk", "v1", "fake", "fake:model:1536", 1536, "f" * 64
+    )
+    run_id = uuid4()
+    for durable, supplied, message in (
+        (_cursor(authorization), None, "authority"),
+        (
+            _reconciliation_cursor(authorization, started_at=now),
+            replace(
+                _reconciliation_cursor(authorization, started_at=now),
+                scan_generation=uuid4(),
+            ),
+            "snapshot changed",
+        ),
+        (
+            replace(
+                _reconciliation_cursor(authorization, started_at=now),
+                phase="complete",
+                reconciliation_batches=1,
+                completion_marker=True,
+            ),
+            None,
+            "authority",
+        ),
+    ):
+        service = GitHubStagedSynchronizationService(Mock(), Mock(), Mock(), profile)
+        service._require_context = Mock()  # type: ignore[method-assign]
+        service._sync = Mock()
+        service._sources = Mock()
+        service._sync.get_active_cursor.return_value = SimpleNamespace(
+            created_by_run_id=run_id,
+            cursor_type="github_repository_progress",
+            safe_cursor=durable.to_safe_json(),
+            cursor_version=1,
+        )
+        snapshot = GitHubSynchronizationSnapshot(
+            authorization, run_id, now, supplied, profile
+        )
+        with pytest.raises(
+            (InvalidGitHubStagedSynchronizationRequest, StalePreparedGitHubBatch),
+            match=message,
+        ):
+            service.reconcile(
+                _lease(authorization), snapshot, worker_id="worker", now=now
+            )
+        service._sources.list_active_github_memberships_before.assert_not_called()
+        service._sync.replace_active_cursor.assert_not_called()

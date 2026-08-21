@@ -74,6 +74,16 @@ class GitHubRepositoryContentUnavailable(RuntimeError):
     pass
 
 
+class GitHubRepositoryContentUnsupported(GitHubRepositoryContentRejected):
+    """A valid pinned blob exists but is not safely indexable."""
+
+    def __init__(self, classification: str) -> None:
+        if classification != "git_lfs_unsupported":
+            raise ValueError("unsupported GitHub content classification is invalid")
+        super().__init__("GitHub blob content is unsupported")
+        self.classification = classification
+
+
 @dataclass(frozen=True, repr=False)
 class GitHubRepositoryContentAuthorization:
     organization_id: UUID
@@ -354,7 +364,7 @@ class GitHubRepositoryContentService:
             self._raise_provider_error(exc)
         self._validate_raw_blob(raw, blob.size_bytes)
         if raw.content.splitlines()[:1] == [_LFS_SIGNATURE]:
-            raise GitHubRepositoryContentRejected("Git LFS content is unsupported")
+            raise GitHubRepositoryContentUnsupported("git_lfs_unsupported")
         digest = hashlib.sha256(raw.content).hexdigest()
         if digest != raw.sha256:
             raise GitHubRepositoryContentRejected("GitHub blob content is invalid")
@@ -533,11 +543,18 @@ class GitHubRepositoryContentService:
                     item.size_bytes,
                     item.mode == "100755",
                 )
-            elif (item.mode, item.object_type) in {
-                ("120000", "blob"),
-                ("160000", "commit"),
-            }:
-                continue
+            elif item.mode == "120000" and item.object_type == "blob":
+                if (
+                    isinstance(item.size_bytes, bool)
+                    or not isinstance(item.size_bytes, int)
+                    or item.size_bytes < 0
+                ):
+                    raise GitHubRepositoryContentRejected("GitHub symlink descriptor is invalid")
+                entry_type, size, executable = "symlink", item.size_bytes, False
+            elif item.mode == "160000" and item.object_type == "commit":
+                if item.size_bytes is not None:
+                    raise GitHubRepositoryContentRejected("GitHub submodule descriptor is invalid")
+                entry_type, size, executable = "submodule", None, False
             else:
                 raise GitHubRepositoryContentRejected("GitHub tree entry type is unsupported")
             results.append(
