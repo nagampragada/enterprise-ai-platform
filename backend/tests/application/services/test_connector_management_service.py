@@ -66,10 +66,18 @@ def test_github_connector_creation_uses_draft_and_only_committed_capabilities():
     assert connector.safe_config == {}
     assert connector.capabilities["supports_repository_discovery"] is True
     assert connector.capabilities["supports_repository_selection"] is True
+    assert connector.capabilities["supports_bounded_content_reading"] is True
+    assert connector.capabilities["supports_staged_synchronization"] is True
     assert {
         value
         for key, value in connector.capabilities.items()
-        if key not in {"supports_repository_discovery", "supports_repository_selection"}
+        if key
+        not in {
+            "supports_repository_discovery",
+            "supports_repository_selection",
+            "supports_bounded_content_reading",
+            "supports_staged_synchronization",
+        }
     } == {False}
     session.commit.assert_not_called()
     session.rollback.assert_not_called()

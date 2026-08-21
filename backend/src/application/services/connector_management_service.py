@@ -53,6 +53,8 @@ GITHUB_PRECONNECTION_CAPABILITIES = ConnectorCapabilities(
     supports_content_download=False,
     supports_repository_discovery=True,
     supports_repository_selection=True,
+    supports_bounded_content_reading=True,
+    supports_staged_synchronization=True,
 )
 
 

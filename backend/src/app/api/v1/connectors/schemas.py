@@ -159,6 +159,8 @@ class ConnectorCapabilitiesResponse(BaseModel):
     supports_content_download: bool
     supports_repository_discovery: bool = False
     supports_repository_selection: bool = False
+    supports_bounded_content_reading: bool = False
+    supports_staged_synchronization: bool = False
 
 
 class ConnectorResponse(BaseModel):

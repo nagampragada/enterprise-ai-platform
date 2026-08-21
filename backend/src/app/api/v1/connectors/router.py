@@ -637,6 +637,8 @@ def _connector_response(row) -> ConnectorResponse:
         **row.capabilities,
         "supports_repository_discovery": row.connector_type == "github",
         "supports_repository_selection": row.connector_type == "github",
+        "supports_bounded_content_reading": row.connector_type == "github",
+        "supports_staged_synchronization": row.connector_type == "github",
     }
     return ConnectorResponse(
         connector_id=row.id,
