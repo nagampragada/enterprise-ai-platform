@@ -9,6 +9,7 @@ import json
 import math
 from pathlib import Path, PurePosixPath
 import tempfile
+from typing import Callable
 from uuid import UUID, uuid4
 
 from sqlalchemy import select
@@ -593,6 +594,7 @@ class GitHubSynchronizationPreparationService:
         cursor: GitHubTraversalCursor,
         *,
         limits: GitHubSynchronizationLimits = GitHubSynchronizationLimits(),
+        progress_check: Callable[[], None] = lambda: None,
     ) -> GitHubDiscoveryBatch:
         _validate_authorization_cursor(authorization, cursor)
         if cursor.phase != "traversal":
@@ -615,6 +617,7 @@ class GitHubSynchronizationPreparationService:
                 if tree_requests >= limits.max_tree_requests:
                     break
                 descriptor = _tree_descriptor(work.snapshot, frame)
+                progress_check()
                 page = self._content.list_tree(authorization, work.snapshot, descriptor)
                 if page.tree != descriptor:
                     raise InvalidGitHubStagedSynchronizationRequest("GitHub tree response changed")
@@ -682,6 +685,7 @@ class GitHubSynchronizationPreparationService:
         batch: GitHubDiscoveryBatch,
         *,
         limits: GitHubSynchronizationLimits = GitHubSynchronizationLimits(),
+        progress_check: Callable[[], None] = lambda: None,
     ) -> PreparedGitHubBatch:
         if len(item_snapshots) != len(batch.files):
             raise InvalidGitHubStagedSynchronizationRequest("GitHub item snapshots are incomplete")
@@ -690,6 +694,7 @@ class GitHubSynchronizationPreparationService:
         prepared_chunks = 0
         cursor_after = batch.cursor_after if not batch.files else batch.files[0].cursor_before
         for discovered, snapshot in zip(batch.files, item_snapshots, strict=True):
+            progress_check()
             _validate_discovered_file(discovered, batch.cursor_after.snapshot)
             if discovered.cursor_before.totals.entries_examined < cursor_after.totals.entries_examined:
                 raise InvalidGitHubStagedSynchronizationRequest("GitHub batch order is invalid")
@@ -717,7 +722,9 @@ class GitHubSynchronizationPreparationService:
                     raise InvalidGitHubStagedSynchronizationRequest("GitHub file size is invalid")
                 if downloaded_bytes + declared > limits.max_download_bytes and prepared:
                     break
-                item = self._prepare_changed(authorization, discovered, snapshot)
+                item = self._prepare_changed(
+                    authorization, discovered, snapshot, progress_check=progress_check
+                )
                 next_chunks = prepared_chunks + len(item.chunks)
                 if next_chunks > limits.max_chunks:
                     if prepared:
@@ -744,8 +751,11 @@ class GitHubSynchronizationPreparationService:
         authorization: GitHubRepositoryContentAuthorization,
         discovered: GitHubDiscoveredFile,
         item_snapshot: GitHubItemSnapshot,
+        *,
+        progress_check: Callable[[], None] = lambda: None,
     ) -> PreparedGitHubFile:
         try:
+            progress_check()
             raw = self._content.download_blob(
                 authorization, discovered.cursor_after.snapshot, discovered.entry
             )
@@ -773,6 +783,7 @@ class GitHubSynchronizationPreparationService:
         chunks: list[PreparedGitHubChunk] = []
         batch_size = profile.max_batch_size or len(chunk_results)
         for start in range(0, len(chunk_results), batch_size):
+            progress_check()
             group = chunk_results[start : start + batch_size]
             requests = tuple(
                 EmbeddingRequest(input_index=index, text=chunk.content)

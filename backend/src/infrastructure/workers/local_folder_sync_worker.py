@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from application.services.connector_sync_execution_service import (
     AcquiredSyncAttempt,
+    AcquiredRoutedSyncAttempt,
     ConnectorSyncExecutionService,
 )
 from application.services.connector_sync_retry_policy import SyncFailureKind, classify_exception
@@ -133,8 +134,10 @@ class LocalFolderSyncWorker:
         finally:
             session.close()
 
-    def attempt_context(self, acquired: AcquiredSyncAttempt) -> LocalFolderAttemptContext:
-        if not isinstance(acquired, AcquiredSyncAttempt):
+    def attempt_context(
+        self, acquired: AcquiredSyncAttempt | AcquiredRoutedSyncAttempt
+    ) -> LocalFolderAttemptContext:
+        if not isinstance(acquired, (AcquiredSyncAttempt, AcquiredRoutedSyncAttempt)):
             raise InvalidLocalFolderWorkerConfiguration("acquired attempt is invalid")
         lease = acquired.lease
         return LocalFolderAttemptContext(

@@ -883,7 +883,7 @@ Never display or request: password hashes, refresh-token hashes, connector secre
 | LangGraph, LangChain, LangSmith | Not dependencies; not used |
 | Tool calling and MCP server/tools | Not implemented |
 | Google Drive connector | Placeholder only |
-| GitHub content sync/webhooks/ACL sync | Internal bounded staged create/update/unindexable/deletion reconciliation exists; production worker routing, webhooks, and ACL sync remain future work |
+| GitHub content sync/webhooks/ACL sync | Continuous worker routing, bounded staged synchronization/reconciliation, cancellation, and independent heartbeat exist; deployment, public operations, webhooks, and ACL sync remain future work |
 | SharePoint/OneDrive connector | Placeholder/contract vocabulary only |
 | Slack/Teams connectors | Not implemented (Teams structure is organizational data, not Microsoft Teams connector) |
 | PostgreSQL/SQL Server connectors | Placeholder directories only |
@@ -911,7 +911,7 @@ The current architecture supports this order because the data plane is stronger 
 | 7 | Search service and API | Server-side query embedding + existing authorized repository | GPT-5.6 Sol, high | Provider credentials and result contract |
 | 8 | Grounded answers/citations | Answer generation, citation evidence, refusal/guardrails | GPT-5.6 Sol, high | Model/provider, safety, prompt policy decisions |
 | 9 | GitHub repository selection | Completed: tenant-safe explicit repository scope with restricted-token proof | GPT-5.6 Sol, high | Operational GitHub/GCP setup required |
-| 10 | GitHub staged read-only synchronization | Internal create/update/deletion reconciliation complete; next add production worker routing and heartbeat orchestration | GPT-5.6 Sol, high | GitHub App permission review required |
+| 10 | GitHub staged read-only synchronization | Worker routing and safe heartbeat orchestration complete; next deploy and add public operations/webhooks/ACLs | GPT-5.6 Sol, high | GitHub App permission review and runtime provisioning required |
 | 11 | Google Drive + OAuth + ACL sync | Follows GitHub; provider adapter, secrets, directory/ACL generation, tests | GPT-5.6 Sol, high | Google credentials/admin consent required |
 | 12 | SharePoint/OneDrive connector | Microsoft OAuth, sites/drives, groups/ACLs | GPT-5.6 Sol, high | Microsoft tenant consent/credentials required |
 | 13 | Usage metering, budgets, circuit breakers | Tenant usage persistence and fail-safe provider controls | GPT-5.6 Sol, high | Pricing/budget policies required |
@@ -927,7 +927,7 @@ The current architecture supports this order because the data plane is stronger 
 - [x] Authenticated manual upload and complete indexing pipeline
 - [x] TXT/Markdown/DOCX/PDF extraction
 - [x] Deterministic chunking and 1,536-dimensional embeddings
-- [x] Local Folder connector, synchronization service, execution control, bounded runner, and continuous/one-shot host
+- [x] Local Folder and GitHub synchronization routing, execution control, bounded runners, and continuous/one-shot connector host
 - [x] Canonical source identity, immutable versions, indexing states/attempts
 - [x] Permission-aware retrieval repository
 - [x] Comprehensive fake-provider, PostgreSQL, filesystem, concurrency, rollback, and migration tests
@@ -936,7 +936,7 @@ The current architecture supports this order because the data plane is stronger 
 
 - [x] Connector/scope repositories and lifecycle persistence
 - [x] Durable jobs, run/item/error/cursor history, cancellation/recovery operations
-- [x] Continuous Local Folder host with internal global claim and expired recovery
+- [x] Continuous connector host with persisted-type routing, global claim, bounded expired recovery, and GitHub lease heartbeat
 - [x] Knowledge-space grants and organization structure
 - [x] External identity/ACL persistence and authorization query
 - [x] Audit table

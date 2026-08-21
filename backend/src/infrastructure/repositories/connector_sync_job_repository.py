@@ -158,6 +158,12 @@ class SyncJobAttemptState:
     cancellation_requested: bool
 
 
+@dataclass(frozen=True)
+class RoutedSyncJobLease:
+    lease: SyncJobLease
+    connector_type: str
+
+
 class ConnectorSyncJobRepository:
     def __init__(
         self,
@@ -310,19 +316,52 @@ class ConnectorSyncJobRepository:
         now: datetime,
     ) -> SyncJobLease | None:
         """Claim one Local Folder job across tenants for the internal worker host."""
+        routed = self._acquire_next_routed(
+            worker_id=worker_id,
+            lease_duration=lease_duration,
+            now=now,
+            connector_type="local_folder",
+        )
+        return routed.lease if routed is not None else None
+
+    def acquire_next_routed(
+        self,
+        *,
+        worker_id: str,
+        lease_duration: timedelta,
+        now: datetime,
+    ) -> RoutedSyncJobLease | None:
+        """Claim one connector job and return its authoritative persisted type."""
+        return self._acquire_next_routed(
+            worker_id=worker_id,
+            lease_duration=lease_duration,
+            now=now,
+            connector_type=None,
+        )
+
+    def _acquire_next_routed(
+        self,
+        *,
+        worker_id: str,
+        lease_duration: timedelta,
+        now: datetime,
+        connector_type: str | None,
+    ) -> RoutedSyncJobLease | None:
         worker_id = _worker_id(worker_id)
         now = _aware("now", now)
         duration = _lease_duration(lease_duration)
         lease_id = self._lease_uuid()
-        local_folder = select(Connector.id).where(
+        connector_predicates = [
             Connector.organization_id == ConnectorSyncJob.organization_id,
             Connector.id == ConnectorSyncJob.connector_id,
-            Connector.connector_type == "local_folder",
-        ).exists()
+        ]
+        if connector_type is not None:
+            connector_predicates.append(Connector.connector_type == connector_type)
+        persisted_connector = select(Connector.id).where(*connector_predicates).exists()
         candidate = (
             select(ConnectorSyncJob.id)
             .where(
-                local_folder,
+                persisted_connector,
                 ConnectorSyncJob.status.in_(("queued", "retry_wait")),
                 ConnectorSyncJob.next_attempt_at <= now,
                 ConnectorSyncJob.cancel_requested_at.is_(None),
@@ -336,13 +375,13 @@ class ConnectorSyncJobRepository:
             )
             .with_for_update(of=ConnectorSyncJob, skip_locked=True)
             .limit(1)
-            .cte("eligible_local_folder_sync_job")
+            .cte("eligible_routed_sync_job")
         )
         statement = (
             update(ConnectorSyncJob)
             .where(
                 ConnectorSyncJob.id == candidate.c.id,
-                local_folder,
+                persisted_connector,
                 ConnectorSyncJob.status.in_(("queued", "retry_wait")),
                 ConnectorSyncJob.next_attempt_at <= now,
                 ConnectorSyncJob.cancel_requested_at.is_(None),
@@ -362,8 +401,25 @@ class ConnectorSyncJobRepository:
             )
             .returning(ConnectorSyncJob)
         )
-        row = self._updated(statement, "Local Folder synchronization job could not be acquired")
-        return _lease(row) if row is not None else None
+        row = self._updated(statement, "routed synchronization job could not be acquired")
+        if row is None:
+            return None
+        connector_type = self._session.execute(
+            select(Connector.connector_type)
+            .where(
+                Connector.organization_id == row.organization_id,
+                Connector.id == row.connector_id,
+                *(
+                    (Connector.connector_type == connector_type,)
+                    if connector_type is not None
+                    else ()
+                ),
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
+        if connector_type is None:
+            raise SyncJobPersistenceError("claimed connector type is unavailable")
+        return RoutedSyncJobLease(_lease(row), connector_type)
 
     def renew_heartbeat(
         self,
@@ -645,17 +701,29 @@ class ConnectorSyncJobRepository:
         limit: int,
     ) -> tuple[ExpiredSyncJobLease, ...]:
         """Lock expired Local Folder jobs across tenants for internal recovery."""
+        return self._lock_expired_routed(now=now, limit=limit, connector_type="local_folder")
+
+    def lock_expired_routed(
+        self, *, now: datetime, limit: int
+    ) -> tuple[ExpiredSyncJobLease, ...]:
+        return self._lock_expired_routed(now=now, limit=limit, connector_type=None)
+
+    def _lock_expired_routed(
+        self, *, now: datetime, limit: int, connector_type: str | None
+    ) -> tuple[ExpiredSyncJobLease, ...]:
         now = _aware("now", now)
         limit = _recovery_limit(limit)
-        local_folder = select(Connector.id).where(
+        connector_predicates = [
             Connector.organization_id == ConnectorSyncJob.organization_id,
             Connector.id == ConnectorSyncJob.connector_id,
-            Connector.connector_type == "local_folder",
-        ).exists()
+        ]
+        if connector_type is not None:
+            connector_predicates.append(Connector.connector_type == connector_type)
+        persisted_connector = select(Connector.id).where(*connector_predicates).exists()
         statement = (
             select(ConnectorSyncJob)
             .where(
-                local_folder,
+                persisted_connector,
                 ConnectorSyncJob.status == "running",
                 ConnectorSyncJob.lease_expires_at <= now,
             )
@@ -663,7 +731,7 @@ class ConnectorSyncJobRepository:
             .with_for_update(of=ConnectorSyncJob, skip_locked=True)
             .limit(limit)
         )
-        rows = self._all(statement, "expired Local Folder synchronization jobs could not be read")
+        rows = self._all(statement, "expired routed synchronization jobs could not be read")
         return tuple(_expired(row) for row in rows)
 
     def recover_expired(

@@ -185,7 +185,7 @@ class GitHubBlobContent:
 class GitHubRepositoryContentService:
     """Stage DB authorization separately from request-scoped provider access."""
 
-    def __init__(self, session: Session, client: GitHubAppClient) -> None:
+    def __init__(self, session: Session | None, client: GitHubAppClient) -> None:
         self._session = session
         self._client = client
         self._connectors = ConnectorRepository(session)
@@ -196,6 +196,8 @@ class GitHubRepositoryContentService:
     def authorize(
         self, organization_id: UUID, connector_id: UUID, scope_id: UUID
     ) -> GitHubRepositoryContentAuthorization:
+        if self._session is None:
+            raise GitHubRepositoryContentRejected("GitHub authorization session is unavailable")
         connector = self._connectors.get_by_id(organization_id, connector_id)
         scope = self._scopes.get_by_id(organization_id, scope_id)
         credential = self._credentials.get(organization_id, connector_id)
@@ -402,7 +404,7 @@ class GitHubRepositoryContentService:
     ) -> None:
         if not isinstance(authorization, GitHubRepositoryContentAuthorization):
             raise GitHubRepositoryContentRejected("GitHub content authorization is invalid")
-        if self._session.in_transaction():
+        if self._session is not None and self._session.in_transaction():
             raise GitHubRepositoryContentConflict(
                 "database transaction must end before GitHub provider access"
             )

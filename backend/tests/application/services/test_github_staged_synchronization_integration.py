@@ -40,6 +40,7 @@ from application.services.local_document_indexing_service import LocalDocumentIn
 from domain.embeddings.models import EmbeddingProfile
 from infrastructure.db.models import (
     ConnectorSyncItem,
+    ConnectorSyncJob,
     ConnectorSyncCursor,
     ConnectorSyncError,
     ConnectorSyncRun,
@@ -61,6 +62,12 @@ from infrastructure.repositories.connector_sync_job_repository import (
 from infrastructure.repositories.permission_aware_document_chunk_search_repository import (
     PermissionAwareDocumentChunkSearchRepository,
 )
+from infrastructure.workers.connector_sync_worker_host import (
+    ConnectorSyncWorkerHost,
+    ConnectorWorkerSettings,
+)
+from infrastructure.workers.github_sync_worker import GitHubSyncWorker
+from infrastructure.workers.local_folder_sync_worker import LocalFolderAttemptContext
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -1850,3 +1857,116 @@ class MockEmbedding:
 class MockFailure:
     def __call__(self, *args, **kwargs):
         raise RuntimeError("controlled cursor failure")
+
+
+def test_production_routing_completes_github_traversal_and_reconciliation(engine):
+    factory = _factory(engine)
+    organization_id, connector_id, scope_id = _seed(factory)
+    with factory() as session:
+        _execution(session).enqueue(
+            organization_id,
+            connector_id,
+            scope_id,
+            mode="incremental",
+            trigger_type="manual",
+        )
+        session.commit()
+
+    profile = _profile()
+
+    class FakePreparation:
+        def __init__(self):
+            self.profile = profile
+            self.provider_boundaries = 0
+
+        def resolve_snapshot(self, authorization):
+            self.provider_boundaries += 1
+            return GitHubTraversalCursor.initial(
+                GitHubRepositorySnapshot(
+                    connector_id,
+                    scope_id,
+                    501,
+                    "github:repository:501",
+                    "main",
+                    COMMIT,
+                    TREE,
+                ),
+                authorization,
+            )
+
+        def discover_batch(self, authorization, cursor, *, progress_check):
+            progress_check()
+            self.provider_boundaries += 1
+            discovered = _candidate(cursor, authorization)
+            return GitHubDiscoveryBatch((discovered,), discovered.cursor_after, 1, 1)
+
+        def prepare_batch(self, authorization, item_snapshots, batch, *, progress_check):
+            progress_check()
+            self.provider_boundaries += 1
+            return _prepared(batch.files[0], item_snapshots[0])
+
+    preparation = FakePreparation()
+
+    def execution(session):
+        return _execution(session)
+
+    class ContextAdapter:
+        def attempt_context(self, acquired):
+            lease = acquired.lease
+            return LocalFolderAttemptContext(
+                lease.organization_id,
+                lease.job_id,
+                lease.connector_id,
+                lease.connector_scope_id,
+                acquired.sync_run_id,
+                lease.attempt_number,
+                "production-route",
+                lease.lease_id,
+                lease.fencing_token,
+                lease.lease_expires_at,
+                lease.mode,
+                lease.trigger_type,
+                lease.max_attempts,
+            )
+
+        def execute(self, _context):  # pragma: no cover - routing must reject this path
+            raise AssertionError("GitHub job routed to Local Folder")
+
+    github = GitHubSyncWorker(
+        factory,
+        execution,
+        lambda session: GitHubStagedSynchronizationService(
+            session,
+            execution(session),
+            GitHubRepositoryContentService(session, Client()),
+            profile,
+        ),
+        preparation,
+        worker_id="production-route",
+        lease_duration=timedelta(minutes=15),
+        heartbeat_interval=timedelta(minutes=1),
+        heartbeat_shutdown_timeout=timedelta(seconds=2),
+        clock=lambda: NOW,
+    )
+    settings = ConnectorWorkerSettings(
+        "production-route",
+        timedelta(minutes=15),
+        timedelta(minutes=1),
+        timedelta(seconds=1),
+        timedelta(seconds=2),
+        10,
+        True,
+    )
+    host = ConnectorSyncWorkerHost(factory, execution, ContextAdapter(), github, settings)
+    assert host.run_cycle() == "completed"
+    assert preparation.provider_boundaries == 3
+    with factory() as session:
+        job = session.scalar(select(ConnectorSyncJob).where(
+            ConnectorSyncJob.organization_id == organization_id
+        ))
+        run = session.scalar(select(ConnectorSyncRun).where(
+            ConnectorSyncRun.sync_job_id == job.id
+        ))
+        assert job.status == "succeeded"
+        assert run.status == "completed"
+        assert session.scalar(select(func.count()).select_from(SourceItem)) == 1

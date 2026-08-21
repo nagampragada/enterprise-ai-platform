@@ -25,6 +25,7 @@ from infrastructure.repositories.connector_sync_job_repository import (
     SyncJobAttemptState,
     SyncJobHistoryItem,
     SyncJobLease,
+    RoutedSyncJobLease,
 )
 
 
@@ -32,6 +33,13 @@ from infrastructure.repositories.connector_sync_job_repository import (
 class AcquiredSyncAttempt:
     lease: SyncJobLease
     sync_run_id: UUID
+
+
+@dataclass(frozen=True)
+class AcquiredRoutedSyncAttempt:
+    lease: SyncJobLease
+    sync_run_id: UUID
+    connector_type: str
 
 
 class ConnectorSyncExecutionService:
@@ -116,6 +124,23 @@ class ConnectorSyncExecutionService:
             now=now,
         )
         return AcquiredSyncAttempt(lease, run.id)
+
+    def acquire_one_routed(
+        self,
+        *,
+        worker_id: str,
+        lease_duration: timedelta,
+    ) -> AcquiredRoutedSyncAttempt | None:
+        now = self._now()
+        routed: RoutedSyncJobLease | None = self._repository.acquire_next_routed(
+            worker_id=worker_id,
+            lease_duration=lease_duration,
+            now=now,
+        )
+        if routed is None:
+            return None
+        run = self._repository.create_attempt_run(routed.lease, worker_id=worker_id, now=now)
+        return AcquiredRoutedSyncAttempt(routed.lease, run.id, routed.connector_type)
 
     def heartbeat(
         self,
@@ -234,6 +259,13 @@ class ConnectorSyncExecutionService:
         """Recover expired Local Folder attempts across tenants for the internal host."""
         now = self._now()
         expired = self._repository.lock_expired_local_folder(now=now, limit=limit)
+        return self._recover_expired(expired, now)
+
+    def recover_expired_routed(
+        self, *, limit: int
+    ) -> tuple[SyncJobHistoryItem, ...]:
+        now = self._now()
+        expired = self._repository.lock_expired_routed(now=now, limit=limit)
         return self._recover_expired(expired, now)
 
     def _recover_expired(self, expired, now: datetime) -> tuple[SyncJobHistoryItem, ...]:

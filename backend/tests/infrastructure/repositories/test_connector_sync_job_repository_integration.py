@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -24,6 +25,7 @@ from infrastructure.repositories.connector_sync_job_repository import (
     SyncJobConflict,
     SyncJobNotFound,
 )
+from infrastructure.workers.lease_heartbeat import LeaseHeartbeat, LeaseHeartbeatFailure
 
 ROOT = Path(__file__).resolve().parents[3]
 PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
@@ -184,6 +186,175 @@ def _acquire_local_folder(session: Session, *, worker="worker-one", now=NOW):
         lease_duration=LEASE,
         now=now,
     )
+
+
+def _acquire_routed(session: Session, *, worker="worker-one", now=NOW):
+    return _repo(session).acquire_next_routed(
+        worker_id=worker,
+        lease_duration=LEASE,
+        now=now,
+    )
+
+
+def test_routed_claim_has_one_concurrent_winner_and_uses_persisted_type(engine):
+    setup = Session(engine, expire_on_commit=False)
+    organization_id, connector_id, scope_id = _setup(setup, "RoutedClaim")
+    setup.execute(
+        text("UPDATE connectors SET connector_type='github' WHERE id=:id"),
+        {"id": connector_id},
+    )
+    job = _enqueue(setup, organization_id, connector_id, scope_id)
+    setup.commit()
+    setup.close()
+    barrier = threading.Barrier(2)
+    results, errors = [], []
+
+    def claim(worker):
+        value = Session(engine, expire_on_commit=False)
+        try:
+            barrier.wait()
+            results.append(_acquire_routed(value, worker=worker))
+            value.commit()
+        except Exception as error:  # pragma: no cover - asserted below
+            errors.append(error)
+            value.rollback()
+        finally:
+            value.close()
+
+    threads = [threading.Thread(target=claim, args=(f"routed-{index}",)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert all(not thread.is_alive() for thread in threads)
+    assert not errors
+    winners = [result for result in results if result is not None]
+    assert len(winners) == 1
+    assert winners[0].lease.job_id == job.job_id
+    assert winners[0].connector_type == "github"
+
+
+def test_local_and_routed_claims_share_the_same_skip_locked_mechanism(engine):
+    setup = Session(engine, expire_on_commit=False)
+    organization_id, connector_id, scope_id = _setup(setup, "SharedClaim")
+    job = _enqueue(setup, organization_id, connector_id, scope_id)
+    setup.commit()
+    setup.close()
+    barrier = threading.Barrier(2)
+    results, errors = [], []
+
+    def claim(local, worker):
+        value = Session(engine, expire_on_commit=False)
+        try:
+            barrier.wait()
+            result = (
+                _acquire_local_folder(value, worker=worker)
+                if local
+                else _acquire_routed(value, worker=worker)
+            )
+            results.append(result)
+            value.commit()
+        except Exception as error:  # pragma: no cover - asserted below
+            errors.append(error)
+            value.rollback()
+        finally:
+            value.close()
+
+    threads = [
+        threading.Thread(target=claim, args=(True, "legacy-local")),
+        threading.Thread(target=claim, args=(False, "routed-host")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert all(not thread.is_alive() for thread in threads)
+    assert not errors
+    winners = [result for result in results if result is not None]
+    assert len(winners) == 1
+    winner_lease = winners[0].lease if hasattr(winners[0], "lease") else winners[0]
+    assert winner_lease.job_id == job.job_id
+
+
+def test_independent_heartbeat_sessions_commit_close_and_observe_cancellation(engine):
+    setup = Session(engine, expire_on_commit=False)
+    organization_id, connector_id, scope_id = _setup(setup, "HeartbeatThread")
+    _enqueue(setup, organization_id, connector_id, scope_id)
+    setup.commit()
+    lease = _acquire(setup, organization_id, worker="heartbeat-owner")
+    assert lease is not None
+    _repo(setup).create_attempt_run(lease, worker_id="heartbeat-owner", now=NOW)
+    setup.commit()
+    setup.close()
+
+    owners, opened, renewed = [], [], threading.Event()
+
+    class TrackingSession(Session):
+        def __init__(self):
+            super().__init__(engine, expire_on_commit=False)
+            self.was_committed = False
+            self.was_rolled_back = False
+            self.was_closed = False
+            owners.append(threading.get_ident())
+            opened.append(self)
+
+        def commit(self):
+            super().commit()
+            self.was_committed = True
+
+        def rollback(self):
+            super().rollback()
+            self.was_rolled_back = True
+
+        def close(self):
+            super().close()
+            self.was_closed = True
+
+    class ObservedExecution:
+        def __init__(self, session):
+            self._service = ConnectorSyncExecutionService(
+                _repo(session),
+                ConnectorSyncRetryPolicy(random_uniform=lambda low, high: high),
+                clock=lambda: NOW + timedelta(minutes=1),
+            )
+
+        def heartbeat(self, *args, **kwargs):
+            result = self._service.heartbeat(*args, **kwargs)
+            renewed.set()
+            return result
+
+    heartbeat = LeaseHeartbeat(
+        TrackingSession,
+        ObservedExecution,
+        lease,
+        worker_id="heartbeat-owner",
+        lease_duration=LEASE,
+        interval=timedelta(milliseconds=20),
+        shutdown_timeout=timedelta(seconds=2),
+    )
+    heartbeat.__enter__()
+    assert renewed.wait(2)
+    cancellation = Session(engine, expire_on_commit=False)
+    _repo(cancellation).request_cancellation(
+        organization_id,
+        lease.job_id,
+        now=NOW + timedelta(minutes=2),
+    )
+    cancellation.commit()
+    cancellation.close()
+    for _ in range(200):
+        try:
+            heartbeat.raise_if_failed()
+        except LeaseHeartbeatFailure:
+            break
+        time.sleep(0.01)
+    with pytest.raises(LeaseHeartbeatFailure) as failure:
+        heartbeat.stop()
+    assert isinstance(failure.value.__cause__, SyncJobCancellationConflict)
+    assert owners and all(owner != threading.get_ident() for owner in owners)
+    assert any(item.was_committed for item in opened)
+    assert any(item.was_rolled_back for item in opened)
+    assert all(item.was_closed for item in opened)
 
 
 def test_concurrent_enqueue_coalesces_to_one_nonterminal_job(engine):

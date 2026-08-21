@@ -975,3 +975,9 @@ These were removed from the immediate set because they add structure without bei
 The first implementation should start with the 21-table minimum secure schema described here. That set is enough to support tenancy, authentication sessions, role assignment, the two first-release connector types, document ingestion and vector retrieval, chat with citations, generated SQL auditing, and basic operational and security observability.
 
 The deferred tables remain architecturally valid, but they should only be added when concrete business or operational conditions justify them.
+
+## Connector Worker Routing and Leases
+
+The production connector worker atomically claims durable jobs with the existing PostgreSQL `FOR UPDATE SKIP LOCKED` and fencing fields, then reads connector type from the tenant-linked connector row. Dispatch is explicitly allowlisted: `local_folder` uses the existing worker and `github` uses the staged GitHub worker. Other persisted types receive the fixed non-retryable validation classification. Job metadata and cursor JSON never select code.
+
+GitHub provider, extraction, chunking, and embedding work runs outside database transactions. An execution-scoped heartbeat uses a new, committed, and closed session for each renewal and matches owner, lease UUID, fence, attempt, running status, expiry, and cancellation state. Renewal rejection reaches the owner thread and blocks persistence. Existing job/run/lease fields are sufficient, so no schema migration was required.
