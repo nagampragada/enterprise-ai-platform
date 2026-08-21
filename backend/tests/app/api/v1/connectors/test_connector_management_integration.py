@@ -32,6 +32,7 @@ from domain.embeddings.models import EmbeddingProfile, EmbeddingRequest, Embeddi
 from domain.embeddings.provider import EmbeddingProvider
 from infrastructure.db.models import (
     Connector,
+    ConnectorCredential,
     ConnectorScope,
     ConnectorSyncJob,
     ConnectorSyncRun,
@@ -40,6 +41,7 @@ from infrastructure.db.models import (
     DocumentChunk,
     DocumentIndexingState,
     DocumentVersion,
+    GitHubAppInstallation,
     SourceItem,
     SourceItemScopeMembership,
 )
@@ -154,7 +156,8 @@ def clean(engine):
             "document_versions", "connector_sync_cursors", "connector_sync_errors",
             "connector_sync_items", "connector_sync_runs", "connector_sync_schedules",
             "connector_sync_jobs",
-            "source_item_scope_memberships", "source_items", "connector_scopes", "connectors",
+            "source_item_scope_memberships", "source_items", "connector_scopes",
+            "github_app_installations", "connector_credentials", "connectors",
             "audit_events", "knowledge_space_user_grants", "knowledge_space_team_grants",
             "knowledge_space_department_grants", "knowledge_space_organization_grants",
             "knowledge_spaces", "team_memberships", "department_memberships", "teams",
@@ -341,13 +344,34 @@ def test_full_api_flow_persists_defaults_redacts_and_coalesces(factory, tmp_path
         job_detail = client.get(
             f"/api/v1/connectors/{connector_id}/scopes/{scope_id}/sync-jobs/{first_job.json()['job_id']}"
         )
+        operational_job = client.post(
+            f"/api/v1/connectors/{connector_id}/sync-jobs",
+            json={"connector_scope_id": scope_id},
+        )
+        operational_jobs = client.get(
+            f"/api/v1/connectors/{connector_id}/sync-jobs?page=1&page_size=50"
+        )
+        operational_detail = client.get(
+            f"/api/v1/connectors/{connector_id}/sync-jobs/{first_job.json()['job_id']}"
+        )
+        cancellation = client.post(
+            f"/api/v1/connectors/{connector_id}/sync-jobs/{first_job.json()['job_id']}/cancel"
+        )
     assert created.status_code == 201 and listing.status_code == detail.status_code == 200
     assert scope.status_code == 201 and scopes.status_code == 200
     assert first_job.status_code == second_job.status_code == 202
     assert first_job.json()["job_id"] == second_job.json()["job_id"]
     assert first_job.json()["coalesced"] is False and second_job.json()["coalesced"] is True
     assert jobs.status_code == job_detail.status_code == 200
-    for response in (created, listing, detail, scope, scopes, first_job, second_job, jobs, job_detail):
+    assert operational_job.status_code == 202 and operational_job.json()["coalesced"] is True
+    assert operational_jobs.status_code == operational_detail.status_code == 200
+    assert operational_jobs.json()["items"][0]["job_id"] == first_job.json()["job_id"]
+    assert operational_detail.json()["runs"] == []
+    assert cancellation.status_code == 200 and cancellation.json()["status"] == "cancelled"
+    for response in (
+        created, listing, detail, scope, scopes, first_job, second_job, jobs, job_detail,
+        operational_job, operational_jobs, operational_detail, cancellation,
+    ):
         body = response.text
         assert root not in body and "secret_reference" not in body and "safe_config" not in body
         assert "lease_id" not in body and "lease_owner" not in body
@@ -479,6 +503,11 @@ def test_cross_tenant_resources_are_concealed(factory):
         assert client.post(
             f"/api/v1/connectors/{connector.id}/scopes/{scope.id}/sync-jobs"
         ).status_code == 404
+        assert client.post(
+            f"/api/v1/connectors/{connector.id}/sync-jobs",
+            json={"connector_scope_id": str(scope.id)},
+        ).status_code == 404
+        assert client.get(f"/api/v1/connectors/{connector.id}/sync-jobs").status_code == 404
 
 
 def test_cross_tenant_knowledge_space_and_inactive_scope_rejected(factory):
@@ -716,3 +745,99 @@ def test_recurring_schedule_runs_api_to_scheduler_to_worker_without_network(fact
     assert session.scalar(select(func.count()).select_from(ConnectorSyncSchedule)) == 0
     assert session.get(ConnectorSyncJob, active_job.id) is not None
     session.close()
+
+
+def test_github_scope_uses_same_provider_free_operational_api(factory):
+    organization_id, user_id, space_id = _identity_rows(factory, "GitHubOps", admin=True)
+    session = factory()
+    service = ConnectorManagementService(session)
+    connector = service.create_github_connector(
+        organization_id, user_id, display_name="GitHub", slug="github"
+    )
+    connector.status = "active"
+    credential = ConnectorCredential(
+        id=uuid.uuid4(),
+        organization_id=organization_id,
+        connector_id=connector.id,
+        provider_key="github",
+        auth_scheme="app_installation",
+        secret_reference=None,
+        status="active",
+        external_subject="4242",
+        granted_scopes=["contents:read", "metadata:read"],
+        created_by_user_id=user_id,
+    )
+    now = datetime.now(timezone.utc)
+    installation = GitHubAppInstallation(
+        id=uuid.uuid4(),
+        organization_id=organization_id,
+        connector_id=connector.id,
+        credential_id=credential.id,
+        github_app_id=101,
+        github_installation_id=4242,
+        account_id=303,
+        account_login="enterprise",
+        account_type="Organization",
+        repository_selection="selected",
+        status="connected",
+        provider_created_at=now,
+        provider_updated_at=now,
+        last_verified_at=now,
+        created_at=now,
+        updated_at=now,
+    )
+    scope = ConnectorScope(
+        id=uuid.uuid4(),
+        organization_id=organization_id,
+        connector_id=connector.id,
+        knowledge_space_id=space_id,
+        display_name="Platform",
+        slug="platform",
+        scope_type="repository",
+        external_scope_key="github:repository:987",
+        access_mode="platform_managed",
+        status="active",
+        safe_config={
+            "repository_id": 987,
+            "repository_name": "platform",
+            "repository_full_name": "enterprise/platform",
+            "owner_login": "enterprise",
+            "private": True,
+            "visibility": "private",
+            "archived": False,
+            "disabled": False,
+            "default_branch": "main",
+        },
+        config_schema_version=1,
+        created_by_user_id=user_id,
+    )
+    session.add_all((credential, installation, scope))
+    session.commit()
+    connector_id, scope_id, credential_id = connector.id, scope.id, credential.id
+    session.close()
+
+    _configure_app(factory, organization_id, user_id)
+    with TestClient(app) as client:
+        queued = client.post(
+            f"/api/v1/connectors/{connector_id}/sync-jobs",
+            json={"connector_scope_id": str(scope_id)},
+        )
+        listing = client.get(f"/api/v1/connectors/{connector_id}/sync-jobs")
+        detail = client.get(
+            f"/api/v1/connectors/{connector_id}/sync-jobs/{queued.json()['job_id']}"
+        )
+    assert queued.status_code == 202 and queued.json()["trigger_type"] == "manual"
+    assert listing.status_code == detail.status_code == 200
+    assert detail.json()["connector_scope_id"] == str(scope_id)
+    assert detail.json()["runs"] == []
+
+    session = factory()
+    session.get(ConnectorCredential, credential_id).status = "invalid"
+    session.commit()
+    session.close()
+    with TestClient(app) as client:
+        blocked = client.post(
+            f"/api/v1/connectors/{connector_id}/sync-jobs",
+            json={"connector_scope_id": str(scope_id)},
+        )
+    assert blocked.status_code == 409

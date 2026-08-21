@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -37,8 +38,10 @@ from infrastructure.repositories.connector_scope_repository import (
 from infrastructure.repositories.connector_sync_job_repository import (
     EnqueueResult,
     SyncJobHistoryItem,
+    SyncJobOffsetPage,
     SyncJobPage,
     SyncJobPageCursor,
+    SyncJobRunSummary,
 )
 
 NOW = datetime(2026, 8, 18, tzinfo=timezone.utc)
@@ -117,6 +120,16 @@ def _schedule(connector_id=None, scope_id=None, **overrides):
     )
     values.update(overrides)
     return SyncScheduleView(**values)
+
+
+def _run(**overrides):
+    values = dict(
+        run_id=uuid4(), status="completed", trigger_type="manual", attempt_number=1,
+        started_at=NOW, completed_at=NOW, cancellation_requested_at=None,
+        items_discovered=4, items_succeeded=3, items_failed=1, items_deleted=0,
+    )
+    values.update(overrides)
+    return SyncJobRunSummary(**values)
 
 
 def _setup(service=None, session=None, schedule_service=None):
@@ -319,6 +332,168 @@ def test_job_list_and_get_are_redacted_and_cross_tenant_not_found_is_safe():
     with TestClient(app) as client:
         concealed = client.get(f"/api/v1/connectors/{connector_id}/scopes/{scope_id}/sync-jobs/{uuid4()}")
     assert concealed.status_code == 404 and concealed.json() == {"detail": "Resource not found"}
+
+
+def test_connector_job_create_is_minimal_idempotent_and_provider_free():
+    service, session, admin = _setup()
+    connector_id, scope_id = uuid4(), uuid4()
+    job = _job(connector_id, scope_id)
+    service.enqueue_sync_job.return_value = (EnqueueResult(job.job_id, "queued", True), job)
+    with (
+        patch("infrastructure.workers.local_folder_sync_worker.LocalFolderSyncWorker.run_one") as run,
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            f"/api/v1/connectors/{connector_id}/sync-jobs",
+            json={"connector_scope_id": str(scope_id)},
+        )
+        rejected = client.post(
+            f"/api/v1/connectors/{connector_id}/sync-jobs",
+            json={"connector_scope_id": str(scope_id), "force": True},
+        )
+    assert response.status_code == 202 and response.json()["coalesced"] is True
+    assert rejected.status_code == 422
+    service.enqueue_sync_job.assert_called_once_with(
+        admin.organization_id, admin.user_id, connector_id, scope_id
+    )
+    assert session.commit_calls == 1 and session.rollback_calls == 0
+    run.assert_not_called()
+    assert set(response.json()) == {
+        "job_id", "connector_id", "connector_scope_id", "mode", "trigger_type",
+        "status", "attempt_count", "max_attempts", "next_attempt_at",
+        "cancellation_requested", "completed_at", "last_error_category",
+        "last_error_code", "created_at", "coalesced",
+    }
+
+
+def test_connector_job_listing_detail_and_cancel_are_bounded_and_redacted():
+    service, session, admin = _setup()
+    connector_id, scope_id = uuid4(), uuid4()
+    job = _job(connector_id, scope_id)
+    run = _run()
+    service.list_connector_sync_jobs.return_value = SyncJobOffsetPage(
+        (job,), 2, 10, False
+    )
+    service.get_connector_sync_job.return_value = (job, (run,))
+    service.cancel_connector_sync_job.return_value = _job(
+        connector_id, scope_id, job_id=job.job_id, status="cancelled",
+        next_attempt_at=None, cancellation_requested=True, completed_at=NOW,
+    )
+    with TestClient(app) as client:
+        listing = client.get(
+            f"/api/v1/connectors/{connector_id}/sync-jobs?page=2&page_size=10&status=queued"
+        )
+        detail = client.get(f"/api/v1/connectors/{connector_id}/sync-jobs/{job.job_id}")
+        cancelled = client.post(
+            f"/api/v1/connectors/{connector_id}/sync-jobs/{job.job_id}/cancel"
+        )
+        rejected = client.post(
+            f"/api/v1/connectors/{connector_id}/sync-jobs/{job.job_id}/cancel",
+            json={"reason": "show this raw text"},
+        )
+    assert listing.status_code == detail.status_code == cancelled.status_code == 200
+    assert rejected.status_code == 422
+    service.list_connector_sync_jobs.assert_called_once_with(
+        admin.organization_id, connector_id, page=2, page_size=10, status="queued"
+    )
+    service.get_connector_sync_job.assert_called_once_with(
+        admin.organization_id, connector_id, job.job_id
+    )
+    service.cancel_connector_sync_job.assert_called_once_with(
+        admin.organization_id, admin.user_id, connector_id, job.job_id
+    )
+    assert listing.json()["page_size"] == 10 and listing.json()["has_next"] is False
+    assert detail.json()["runs"][0]["items_discovered"] == 4
+    assert len(detail.json()["runs"]) == 1 and session.commit_calls == 1
+    forbidden = (
+        "organization_id", "lease", "fence", "heartbeat", "cursor", "token",
+        "credential", "secret", "provider_metadata", "error_summary", "run_metadata",
+    )
+    for response in (listing, detail, cancelled):
+        assert not any(value in response.text for value in forbidden)
+
+
+def test_connector_job_routes_reject_invalid_bounds_and_conceal_missing_job():
+    service, _, _ = _setup()
+    connector_id = uuid4()
+    service.get_connector_sync_job.side_effect = ConnectorManagementNotFound("foreign job")
+    with TestClient(app) as client:
+        invalid = (
+            client.get(f"/api/v1/connectors/{connector_id}/sync-jobs?page=0"),
+            client.get(f"/api/v1/connectors/{connector_id}/sync-jobs?page=1001"),
+            client.get(f"/api/v1/connectors/{connector_id}/sync-jobs?page_size=0"),
+            client.get(f"/api/v1/connectors/{connector_id}/sync-jobs?page_size=101"),
+            client.get(f"/api/v1/connectors/{connector_id}/sync-jobs?status=owned"),
+            client.get(f"/api/v1/connectors/{connector_id}/sync-jobs?sort=lease_owner"),
+        )
+        missing = client.get(f"/api/v1/connectors/{connector_id}/sync-jobs/{uuid4()}")
+    assert all(response.status_code == 422 for response in invalid)
+    assert missing.status_code == 404 and missing.json() == {"detail": "Resource not found"}
+
+
+def test_connector_job_mutations_and_detail_reject_all_query_parameters():
+    _setup()
+    connector_id, scope_id, job_id = uuid4(), uuid4(), uuid4()
+    with TestClient(app) as client:
+        create = client.post(
+            f"/api/v1/connectors/{connector_id}/sync-jobs?organization_id={uuid4()}",
+            json={"connector_scope_id": str(scope_id)},
+        )
+        detail = client.get(
+            f"/api/v1/connectors/{connector_id}/sync-jobs/{job_id}?cursor=opaque"
+        )
+        cancel = client.post(
+            f"/api/v1/connectors/{connector_id}/sync-jobs/{job_id}/cancel?force=true"
+        )
+    assert create.status_code == detail.status_code == cancel.status_code == 422
+    assert create.json() == detail.json() == cancel.json() == {
+        "detail": "Connector request is invalid"
+    }
+
+
+def test_connector_job_operations_require_authentication_and_admin_role():
+    connector_id = uuid4()
+    with TestClient(app) as client:
+        unauthenticated = client.get(f"/api/v1/connectors/{connector_id}/sync-jobs")
+    assert unauthenticated.status_code == 401
+
+    app.dependency_overrides[get_connector_administrator] = lambda: (
+        _ for _ in ()
+    ).throw(HTTPException(status_code=403, detail="Connector administration is forbidden"))
+    with TestClient(app) as client:
+        forbidden = client.post(
+            f"/api/v1/connectors/{connector_id}/sync-jobs",
+            json={"connector_scope_id": str(uuid4())},
+        )
+    assert forbidden.status_code == 403
+
+
+def test_connector_job_openapi_is_explicit_bounded_and_contains_no_worker_fields():
+    schema = app.openapi()
+    connector_path = "/api/v1/connectors/{connector_id}/sync-jobs"
+    detail_path = "/api/v1/connectors/{connector_id}/sync-jobs/{job_id}"
+    cancel_path = "/api/v1/connectors/{connector_id}/sync-jobs/{job_id}/cancel"
+    assert set(schema["paths"][connector_path]) == {"get", "post"}
+    assert set(schema["paths"][detail_path]) == {"get"}
+    assert set(schema["paths"][cancel_path]) == {"post"}
+    encoded = json.dumps(
+        {
+            connector_path: schema["paths"][connector_path],
+            detail_path: schema["paths"][detail_path],
+            cancel_path: schema["paths"][cancel_path],
+            "schemas": {
+                name: value
+                for name, value in schema["components"]["schemas"].items()
+                if name.startswith(("ConnectorSync", "CreateConnectorSync", "CancelConnectorSync"))
+            },
+        }
+    )
+    for forbidden in (
+        "organization_id", "lease_id", "lease_owner", "fencing_token",
+        "heartbeat_at", "safe_cursor", "secret_reference", "credential_id",
+        "installation_id", "run_metadata", "error_summary", "embedding", "vector",
+    ):
+        assert forbidden not in encoded
 
 
 def test_schedule_put_get_pause_resume_delete_use_admin_identity_and_transactions():

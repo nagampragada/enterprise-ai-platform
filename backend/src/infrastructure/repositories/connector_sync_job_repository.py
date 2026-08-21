@@ -135,6 +135,29 @@ class SyncJobPage:
 
 
 @dataclass(frozen=True)
+class SyncJobOffsetPage:
+    items: tuple[SyncJobHistoryItem, ...]
+    page: int
+    page_size: int
+    has_next: bool
+
+
+@dataclass(frozen=True)
+class SyncJobRunSummary:
+    run_id: UUID
+    status: str
+    trigger_type: str
+    attempt_number: int
+    started_at: datetime | None
+    completed_at: datetime | None
+    cancellation_requested_at: datetime | None
+    items_discovered: int
+    items_succeeded: int
+    items_failed: int
+    items_deleted: int
+
+
+@dataclass(frozen=True)
 class ExpiredSyncJobLease:
     organization_id: UUID
     job_id: UUID
@@ -858,6 +881,24 @@ class ConnectorSyncJobRepository:
         )
         return _history(row) if row is not None else None
 
+    def get_for_connector(
+        self,
+        organization_id: UUID,
+        connector_id: UUID,
+        job_id: UUID,
+        *,
+        lock: bool = False,
+    ) -> SyncJobHistoryItem | None:
+        statement = select(ConnectorSyncJob).where(
+            ConnectorSyncJob.organization_id == _uuid("organization_id", organization_id),
+            ConnectorSyncJob.connector_id == _uuid("connector_id", connector_id),
+            ConnectorSyncJob.id == _uuid("job_id", job_id),
+        )
+        if lock:
+            statement = statement.with_for_update()
+        row = self._one(statement, "synchronization job could not be read")
+        return _history(row) if row is not None else None
+
     def get_current(
         self,
         organization_id: UUID,
@@ -925,6 +966,81 @@ class ConnectorSyncJobRepository:
             else None
         )
         return SyncJobPage(items, limit, has_more, next_cursor)
+
+    def list_connector_history_page(
+        self,
+        organization_id: UUID,
+        connector_id: UUID,
+        *,
+        page: int,
+        page_size: int,
+        status: str | None = None,
+    ) -> SyncJobOffsetPage:
+        organization_id = _uuid("organization_id", organization_id)
+        connector_id = _uuid("connector_id", connector_id)
+        if (
+            isinstance(page, bool)
+            or not isinstance(page, int)
+            or not 1 <= page <= 1000
+        ):
+            raise InvalidSyncJobRequest("page must be between 1 and 1000")
+        page_size = _page_limit(page_size)
+        statement = select(ConnectorSyncJob).where(
+            ConnectorSyncJob.organization_id == organization_id,
+            ConnectorSyncJob.connector_id == connector_id,
+        )
+        if status is not None:
+            statement = statement.where(
+                ConnectorSyncJob.status == _choice("status", status, JOB_STATUSES)
+            )
+        rows = self._all(
+            statement.order_by(
+                ConnectorSyncJob.created_at.desc(), ConnectorSyncJob.id.desc()
+            )
+            .offset((page - 1) * page_size)
+            .limit(page_size + 1),
+            "synchronization job history could not be read",
+        )
+        return SyncJobOffsetPage(
+            tuple(_history(row) for row in rows[:page_size]),
+            page,
+            page_size,
+            len(rows) > page_size,
+        )
+
+    def list_attempt_runs(
+        self,
+        organization_id: UUID,
+        connector_id: UUID,
+        job_id: UUID,
+        *,
+        limit: int = 20,
+    ) -> tuple[SyncJobRunSummary, ...]:
+        organization_id = _uuid("organization_id", organization_id)
+        connector_id = _uuid("connector_id", connector_id)
+        job_id = _uuid("job_id", job_id)
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 20
+        ):
+            raise InvalidSyncJobRequest("run history limit must be between 1 and 20")
+        try:
+            rows = self._session.execute(
+                select(ConnectorSyncRun)
+                .where(
+                    ConnectorSyncRun.organization_id == organization_id,
+                    ConnectorSyncRun.connector_id == connector_id,
+                    ConnectorSyncRun.sync_job_id == job_id,
+                )
+                .order_by(
+                    ConnectorSyncRun.job_attempt_number.desc(), ConnectorSyncRun.id.desc()
+                )
+                .limit(limit)
+            ).scalars().all()
+        except SQLAlchemyError as exc:
+            raise SyncJobPersistenceError("synchronization run history could not be read") from exc
+        return tuple(_run_summary(row) for row in rows)
 
     def _finish_attempt_run(self, lease: SyncJobLease, *, status: str, now: datetime) -> None:
         values: dict[str, object] = {"status": status, "finished_at": now, "heartbeat_at": now}
@@ -1079,6 +1195,24 @@ def _history(row: ConnectorSyncJob) -> SyncJobHistoryItem:
         row.last_error_category,
         row.last_error_code,
         row.created_at,
+    )
+
+
+def _run_summary(row: ConnectorSyncRun) -> SyncJobRunSummary:
+    if row.job_attempt_number is None:
+        raise SyncJobPersistenceError("synchronization run history is invalid")
+    return SyncJobRunSummary(
+        run_id=row.id,
+        status=row.status,
+        trigger_type=row.trigger_type,
+        attempt_number=row.job_attempt_number,
+        started_at=row.started_at,
+        completed_at=row.finished_at,
+        cancellation_requested_at=row.cancel_requested_at,
+        items_discovered=row.items_discovered,
+        items_succeeded=row.items_succeeded,
+        items_failed=row.items_failed,
+        items_deleted=row.items_deleted,
     )
 
 

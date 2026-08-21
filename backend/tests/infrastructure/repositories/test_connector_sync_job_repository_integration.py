@@ -950,6 +950,63 @@ def test_tenant_reads_mutations_and_history_are_bounded(session):
     assert not hasattr(first_page.items[0], "lease_owner")
 
 
+def test_connector_operational_reads_are_tenant_qualified_newest_first_and_bounded(session):
+    organization_id, connector_id, scope_id = _setup(session, "Operations")
+    other_org, other_connector, other_scope = _setup(session, "OperationsOther")
+    first = _enqueue(session, organization_id, connector_id, scope_id)
+    second_scope = _scope(session, organization_id, connector_id, "operations-two")
+    second = _enqueue(session, organization_id, connector_id, second_scope)
+    foreign = _enqueue(session, other_org, other_connector, other_scope)
+    for attempt in range(1, 26):
+        session.add(
+            ConnectorSyncRun(
+                id=uuid.uuid4(),
+                organization_id=organization_id,
+                connector_id=connector_id,
+                connector_scope_id=scope_id,
+                mode="incremental",
+                trigger_type="manual",
+                status="queued",
+                run_metadata={},
+                sync_job_id=first.job_id,
+                job_attempt_number=attempt,
+            )
+        )
+    session.commit()
+
+    page_one = _repo(session).list_connector_history_page(
+        organization_id, connector_id, page=1, page_size=1
+    )
+    page_two = _repo(session).list_connector_history_page(
+        organization_id, connector_id, page=2, page_size=1
+    )
+    assert len(page_one.items) == len(page_two.items) == 1
+    assert page_one.has_next and not page_two.has_next
+    assert {page_one.items[0].job_id, page_two.items[0].job_id} == {
+        first.job_id,
+        second.job_id,
+    }
+    expected_newest = max((first.job_id, second.job_id), key=str)
+    assert page_one.items[0].job_id == expected_newest
+    assert _repo(session).get_for_connector(
+        organization_id, connector_id, foreign.job_id
+    ) is None
+    assert _repo(session).get_for_connector(
+        other_org, other_connector, foreign.job_id
+    ).job_id == foreign.job_id
+
+    runs = _repo(session).list_attempt_runs(
+        organization_id, connector_id, first.job_id, limit=20
+    )
+    assert len(runs) == 20
+    assert [run.attempt_number for run in runs] == list(range(25, 5, -1))
+    assert _repo(session).list_attempt_runs(
+        other_org, other_connector, first.job_id, limit=20
+    ) == ()
+    assert not hasattr(runs[0], "heartbeat_at")
+    assert not hasattr(runs[0], "run_metadata")
+
+
 def test_caller_rollback_restores_acquisition_heartbeat_retry_and_completion(engine):
     setup = Session(engine, expire_on_commit=False)
     organization_id, connector_id, scope_id = _setup(setup, "Rollback")

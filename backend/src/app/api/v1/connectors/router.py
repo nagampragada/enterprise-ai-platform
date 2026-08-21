@@ -14,11 +14,18 @@ from sqlalchemy.orm import Session
 from starlette.responses import RedirectResponse, Response
 
 from app.api.v1.connectors.schemas import (
+    CancelConnectorSyncJobRequest,
     ConnectorCapabilitiesResponse,
     ConnectorPageResponse,
     ConnectorResponse,
     ConnectorScopePageResponse,
     ConnectorScopeResponse,
+    ConnectorSyncJobDetailResponse,
+    ConnectorSyncJobPageResponse,
+    ConnectorSyncJobResponse,
+    ConnectorSyncRunSummaryResponse,
+    CreateConnectorSyncJobRequest,
+    CreateConnectorSyncJobResponse,
     CreateGitHubRepositoryScopeRequest,
     CreateConnectorRequest,
     CreateConnectorScopeRequest,
@@ -544,6 +551,139 @@ def get_sync_job(
         _raise_http(exc)
 
 
+@connectors_router.post(
+    "/{connector_id}/sync-jobs",
+    response_model=CreateConnectorSyncJobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def create_connector_sync_job(
+    connector_id: UUID,
+    request: Request,
+    payload: CreateConnectorSyncJobRequest,
+    administrator: ConnectorAdministrator = Depends(get_connector_administrator),
+    service: ConnectorManagementService = Depends(get_connector_management_service),
+    db_session: Session = Depends(get_db_session),
+) -> CreateConnectorSyncJobResponse:
+    try:
+        if request.query_params:
+            raise InvalidConnectorManagementRequest(
+                "connector synchronization request is invalid"
+            )
+        result, job = service.enqueue_sync_job(
+            administrator.organization_id,
+            administrator.user_id,
+            connector_id,
+            payload.connector_scope_id,
+        )
+        db_session.commit()
+        return CreateConnectorSyncJobResponse(
+            **_connector_job_values(job), coalesced=result.coalesced
+        )
+    except Exception as exc:
+        db_session.rollback()
+        _raise_http(exc)
+
+
+@connectors_router.get(
+    "/{connector_id}/sync-jobs",
+    response_model=ConnectorSyncJobPageResponse,
+)
+def list_connector_sync_jobs(
+    connector_id: UUID,
+    request: Request,
+    page: int = Query(default=1, ge=1, le=1_000),
+    page_size: int = Query(default=50, ge=1, le=100),
+    status_filter: Literal[
+        "queued", "running", "retry_wait", "succeeded", "failed", "cancelled"
+    ]
+    | None = Query(default=None, alias="status"),
+    administrator: ConnectorAdministrator = Depends(get_connector_administrator),
+    service: ConnectorManagementService = Depends(get_connector_management_service),
+) -> ConnectorSyncJobPageResponse:
+    try:
+        if set(request.query_params) - {"page", "page_size", "status"}:
+            raise InvalidConnectorManagementRequest(
+                "connector synchronization request is invalid"
+            )
+        result = service.list_connector_sync_jobs(
+            administrator.organization_id,
+            connector_id,
+            page=page,
+            page_size=page_size,
+            status=status_filter,
+        )
+        return ConnectorSyncJobPageResponse(
+            items=tuple(
+                ConnectorSyncJobResponse(**_connector_job_values(item))
+                for item in result.items
+            ),
+            page=result.page,
+            page_size=result.page_size,
+            has_next=result.has_next,
+        )
+    except Exception as exc:
+        _raise_http(exc)
+
+
+@connectors_router.get(
+    "/{connector_id}/sync-jobs/{job_id}",
+    response_model=ConnectorSyncJobDetailResponse,
+)
+def get_connector_sync_job(
+    connector_id: UUID,
+    job_id: UUID,
+    request: Request,
+    administrator: ConnectorAdministrator = Depends(get_connector_administrator),
+    service: ConnectorManagementService = Depends(get_connector_management_service),
+) -> ConnectorSyncJobDetailResponse:
+    try:
+        if request.query_params:
+            raise InvalidConnectorManagementRequest(
+                "connector synchronization request is invalid"
+            )
+        job, runs = service.get_connector_sync_job(
+            administrator.organization_id, connector_id, job_id
+        )
+        return ConnectorSyncJobDetailResponse(
+            **_connector_job_values(job),
+            runs=tuple(_sync_run_response(run) for run in runs),
+        )
+    except Exception as exc:
+        _raise_http(exc)
+
+
+@connectors_router.post(
+    "/{connector_id}/sync-jobs/{job_id}/cancel",
+    response_model=ConnectorSyncJobResponse,
+)
+def cancel_connector_sync_job(
+    connector_id: UUID,
+    job_id: UUID,
+    request: Request,
+    payload: CancelConnectorSyncJobRequest | None = Body(default=None),
+    administrator: ConnectorAdministrator = Depends(get_connector_administrator),
+    service: ConnectorManagementService = Depends(get_connector_management_service),
+    db_session: Session = Depends(get_db_session),
+) -> ConnectorSyncJobResponse:
+    del payload
+    try:
+        if request.query_params:
+            raise InvalidConnectorManagementRequest(
+                "connector synchronization request is invalid"
+            )
+        job = service.cancel_connector_sync_job(
+            administrator.organization_id,
+            administrator.user_id,
+            connector_id,
+            job_id,
+        )
+        db_session.commit()
+        return ConnectorSyncJobResponse(**_connector_job_values(job))
+    except Exception as exc:
+        db_session.rollback()
+        _raise_http(exc)
+
+
 @connectors_router.put(
     "/{connector_id}/scopes/{scope_id}/schedule",
     response_model=SyncScheduleResponse,
@@ -695,6 +835,28 @@ def _job_values(row) -> dict[str, object]:
         "last_error_code": row.last_error_code,
         "created_at": row.created_at,
     }
+
+
+def _connector_job_values(row) -> dict[str, object]:
+    values = _job_values(row)
+    values["connector_scope_id"] = values.pop("scope_id")
+    return values
+
+
+def _sync_run_response(row) -> ConnectorSyncRunSummaryResponse:
+    return ConnectorSyncRunSummaryResponse(
+        run_id=row.run_id,
+        status=row.status,
+        trigger_type=row.trigger_type,
+        attempt_number=row.attempt_number,
+        started_at=row.started_at,
+        completed_at=row.completed_at,
+        cancellation_requested_at=row.cancellation_requested_at,
+        items_discovered=row.items_discovered,
+        items_succeeded=row.items_succeeded,
+        items_failed=row.items_failed,
+        items_deleted=row.items_deleted,
+    )
 
 
 def _schedule_response(row: SyncScheduleView) -> SyncScheduleResponse:

@@ -12,8 +12,16 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from application.services.github_repository_selection_service import (
+    EXPECTED_GITHUB_SCOPES,
+    GitHubRepositorySelectionConflict,
+    validated_github_repository_scope_config,
+)
 from domain.connectors.capabilities import ConnectorCapabilities
 from infrastructure.db.models import Connector, ConnectorScope, KnowledgeSpace
+from infrastructure.repositories.connector_credential_repository import (
+    ConnectorCredentialRepository,
+)
 from infrastructure.repositories.connector_repository import (
     ConnectorPage,
     ConnectorPageCursor,
@@ -29,8 +37,13 @@ from infrastructure.repositories.connector_sync_job_repository import (
     ConnectorSyncJobRepository,
     EnqueueResult,
     SyncJobHistoryItem,
+    SyncJobOffsetPage,
     SyncJobPage,
     SyncJobPageCursor,
+    SyncJobRunSummary,
+)
+from infrastructure.repositories.github_app_installation_repository import (
+    GitHubAppInstallationRepository,
 )
 
 LOCAL_FOLDER_CAPABILITIES = ConnectorCapabilities(
@@ -85,6 +98,8 @@ class ConnectorManagementService:
         self._connectors = ConnectorRepository(session)
         self._scopes = ConnectorScopeRepository(session)
         self._jobs = ConnectorSyncJobRepository(session)
+        self._credentials = ConnectorCredentialRepository(session)
+        self._installations = GitHubAppInstallationRepository(session)
         self._clock = clock
 
     def create_local_folder_connector(
@@ -225,10 +240,39 @@ class ConnectorManagementService:
         scope = self._scopes.lock_by_id(organization_id, scope_id)
         if connector is None or scope is None or scope.connector_id != connector_id:
             raise ConnectorManagementNotFound("connector scope was not found")
-        if connector.connector_type != "local_folder":
+        if connector.connector_type not in {"local_folder", "github"}:
             raise InvalidConnectorManagementRequest("connector type is not supported")
         if connector.status != "active" or scope.status != "active":
             raise ConnectorManagementConflict("connector scope is not active")
+        self._require_active_knowledge_space(organization_id, scope.knowledge_space_id)
+        if connector.connector_type == "local_folder":
+            if scope.scope_type != "folder":
+                raise ConnectorManagementNotFound("connector scope was not found")
+        else:
+            if scope.scope_type != "repository":
+                raise ConnectorManagementNotFound("connector scope was not found")
+            try:
+                validated_github_repository_scope_config(scope)
+            except GitHubRepositorySelectionConflict as exc:
+                raise ConnectorManagementConflict("connector scope is not active") from exc
+            credential = self._credentials.lock(organization_id, connector_id)
+            installation = self._installations.lock(organization_id, connector_id)
+            if (
+                credential is None
+                or installation is None
+                or credential.status != "active"
+                or credential.provider_key != "github"
+                or credential.auth_scheme != "app_installation"
+                or frozenset(credential.granted_scopes) != EXPECTED_GITHUB_SCOPES
+                or credential.expires_at is not None
+                or installation.credential_id != credential.id
+                or credential.external_subject
+                != str(installation.github_installation_id)
+                or installation.status != "connected"
+                or installation.disconnected_at is not None
+                or installation.account_type != "Organization"
+            ):
+                raise ConnectorManagementConflict("connector authorization is unavailable")
         result = self._jobs.enqueue_or_coalesce(
             organization_id,
             connector_id,
@@ -242,6 +286,59 @@ class ConnectorManagementService:
         if job is None:
             raise ConnectorManagementPersistenceError("synchronization job could not be read")
         return result, job
+
+    def list_connector_sync_jobs(
+        self,
+        organization_id: UUID,
+        connector_id: UUID,
+        *,
+        page: int,
+        page_size: int,
+        status: str | None = None,
+    ) -> SyncJobOffsetPage:
+        self.get_connector(organization_id, connector_id)
+        return self._jobs.list_connector_history_page(
+            organization_id,
+            connector_id,
+            page=page,
+            page_size=page_size,
+            status=status,
+        )
+
+    def get_connector_sync_job(
+        self, organization_id: UUID, connector_id: UUID, job_id: UUID
+    ) -> tuple[SyncJobHistoryItem, tuple[SyncJobRunSummary, ...]]:
+        self.get_connector(organization_id, connector_id)
+        job = self._jobs.get_for_connector(organization_id, connector_id, job_id)
+        if job is None:
+            raise ConnectorManagementNotFound("synchronization job was not found")
+        runs = self._jobs.list_attempt_runs(
+            organization_id, connector_id, job_id, limit=20
+        )
+        return job, runs
+
+    def cancel_connector_sync_job(
+        self,
+        organization_id: UUID,
+        requester_user_id: UUID,
+        connector_id: UUID,
+        job_id: UUID,
+    ) -> SyncJobHistoryItem:
+        self.get_connector(organization_id, connector_id)
+        job = self._jobs.get_for_connector(
+            organization_id, connector_id, job_id, lock=True
+        )
+        if job is None:
+            raise ConnectorManagementNotFound("synchronization job was not found")
+        if job.status in {"succeeded", "failed", "cancelled"}:
+            return job
+        return self._jobs.request_cancellation(
+            organization_id,
+            job_id,
+            requested_by_user_id=requester_user_id,
+            reason_code="user_requested",
+            now=self._now(),
+        )
 
     def list_sync_jobs(
         self,

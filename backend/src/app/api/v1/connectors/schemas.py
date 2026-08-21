@@ -223,6 +223,76 @@ class EnqueueSyncJobRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
 
+class CreateConnectorSyncJobRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    connector_scope_id: UUID
+
+
+class CancelConnectorSyncJobRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class ConnectorSyncJobResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    job_id: UUID
+    connector_id: UUID
+    connector_scope_id: UUID
+    mode: Literal["initial", "incremental", "reconciliation"]
+    trigger_type: Literal["manual", "scheduled", "webhook", "system"]
+    status: Literal["queued", "running", "retry_wait", "succeeded", "failed", "cancelled"]
+    attempt_count: int = Field(ge=0)
+    max_attempts: int = Field(ge=1, le=5)
+    next_attempt_at: datetime | None
+    cancellation_requested: bool
+    completed_at: datetime | None
+    last_error_category: str | None
+    last_error_code: str | None
+    created_at: datetime
+
+
+class CreateConnectorSyncJobResponse(ConnectorSyncJobResponse):
+    coalesced: bool
+
+
+class ConnectorSyncRunSummaryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    run_id: UUID
+    status: Literal[
+        "queued",
+        "running",
+        "cancelling",
+        "cancelled",
+        "completed",
+        "completed_with_errors",
+        "failed",
+    ]
+    trigger_type: Literal["manual", "scheduled", "webhook", "retry", "system"]
+    attempt_number: int = Field(ge=1)
+    started_at: datetime | None
+    completed_at: datetime | None
+    cancellation_requested_at: datetime | None
+    items_discovered: int = Field(ge=0)
+    items_succeeded: int = Field(ge=0)
+    items_failed: int = Field(ge=0)
+    items_deleted: int = Field(ge=0)
+
+
+class ConnectorSyncJobDetailResponse(ConnectorSyncJobResponse):
+    runs: tuple[ConnectorSyncRunSummaryResponse, ...]
+
+
+class ConnectorSyncJobPageResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    items: tuple[ConnectorSyncJobResponse, ...]
+    page: int = Field(ge=1, le=1_000)
+    page_size: int = Field(ge=1, le=100)
+    has_next: bool
+
+
 class PutSyncScheduleRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
