@@ -16,6 +16,9 @@ class GitHubProviderAuthorizationError(GitHubProviderError): pass
 class GitHubProviderNotFoundError(GitHubProviderError): pass
 class GitHubProviderRateLimitError(GitHubProviderError): pass
 class GitHubProviderUnavailableError(GitHubProviderError): pass
+class GitHubProviderMalformedResponseError(GitHubProviderError): pass
+class GitHubProviderResponseTooLargeError(GitHubProviderError): pass
+class GitHubProviderRedirectError(GitHubProviderError): pass
 
 
 @dataclass(frozen=True, repr=False)
@@ -99,6 +102,42 @@ class GitHubRepositoryAccessGrant:
     repository: GitHubRepository
 
 
+@dataclass(frozen=True)
+class GitHubBranchReference:
+    branch_name: str
+    commit_object_id: str
+    root_tree_object_id: str
+
+
+@dataclass(frozen=True)
+class GitHubCommitReference:
+    commit_object_id: str
+    root_tree_object_id: str
+
+
+@dataclass(frozen=True)
+class GitHubGitTreeEntry:
+    name: str
+    mode: str
+    object_type: str
+    object_id: str
+    size_bytes: int | None
+
+
+@dataclass(frozen=True)
+class GitHubGitTree:
+    object_id: str
+    entries: tuple[GitHubGitTreeEntry, ...]
+    truncated: bool
+
+
+@dataclass(frozen=True, repr=False)
+class GitHubRawBlob:
+    content: bytes
+    byte_count: int
+    sha256: str
+
+
 class GitHubAppClient(Protocol):
     @property
     def app_id(self) -> int: ...
@@ -125,6 +164,47 @@ class GitHubAppClient(Protocol):
         account_id: int,
         account_login: str,
     ) -> GitHubRepositoryAccessGrant: ...
+    def create_repository_content_access_token(
+        self,
+        installation_id: int,
+        repository_id: int,
+        *,
+        account_id: int,
+        account_login: str,
+    ) -> GitHubRepositoryAccessGrant: ...
+    def get_branch_reference(
+        self,
+        token: GitHubInstallationAccessToken,
+        *,
+        owner_login: str,
+        repository_name: str,
+        branch_name: str,
+    ) -> GitHubBranchReference: ...
+    def get_commit_reference(
+        self,
+        token: GitHubInstallationAccessToken,
+        *,
+        owner_login: str,
+        repository_name: str,
+        commit_object_id: str,
+    ) -> GitHubCommitReference: ...
+    def get_tree(
+        self,
+        token: GitHubInstallationAccessToken,
+        *,
+        owner_login: str,
+        repository_name: str,
+        tree_object_id: str,
+    ) -> GitHubGitTree: ...
+    def download_blob(
+        self,
+        token: GitHubInstallationAccessToken,
+        *,
+        owner_login: str,
+        repository_name: str,
+        blob_object_id: str,
+        maximum_bytes: int,
+    ) -> GitHubRawBlob: ...
     def list_installation_repositories(
         self,
         token: GitHubInstallationAccessToken,

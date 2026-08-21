@@ -454,6 +454,14 @@ def _validated_scope_config(scope: ConnectorScope) -> dict[str, object]:
     return config
 
 
+def validated_github_repository_scope_config(
+    scope: ConnectorScope,
+) -> dict[str, object]:
+    """Validate and return the canonical safe repository-scope metadata."""
+
+    return _validated_scope_config(scope)
+
+
 def _validated_config_values(config: dict[str, object]) -> None:
     repository_id = _repository_id(config.get("repository_id"))
     name = config.get("repository_name")

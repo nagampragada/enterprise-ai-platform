@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
+import hashlib
 import random
 import re
 import time
 from typing import Callable
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 import httpx
 import jwt
@@ -16,13 +17,21 @@ import jwt
 from app.config import GitHubAppSettings
 from application.ports.github_app import (
     GitHubAppClient,
+    GitHubBranchReference,
+    GitHubCommitReference,
+    GitHubGitTree,
+    GitHubGitTreeEntry,
     GitHubInstallation,
     GitHubInstallationAccessToken,
     GitHubProviderAuthenticationError,
     GitHubProviderAuthorizationError,
+    GitHubProviderMalformedResponseError,
     GitHubProviderNotFoundError,
     GitHubProviderRateLimitError,
+    GitHubProviderRedirectError,
+    GitHubProviderResponseTooLargeError,
     GitHubProviderUnavailableError,
+    GitHubRawBlob,
     GitHubRepository,
     GitHubRepositoryAccessGrant,
     GitHubRepositoryPage,
@@ -43,6 +52,9 @@ MAX_LINK_HEADER_BYTES = 8_192
 MIN_INSTALLATION_TOKEN_LIFETIME = timedelta(seconds=30)
 MAX_INSTALLATION_TOKEN_LIFETIME = timedelta(minutes=65)
 INSTALLATION_TOKEN_PERMISSIONS = {"metadata": "read"}
+CONTENT_TOKEN_PERMISSIONS = {"contents": "read", "metadata": "read"}
+MAX_GIT_TREE_ENTRIES = 1_000
+MAX_CONTENT_BLOB_BYTES = 10 * 1024 * 1024
 _REPOSITORY_NAME = re.compile(r"[A-Za-z0-9_.-]{1,100}")
 _ACCOUNT_LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,98}[A-Za-z0-9])?")
 _DEFAULT_BRANCH = re.compile(r"[A-Za-z0-9._/-]{1,255}")
@@ -237,8 +249,51 @@ class GitHubAppRestClient(GitHubAppClient):
             raise GitHubProviderAuthorizationError()
         return GitHubRepositoryAccessGrant(token, repository)
 
+    def create_repository_content_access_token(
+        self,
+        installation_id: int,
+        repository_id: int,
+        *,
+        account_id: int,
+        account_login: str,
+    ) -> GitHubRepositoryAccessGrant:
+        installation_id = _positive_int(installation_id)
+        repository_id = _positive_int(repository_id)
+        account_id = _positive_int(account_id)
+        if not isinstance(account_login, str) or _ACCOUNT_LOGIN.fullmatch(account_login) is None:
+            raise GitHubProviderAuthorizationError()
+        response = self._request(
+            "POST",
+            f"/app/installations/{installation_id}/access_tokens",
+            authorization=f"Bearer {self._app_jwt()}",
+            retry=False,
+            json_data={
+                "repository_ids": [repository_id],
+                "permissions": CONTENT_TOKEN_PERMISSIONS,
+            },
+            expected_statuses=(201,),
+        )
+        body = _json_object(response)
+        token = self._installation_token(body, CONTENT_TOKEN_PERMISSIONS)
+        raw_repositories = body.get("repositories")
+        if body.get("repository_selection") != "selected" or not isinstance(
+            raw_repositories, list
+        ) or len(raw_repositories) != 1:
+            raise GitHubProviderAuthorizationError()
+        repository = _repository(
+            raw_repositories[0],
+            account_id=account_id,
+            account_login=account_login,
+            web_base_url=self._settings.web_base_url,
+        )
+        if repository.repository_id != repository_id:
+            raise GitHubProviderAuthorizationError()
+        return GitHubRepositoryAccessGrant(token, repository)
+
     def _installation_token(
-        self, body: dict[str, object]
+        self,
+        body: dict[str, object],
+        expected_permissions: dict[str, str] = INSTALLATION_TOKEN_PERMISSIONS,
     ) -> GitHubInstallationAccessToken:
         try:
             token = GitHubInstallationAccessToken(
@@ -252,10 +307,177 @@ class GitHubAppRestClient(GitHubAppClient):
         lifetime = token.expires_at - now
         if (
             not MIN_INSTALLATION_TOKEN_LIFETIME <= lifetime <= MAX_INSTALLATION_TOKEN_LIFETIME
-            or permissions != tuple(sorted(INSTALLATION_TOKEN_PERMISSIONS.items()))
+            or permissions != tuple(sorted(expected_permissions.items()))
         ):
             raise GitHubProviderUnavailableError()
         return token
+
+    def get_branch_reference(
+        self,
+        token: GitHubInstallationAccessToken,
+        *,
+        owner_login: str,
+        repository_name: str,
+        branch_name: str,
+    ) -> GitHubBranchReference:
+        self._require_installation_token(token)
+        owner_login = _repository_component(owner_login, _ACCOUNT_LOGIN)
+        repository_name = _repository_component(repository_name, _REPOSITORY_NAME)
+        branch_name = _default_branch(branch_name)
+        if branch_name is None:
+            raise GitHubProviderNotFoundError()
+        response = self._request(
+            "GET",
+            f"/repos/{owner_login}/{repository_name}/branches/{quote(branch_name, safe='')}",
+            authorization=f"Bearer {token.value}",
+            retry=True,
+        )
+        return _branch_reference(_json_object(response), branch_name)
+
+    def get_commit_reference(
+        self,
+        token: GitHubInstallationAccessToken,
+        *,
+        owner_login: str,
+        repository_name: str,
+        commit_object_id: str,
+    ) -> GitHubCommitReference:
+        self._require_installation_token(token)
+        owner_login = _repository_component(owner_login, _ACCOUNT_LOGIN)
+        repository_name = _repository_component(repository_name, _REPOSITORY_NAME)
+        commit_object_id = _git_object_id(commit_object_id)
+        response = self._request(
+            "GET",
+            f"/repos/{owner_login}/{repository_name}/git/commits/{commit_object_id}",
+            authorization=f"Bearer {token.value}",
+            retry=True,
+        )
+        return _commit_reference(_json_object(response), commit_object_id)
+
+    def get_tree(
+        self,
+        token: GitHubInstallationAccessToken,
+        *,
+        owner_login: str,
+        repository_name: str,
+        tree_object_id: str,
+    ) -> GitHubGitTree:
+        self._require_installation_token(token)
+        owner_login = _repository_component(owner_login, _ACCOUNT_LOGIN)
+        repository_name = _repository_component(repository_name, _REPOSITORY_NAME)
+        tree_object_id = _git_object_id(tree_object_id)
+        response = self._request(
+            "GET",
+            f"/repos/{owner_login}/{repository_name}/git/trees/{tree_object_id}",
+            authorization=f"Bearer {token.value}",
+            retry=True,
+        )
+        return _git_tree(_json_object(response), tree_object_id)
+
+    def download_blob(
+        self,
+        token: GitHubInstallationAccessToken,
+        *,
+        owner_login: str,
+        repository_name: str,
+        blob_object_id: str,
+        maximum_bytes: int,
+    ) -> GitHubRawBlob:
+        self._require_installation_token(token)
+        owner_login = _repository_component(owner_login, _ACCOUNT_LOGIN)
+        repository_name = _repository_component(repository_name, _REPOSITORY_NAME)
+        blob_object_id = _git_object_id(blob_object_id)
+        maximum_bytes = _bounded_integer(
+            "blob size", maximum_bytes, 1, MAX_CONTENT_BLOB_BYTES
+        )
+        return self._stream_blob(
+            f"/repos/{owner_login}/{repository_name}/git/blobs/{blob_object_id}",
+            token,
+            maximum_bytes,
+        )
+
+    def _require_installation_token(self, token: GitHubInstallationAccessToken) -> None:
+        if not isinstance(token, GitHubInstallationAccessToken):
+            raise GitHubProviderAuthenticationError()
+        if token.expires_at <= _aware_clock(self._clock()):
+            raise GitHubProviderAuthenticationError()
+
+    def _stream_blob(
+        self,
+        path: str,
+        token: GitHubInstallationAccessToken,
+        maximum_bytes: int,
+    ) -> GitHubRawBlob:
+        deadline = self._monotonic() + self._settings.request_timeout_seconds
+        attempts = min(self._settings.max_retries + 1, 3)
+        headers = {
+            "Accept": "application/vnd.github.raw+json",
+            "Accept-Encoding": "identity",
+            "Authorization": f"Bearer {token.value}",
+            "X-GitHub-Api-Version": GITHUB_API_VERSION,
+            "User-Agent": "enterprise-ai-platform",
+        }
+        url = f"{self._settings.api_base_url.rstrip('/')}{path}"
+        for attempt in range(attempts):
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                raise GitHubProviderUnavailableError()
+            try:
+                with self._http.stream(
+                    "GET",
+                    url,
+                    headers=headers,
+                    timeout=httpx.Timeout(remaining, connect=min(5.0, remaining)),
+                    follow_redirects=False,
+                ) as response:
+                    rate_limited = response.status_code == 429 or (
+                        response.status_code == 403
+                        and (
+                            response.headers.get("X-RateLimit-Remaining") == "0"
+                            or "Retry-After" in response.headers
+                        )
+                    )
+                    if rate_limited:
+                        delay = _rate_limit_delay(response, self._clock())
+                        if attempt + 1 < attempts and delay is not None:
+                            self._bounded_sleep(delay, deadline, required=True)
+                            continue
+                        raise GitHubProviderRateLimitError()
+                    if response.status_code in {502, 503, 504} and attempt + 1 < attempts:
+                        self._bounded_sleep(min(2**attempt, 4), deadline, required=False)
+                        continue
+                    if response.status_code == 401:
+                        raise GitHubProviderAuthenticationError()
+                    if response.status_code == 403:
+                        raise GitHubProviderAuthorizationError()
+                    if response.status_code == 404:
+                        raise GitHubProviderNotFoundError()
+                    if 300 <= response.status_code < 400:
+                        raise GitHubProviderRedirectError()
+                    if response.status_code >= 500:
+                        raise GitHubProviderUnavailableError()
+                    if response.status_code != 200:
+                        if 400 <= response.status_code < 500:
+                            raise GitHubProviderAuthorizationError()
+                        raise GitHubProviderUnavailableError()
+                    content_encoding = response.headers.get("Content-Encoding")
+                    if content_encoding is not None and content_encoding.casefold() != "identity":
+                        raise GitHubProviderMalformedResponseError()
+                    _bounded_blob_length(response, maximum_bytes)
+                    content = bytearray()
+                    digest = hashlib.sha256()
+                    for chunk in response.iter_raw():
+                        if len(content) + len(chunk) > maximum_bytes:
+                            raise GitHubProviderResponseTooLargeError()
+                        content.extend(chunk)
+                        digest.update(chunk)
+                    immutable = bytes(content)
+                    return GitHubRawBlob(immutable, len(immutable), digest.hexdigest())
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                if attempt + 1 >= attempts:
+                    raise GitHubProviderUnavailableError() from exc
+                self._bounded_sleep(min(2**attempt, 4), deadline, required=False)
+        raise GitHubProviderUnavailableError()
 
     def list_installation_repositories(
         self,
@@ -387,41 +609,41 @@ class GitHubAppRestClient(GitHubAppClient):
             if json_data is not None:
                 request_arguments["json"] = json_data
             try:
-                response = self._http.request(method, url, **request_arguments)
+                with self._http.stream(method, url, **request_arguments) as streamed:
+                    rate_limited = streamed.status_code == 429 or (
+                        streamed.status_code == 403
+                        and (
+                            streamed.headers.get("X-RateLimit-Remaining") == "0"
+                            or "Retry-After" in streamed.headers
+                        )
+                    )
+                    if rate_limited:
+                        delay = _rate_limit_delay(streamed, self._clock())
+                        if attempt + 1 < attempts and delay is not None:
+                            self._bounded_sleep(delay, deadline, required=True)
+                            continue
+                        raise GitHubProviderRateLimitError()
+                    if streamed.status_code in {502, 503, 504} and attempt + 1 < attempts:
+                        self._bounded_sleep(min(2**attempt, 4), deadline, required=False)
+                        continue
+                    if streamed.status_code == 401:
+                        raise GitHubProviderAuthenticationError()
+                    if streamed.status_code == 403:
+                        raise GitHubProviderAuthorizationError()
+                    if streamed.status_code == 404:
+                        raise GitHubProviderNotFoundError()
+                    if streamed.status_code >= 500:
+                        raise GitHubProviderUnavailableError()
+                    if streamed.status_code not in expected_statuses:
+                        if 400 <= streamed.status_code < 500:
+                            raise GitHubProviderAuthorizationError()
+                        raise GitHubProviderUnavailableError()
+                    response = _bounded_response(streamed)
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
                 if attempt + 1 >= attempts:
                     raise GitHubProviderUnavailableError() from exc
                 self._bounded_sleep(min(2**attempt, 4), deadline, required=False)
                 continue
-            _bounded_response(response)
-            rate_limited = response.status_code == 429 or (
-                response.status_code == 403
-                and (
-                    response.headers.get("X-RateLimit-Remaining") == "0"
-                    or "Retry-After" in response.headers
-                )
-            )
-            if rate_limited:
-                delay = _rate_limit_delay(response, self._clock())
-                if attempt + 1 < attempts and delay is not None:
-                    self._bounded_sleep(delay, deadline, required=True)
-                    continue
-                raise GitHubProviderRateLimitError()
-            if response.status_code in {502, 503, 504} and attempt + 1 < attempts:
-                self._bounded_sleep(min(2**attempt, 4), deadline, required=False)
-                continue
-            if response.status_code == 401:
-                raise GitHubProviderAuthenticationError()
-            if response.status_code == 403:
-                raise GitHubProviderAuthorizationError()
-            if response.status_code == 404:
-                raise GitHubProviderNotFoundError()
-            if response.status_code >= 500:
-                raise GitHubProviderUnavailableError()
-            if response.status_code not in expected_statuses:
-                if 400 <= response.status_code < 500:
-                    raise GitHubProviderAuthorizationError()
-                raise GitHubProviderUnavailableError()
             return response
         raise GitHubProviderUnavailableError()
 
@@ -527,6 +749,81 @@ def _json_object(response: httpx.Response) -> dict[str, object]:
     return value
 
 
+def _branch_reference(
+    value: dict[str, object], expected_branch: str
+) -> GitHubBranchReference:
+    try:
+        if value.get("name") != expected_branch:
+            raise ValueError
+        commit = value["commit"]
+        if not isinstance(commit, dict):
+            raise TypeError
+        git_commit = commit["commit"]
+        if not isinstance(git_commit, dict):
+            raise TypeError
+        tree = git_commit["tree"]
+        if not isinstance(tree, dict):
+            raise TypeError
+        return GitHubBranchReference(
+            expected_branch,
+            _git_object_id(commit["sha"]),
+            _git_object_id(tree["sha"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise GitHubProviderMalformedResponseError() from exc
+
+
+def _commit_reference(
+    value: dict[str, object], expected_commit: str
+) -> GitHubCommitReference:
+    try:
+        tree = value["tree"]
+        if not isinstance(tree, dict):
+            raise TypeError
+        commit_object_id = _git_object_id(value["sha"])
+        if commit_object_id != expected_commit:
+            raise ValueError
+        return GitHubCommitReference(commit_object_id, _git_object_id(tree["sha"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise GitHubProviderMalformedResponseError() from exc
+
+
+def _git_tree(value: dict[str, object], expected_tree: str) -> GitHubGitTree:
+    try:
+        object_id = _git_object_id(value["sha"])
+        truncated = value["truncated"]
+        entries = value["tree"]
+        if object_id != expected_tree or not isinstance(truncated, bool):
+            raise ValueError
+        if not isinstance(entries, list):
+            raise TypeError
+        if len(entries) > MAX_GIT_TREE_ENTRIES:
+            raise GitHubProviderResponseTooLargeError()
+        parsed: list[GitHubGitTreeEntry] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise TypeError
+            size = entry.get("size")
+            if size is not None and (
+                isinstance(size, bool) or not isinstance(size, int) or size < 0
+            ):
+                raise ValueError
+            parsed.append(
+                GitHubGitTreeEntry(
+                    _nonblank(entry["path"], 1_024),
+                    _nonblank(entry["mode"], 16),
+                    _nonblank(entry["type"], 16),
+                    _git_object_id(entry["sha"]),
+                    size,
+                )
+            )
+        return GitHubGitTree(object_id, tuple(parsed), truncated)
+    except GitHubProviderResponseTooLargeError:
+        raise
+    except (KeyError, TypeError, ValueError) as exc:
+        raise GitHubProviderMalformedResponseError() from exc
+
+
 def _permissions(value: object) -> tuple[tuple[str, str], ...]:
     if not isinstance(value, dict) or not 1 <= len(value) <= 100:
         raise ValueError
@@ -542,15 +839,44 @@ def _permissions(value: object) -> tuple[tuple[str, str], ...]:
     return tuple(sorted(result))
 
 
-def _bounded_response(response: httpx.Response) -> None:
+def _bounded_response(response: httpx.Response) -> httpx.Response:
     length = response.headers.get("Content-Length")
     try:
-        if length is not None and int(length) > MAX_RESPONSE_BYTES:
+        if length is not None and (int(length) < 0 or int(length) > MAX_RESPONSE_BYTES):
             raise GitHubProviderUnavailableError()
     except ValueError as exc:
         raise GitHubProviderUnavailableError() from exc
-    if len(response.content) > MAX_RESPONSE_BYTES:
-        raise GitHubProviderUnavailableError()
+    if response.is_stream_consumed:
+        if len(response.content) > MAX_RESPONSE_BYTES:
+            raise GitHubProviderUnavailableError()
+        content = response.content
+    else:
+        buffered = bytearray()
+        for chunk in response.iter_raw():
+            if len(buffered) + len(chunk) > MAX_RESPONSE_BYTES:
+                raise GitHubProviderUnavailableError()
+            buffered.extend(chunk)
+        content = bytes(buffered)
+    return httpx.Response(
+        response.status_code,
+        headers=response.headers,
+        content=content,
+        request=response.request,
+    )
+
+
+def _bounded_blob_length(response: httpx.Response, maximum_bytes: int) -> None:
+    value = response.headers.get("Content-Length")
+    if value is None:
+        return
+    try:
+        length = int(value)
+    except ValueError as exc:
+        raise GitHubProviderMalformedResponseError() from exc
+    if length < 0:
+        raise GitHubProviderMalformedResponseError()
+    if length > maximum_bytes:
+        raise GitHubProviderResponseTooLargeError()
 
 
 def _positive_int(value: object) -> int:
@@ -558,6 +884,16 @@ def _positive_int(value: object) -> int:
         isinstance(value, bool)
         or not isinstance(value, int)
         or not 1 <= value <= 9_223_372_036_854_775_807
+    ):
+        raise ValueError
+    return value
+
+
+def _git_object_id(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) not in {40, 64}
+        or re.fullmatch(r"[0-9a-f]+", value) is None
     ):
         raise ValueError
     return value

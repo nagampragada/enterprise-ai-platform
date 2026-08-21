@@ -14,10 +14,16 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from application.ports.github_app import (
+    GitHubBranchReference,
+    GitHubCommitReference,
     GitHubInstallationAccessToken,
     GitHubRepository,
     GitHubRepositoryAccessGrant,
     GitHubRepositoryPage,
+)
+from application.services.github_repository_content_service import (
+    GitHubRepositoryContentNotFound,
+    GitHubRepositoryContentService,
 )
 from application.services.github_repository_selection_service import (
     GitHubRepositorySelectionConflict,
@@ -96,6 +102,24 @@ class Client:
         assert not self.session.in_transaction()
         self.list_calls.append((page, page_size, account_id, account_login))
         return GitHubRepositoryPage((repository(),), 1, 1, False, 1)
+
+    def create_repository_content_access_token(
+        self, installation_id, repository_id, *, account_id, account_login
+    ):
+        assert not self.session.in_transaction()
+        self.token_calls.append((installation_id, repository_id, account_id, account_login))
+        return GitHubRepositoryAccessGrant(
+            GitHubInstallationAccessToken("ghs_request_scoped", NOW + timedelta(hours=1)),
+            repository(),
+        )
+
+    def get_branch_reference(self, token, **kwargs):
+        assert not self.session.in_transaction()
+        return GitHubBranchReference("main", "a" * 40, "b" * 40)
+
+    def get_commit_reference(self, token, **kwargs):
+        assert not self.session.in_transaction()
+        return GitHubCommitReference("a" * 40, "b" * 40)
 
 
 def _seed(factory):
@@ -244,3 +268,32 @@ def test_concurrent_select_and_deselect_leave_one_consistent_scope(factory):
         rows=tuple(check.scalars(select(ConnectorScope)).all())
         assert len(rows)==1 and rows[0].status in {"active","removed"}
         assert (rows[0].status=="removed") == (rows[0].removed_at is not None)
+
+
+def test_content_authorization_is_tenant_safe_read_only_and_provider_runs_after_rollback(factory):
+    org, other_org, user, connector, spaces = _seed(factory)
+    session = factory()
+    client = Client(session)
+    selection = GitHubRepositorySelectionService(session, client, clock=lambda: NOW)
+    context, repo = _verified(selection, session, org, connector, spaces[0])
+    selected = selection.persist(context, repo, user)
+    session.commit()
+    reader = GitHubRepositoryContentService(session, client)
+    with pytest.raises(GitHubRepositoryContentNotFound):
+        reader.authorize(other_org, connector, selected.scope_id)
+    session.rollback()
+    authorization = reader.authorize(org, connector, selected.scope_id)
+    assert session.in_transaction()
+    before = {
+        table: session.scalar(text(f"SELECT count(*) FROM {table}"))
+        for table in ("source_items", "documents", "connector_sync_runs")
+    }
+    session.rollback()
+    result = reader.resolve_default_branch_snapshot(authorization)
+    assert result.repository_id == 501 and result.commit_object_id == "a" * 40
+    after = {
+        table: session.scalar(text(f"SELECT count(*) FROM {table}"))
+        for table in ("source_items", "documents", "connector_sync_runs")
+    }
+    assert after == before == {"source_items": 0, "documents": 0, "connector_sync_runs": 0}
+    session.close()
