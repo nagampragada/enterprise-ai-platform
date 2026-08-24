@@ -14,7 +14,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlparse
 import httpx
 import jwt
 
-from app.config import GitHubAppSettings
+from app.config import GitHubAppSettings, GitHubWorkerSettings
 from application.ports.github_app import (
     GitHubAppClient,
     GitHubBranchReference,
@@ -65,7 +65,7 @@ _REPOSITORY_VISIBILITIES = frozenset({"public", "private", "internal"})
 class GitHubAppRestClient(GitHubAppClient):
     def __init__(
         self,
-        settings: GitHubAppSettings,
+        settings: GitHubAppSettings | GitHubWorkerSettings,
         secrets: SecretStore,
         *,
         http_client: httpx.Client | None = None,
@@ -100,22 +100,24 @@ class GitHubAppRestClient(GitHubAppClient):
 
     @property
     def callback_url(self) -> str:
-        return self._settings.callback_url
+        return self._browser_settings().callback_url
 
     def build_installation_url(self, state: str) -> str:
+        settings = self._browser_settings()
         _opaque(state, "GitHub installation state", 43, 512)
         return (
-            f"{self._settings.web_base_url.rstrip('/')}/apps/"
-            f"{self._settings.app_slug}/installations/new?{urlencode({'state': state})}"
+            f"{settings.web_base_url.rstrip('/')}/apps/"
+            f"{settings.app_slug}/installations/new?{urlencode({'state': state})}"
         )
 
     def build_authorization_url(self, state: str, pkce_challenge: str) -> str:
+        settings = self._browser_settings()
         _opaque(state, "GitHub authorization state", 43, 512)
         _opaque(pkce_challenge, "GitHub PKCE challenge", 43, 128)
         query = urlencode(
             {
-                "client_id": self._settings.client_id,
-                "redirect_uri": self._settings.callback_url,
+                "client_id": settings.client_id,
+                "redirect_uri": settings.callback_url,
                 "state": state,
                 "code_challenge": pkce_challenge,
                 "code_challenge_method": "S256",
@@ -128,9 +130,8 @@ class GitHubAppRestClient(GitHubAppClient):
     ) -> GitHubUserAccessToken:
         _opaque(code, "GitHub authorization code", 1, 1024)
         _opaque(pkce_verifier, "GitHub PKCE verifier", 43, 512)
-        client_secret = self._secrets.retrieve(
-            self._settings.client_secret_reference
-        ).value
+        settings = self._browser_settings()
+        client_secret = self._secrets.retrieve(settings.client_secret_reference).value
         response = self._request(
             "POST",
             "/login/oauth/access_token",
@@ -141,7 +142,7 @@ class GitHubAppRestClient(GitHubAppClient):
                 "client_id": self._settings.client_id,
                 "client_secret": client_secret,
                 "code": code,
-                "redirect_uri": self._settings.callback_url,
+                "redirect_uri": settings.callback_url,
                 "code_verifier": pkce_verifier,
             },
         )
@@ -156,6 +157,11 @@ class GitHubAppRestClient(GitHubAppClient):
         ):
             raise GitHubProviderAuthenticationError()
         return GitHubUserAccessToken(token)
+
+    def _browser_settings(self) -> GitHubAppSettings:
+        if not isinstance(self._settings, GitHubAppSettings):
+            raise GitHubProviderUnavailableError()
+        return self._settings
 
     def get_authenticated_user(self, token: GitHubUserAccessToken) -> GitHubUser:
         body = _json_object(self._user_request("/user", token))

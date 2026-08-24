@@ -16,8 +16,8 @@ from uuid import uuid4
 from sqlalchemy.orm import Session
 
 from app.config import (
-    load_github_app_settings_from_environment,
-    load_google_secret_manager_settings_from_environment,
+    WorkerProcessSettings,
+    validate_worker_process_environment,
 )
 from application.services.connector_sync_execution_service import (
     AcquiredRoutedSyncAttempt,
@@ -182,12 +182,14 @@ class ConnectorSyncWorkerHost:
 
 def compose_connector_sync_worker_host(settings: ConnectorWorkerSettings,
                                        *, session_factory=SessionLocal,
-                                       shutdown_event=None):
+                                       shutdown_event=None,
+                                       process_settings: WorkerProcessSettings | None = None):
+    runtime = process_settings or validate_worker_process_environment()
     secret_store = GoogleSecretManagerSecretStore(
-        load_google_secret_manager_settings_from_environment()
+        runtime.secret_manager
     )
     github_client = GitHubAppRestClient(
-        load_github_app_settings_from_environment(), secret_store
+        runtime.github, secret_store
     )
     embedding = OpenAIEmbeddingProvider()
     extractors = create_default_content_extractor_registry()
@@ -242,10 +244,13 @@ def install_shutdown_signal_handlers(event: threading.Event) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     try:
+        process_settings = validate_worker_process_environment()
         settings = ConnectorWorkerSettings.from_environment(argv)
         shutdown = threading.Event()
         install_shutdown_signal_handlers(shutdown)
-        return compose_connector_sync_worker_host(settings, shutdown_event=shutdown).run()
+        return compose_connector_sync_worker_host(
+            settings, shutdown_event=shutdown, process_settings=process_settings
+        ).run()
     except Exception as error:
         LOGGER.error("event=worker_startup_failed error_type=%s", type(error).__name__)
         return 1

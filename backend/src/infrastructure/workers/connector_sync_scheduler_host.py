@@ -20,6 +20,7 @@ from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
+from app.config import validate_scheduler_process_environment
 from application.services.connector_sync_schedule_service import (
     ConnectorSyncScheduleService,
     DueScheduleResult,
@@ -48,7 +49,7 @@ class InvalidSchedulerHostConfiguration(ValueError):
 class SchedulerHostExitCode(IntEnum):
     SUCCESS = 0
     HOST_FAILURE = 1
-    NO_WORK = 2
+    NO_WORK = 0
     SHUTDOWN = 130
 
 
@@ -283,6 +284,7 @@ def install_shutdown_signal_handlers(shutdown_event: threading.Event) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     try:
+        validate_scheduler_process_environment()
         settings = ConnectorSyncSchedulerHostSettings.from_environment(argv)
         shutdown_event = threading.Event()
         install_shutdown_signal_handlers(shutdown_event)

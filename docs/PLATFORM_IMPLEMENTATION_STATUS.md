@@ -27,6 +27,8 @@ This document treats executable code, migrations, runtime route registration, an
 
 The repository is building a multi-tenant enterprise knowledge platform. Organizations will eventually configure controlled data connectors, ingest and index documents, retrieve only content a user is authorized to see, and use a future answer/agent layer to produce grounded responses with citations.
 
+The backend now has a statically tested, non-root Python 3.12 production image foundation, a validated single-process Uvicorn launcher, process-specific sandbox/production gates, strict liveness/readiness, Cloud Run Job-compatible one-shot exit codes, and a sandbox-only atomic identity/knowledge-space bootstrap. This is packaging and runbook implementation only: the image has not been built in Docker, and no GCP, Cloud Run, Cloud SQL, Secret Manager, IAM, or GitHub resource has been created.
+
 Operationally today, the FastAPI backend supports authentication and authenticated manual upload of TXT, Markdown, DOCX, and PDF files through a fully tested extraction, deterministic chunking, embedding, and PostgreSQL/pgvector persistence pipeline. The backend also contains secure connector-management APIs, recurring interval schedules, a database-only scheduler host, durable job control, provider-neutral administrator job operations, a continuous and one-shot worker host, immutable source versioning, and a permission-aware vector retrieval repository. GitHub is the first cloud connector: organization administrators can complete its GitHub App installation lifecycle, discover a bounded live repository page, persist explicit repository-to-knowledge-space selections after authoritative restricted-token revalidation, and request/list/inspect/cancel synchronization jobs through database-only APIs. Its staged service pins an immutable snapshot, traverses non-recursive trees with a durable DFS cursor, skips unchanged content before download, safely retires present-but-unindexable content, and enters bounded resumable reconciliation only after authoritative traversal. It applies rename as create-plus-delete and preserves immutable history while removing stale content from retrieval. The production connector worker routes GitHub jobs and uses an independent fenced heartbeat. A production Google Cloud Secret Manager adapter supplies immutable GitHub configuration references, ephemeral PKCE storage, and on-demand private-key access through ADC-based, fail-closed composition. No GCP resource or Cloud Run deployment has been provisioned. Retrieval is not exposed by an API.
 
 The product is therefore a **tested backend foundation and vertical-slice implementation, not a finished user-facing product**. Its strongest capability is the tenant-safe scheduled content ingestion/synchronization/indexing data plane with bounded leases, fencing, retries, rollback, continuous Local Folder execution, and authorization-before-ranking retrieval. Its primary gaps are cron/timezone scheduling, broader connector lifecycle operations, search APIs, answer generation, deployment supervision, and a frontend.
@@ -113,7 +115,7 @@ Evidence: `backend/pyproject.toml`, `infra/docker/docker-compose.postgres.yml`, 
 | pypdf | `>=5.0,<6.0` | PDF extraction | Complete |
 | python-multipart | `>=0.0.9,<1.0` | Upload parsing | Complete |
 | pytest/httpx/reportlab | pytest 8, httpx 0.27+, reportlab 4 | Unit/API/integration/PDF fixture tests | Complete |
-| Docker | pgvector PostgreSQL only | Local database with health check and named volume | Partial |
+| Docker | PostgreSQL Compose plus common backend image | Local database and non-root multi-operation backend packaging | Implemented; real image build pending |
 | Next.js/React/TypeScript | Mentioned in plans only | Empty frontend directory skeleton; no package manifest or code | Planned |
 | Redis | Mentioned by old README only | No dependency or implementation | Planned/stale claim |
 | LangGraph | Mentioned aspirationally in `VISION.md` | No dependency/import/runtime | Planned, not used |
@@ -546,7 +548,7 @@ One-shot uses the same recovery, claim, lease, fencing, staged worker, and outco
 
 Host defaults are: generated `local-folder-<uuid>` worker ID, 5-second idle interval, 15-minute lease, 60-second heartbeat target, 5 maximum consecutive host failures, 1-to-60-second host backoff with 20% jitter, 5-minute graceful shutdown limit, and expired recovery limit 10. Environment names are `LOCAL_FOLDER_WORKER_ID`, `LOCAL_FOLDER_WORKER_IDLE_SECONDS`, `LOCAL_FOLDER_WORKER_LEASE_SECONDS`, `LOCAL_FOLDER_WORKER_HEARTBEAT_SECONDS`, `LOCAL_FOLDER_WORKER_MAX_FAILURES`, `LOCAL_FOLDER_WORKER_BACKOFF_MIN_SECONDS`, `LOCAL_FOLDER_WORKER_BACKOFF_MAX_SECONDS`, `LOCAL_FOLDER_WORKER_BACKOFF_JITTER`, `LOCAL_FOLDER_WORKER_SHUTDOWN_TIMEOUT_SECONDS`, and `LOCAL_FOLDER_WORKER_RECOVERY_LIMIT`. Durations are positive and hard-bounded, heartbeat is strictly shorter than lease, backoff maximum is at least its minimum, and malformed values fail startup. No organization, connector, scope, job, path, database URL, or secret selector is accepted.
 
-`SIGINT` and supported `SIGTERM` handlers only set a shutdown event. Idle/backoff waits stop promptly; a claimed job stops at the next committed staged boundary without being marked successful. One extraction or embedding call cannot be interrupted or renewed by a shared-session heartbeat thread. The default 15-minute lease is therefore a conservative single-step operational limit; operators must choose a lease longer than the maximum expected indivisible provider step. If such a step returns after the graceful limit, the host exits nonzero after reaching the safe boundary. A production process supervisor, readiness endpoint, service manifest, and restart policy remain deployment work.
+`SIGINT` and supported `SIGTERM` handlers only set a shutdown event. Idle/backoff waits stop promptly; a claimed job stops at the next committed staged boundary without being marked successful. One extraction or embedding call cannot be interrupted or renewed by a shared-session heartbeat thread. The default 15-minute lease is therefore a conservative single-step operational limit; operators must choose a lease longer than the maximum expected indivisible provider step. If such a step returns after the graceful limit, the host exits nonzero after reaching the safe boundary. Strict API readiness and Cloud Run Job-compatible connector worker/scheduler commands are implemented; a production process supervisor, deployment manifest, and restart policy remain deployment work.
 
 ## 19. Immutable document versions and indexing state
 
@@ -613,7 +615,7 @@ Generated OpenAPI verifies **26 application operations across 18 paths**. FastAP
 | Method | Route | Authentication | Purpose | Request | Response | Status |
 |---|---|---|---|---|---|---|
 | GET | `/health` | Public | Process health | None | `{"status":"healthy"}` | Complete |
-| GET | `/api/v1/health` | Public | Database health without raw diagnostics | None | status + database healthy/message | Complete |
+| GET | `/api/v1/health` | Public | Strict configuration/database/schema readiness | None | fixed checks; 503 when unready | Complete |
 | POST | `/api/v1/auth/login` | Public | Login and create refresh session | JSON organization UUID, email, password | user + access/refresh tokens | Complete |
 | POST | `/api/v1/auth/refresh` | Public | Rotate refresh/access tokens | JSON refresh token | token pair | Complete |
 | GET | `/api/v1/auth/me` | Bearer | Resolve current active user | None | user/org/email/display name | Complete |
@@ -832,8 +834,8 @@ Known output at snapshot:
 | Worker runner | Bounded staged callable class implemented |
 | Continuous worker host | Direct module with continuous and one-shot modes implemented |
 | Scheduler/automatic recovery | Continuous/one-shot interval scheduler and worker expired recovery implemented |
-| Worker health/readiness | Not implemented |
-| Backend/frontend containers | Not implemented |
+| Worker health/readiness | One-shot connector worker/scheduler use zero for success or no work and nonzero for failures; no HTTP endpoint |
+| Backend/frontend containers | Common non-root backend image implemented and statically tested; no frontend image; real build pending |
 | Deployment manifests | Environment directories exist but contain no manifests |
 | CI/CD | No executable GitHub Actions workflow found |
 | Secret manager | Google Cloud adapter implemented with ADC, strict version references, CRC32C, bounded retries, and narrow cleanup; GCP resources/IAM/secrets not provisioned |

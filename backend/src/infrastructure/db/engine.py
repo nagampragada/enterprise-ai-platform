@@ -6,18 +6,20 @@ from functools import lru_cache
 
 from sqlalchemy import Engine, create_engine
 
-from app.config import get_settings
+from app.config import get_database_settings
 
 
 @lru_cache(maxsize=1)
 def _build_engine() -> Engine:
-    settings = get_settings()
+    settings = get_database_settings()
     return create_engine(
         settings.database_url,
         pool_pre_ping=True,
         pool_size=5,
         max_overflow=10,
         pool_recycle=1800,
+        pool_timeout=5,
+        connect_args={"connect_timeout": 5},
         future=True,
     )
 

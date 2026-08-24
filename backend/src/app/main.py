@@ -7,8 +7,11 @@ from fastapi import FastAPI
 from app.api.router import api_router
 from app.config import (
     GitHubAppSettings,
+    STRICT_RUNTIME_ENVIRONMENTS,
+    load_runtime_environment,
     load_github_app_settings_from_environment,
     load_google_secret_manager_settings_from_environment,
+    validate_api_process_environment,
 )
 from application.ports.secret_store import SecretStore
 from infrastructure.secrets.google_secret_manager import GoogleSecretManagerSecretStore
@@ -35,6 +38,7 @@ def configure_github_app(application:FastAPI,secret_store:SecretStore,*,
     resolved=settings or load_github_app_settings_from_environment()
     application.state.secret_store=secret_store
     application.state.github_app_settings=resolved
+    application.state.github_composition_ready=True
 
 
 def configure_github_app_from_environment(application: FastAPI) -> bool:
@@ -49,9 +53,19 @@ def configure_github_app_from_environment(application: FastAPI) -> bool:
         for name in ("secret_store", "github_app_settings"):
             if hasattr(application.state, name):
                 delattr(application.state, name)
+        application.state.github_composition_ready=False
         return False
     configure_github_app(application, secret_store, settings=github_settings)
     return True
 
 
-configure_github_app_from_environment(app)
+_runtime_environment = load_runtime_environment()
+if _runtime_environment in STRICT_RUNTIME_ENVIRONMENTS:
+    try:
+        validate_api_process_environment()
+    except Exception:
+        raise RuntimeError("API runtime configuration is invalid") from None
+    if not configure_github_app_from_environment(app):
+        raise RuntimeError("API runtime composition is unavailable")
+else:
+    configure_github_app_from_environment(app)

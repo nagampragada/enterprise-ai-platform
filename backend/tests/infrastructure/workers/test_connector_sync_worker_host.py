@@ -73,3 +73,21 @@ def test_unsupported_persisted_type_fails_nonretryably_without_dispatch():
     assert host.run_cycle() == "failed"
     execution.fail_attempt.assert_called_once()
     local.execute.assert_not_called(); github.execute.assert_not_called()
+
+
+def test_one_shot_no_work_exits_successfully():
+    execution = Mock()
+    execution.recover_expired_routed.return_value = ()
+    execution.acquire_one_routed.return_value = None
+    session = Mock()
+    host = ConnectorSyncWorkerHost(
+        lambda: session,
+        lambda _session: execution,
+        Mock(),
+        Mock(),
+        _settings(),
+    )
+
+    assert host.run() == 0
+    session.commit.assert_called_once()
+    session.close.assert_called_once()

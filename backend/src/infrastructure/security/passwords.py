@@ -9,6 +9,27 @@ from argon2.exceptions import InvalidHashError, VerificationError
 
 
 _PASSWORD_HASHER: Final[PasswordHasher] = PasswordHasher()
+MINIMUM_STRONG_PASSWORD_LENGTH: Final[int] = 14
+
+
+def validate_password_strength(password: str) -> str:
+    """Validate bootstrap-grade password strength without exposing diagnostics."""
+    if (
+        not isinstance(password, str)
+        or len(password) < MINIMUM_STRONG_PASSWORD_LENGTH
+        or len(password) > 256
+        or any(character.isspace() for character in password)
+    ):
+        raise ValueError("Password does not satisfy the security policy")
+    classes = (
+        any(character.islower() for character in password),
+        any(character.isupper() for character in password),
+        any(character.isdigit() for character in password),
+        any(not character.isalnum() for character in password),
+    )
+    if sum(classes) < 3:
+        raise ValueError("Password does not satisfy the security policy")
+    return password
 
 
 def hash_password(password: str) -> str:

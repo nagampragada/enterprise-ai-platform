@@ -7,7 +7,7 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
-from app.config import get_settings
+from app.config import get_database_settings, validate_migration_process_environment
 from infrastructure.db.base import Base
 from infrastructure.db import models  # noqa: F401
 
@@ -20,7 +20,7 @@ if config.config_file_name is not None:
 # to application settings when no URL was provided.
 configured_url = config.get_main_option("sqlalchemy.url")
 if not configured_url:
-    settings = get_settings()
+    settings = validate_migration_process_environment()
     config.set_main_option("sqlalchemy.url", settings.database_url)
 
 target_metadata = Base.metadata

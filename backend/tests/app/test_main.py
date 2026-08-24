@@ -33,17 +33,22 @@ def test_get_api_v1_health_returns_database_status(monkeypatch) -> None:
     monkeypatch.setattr(
         api_router_module,
         "check_database_connection",
-        lambda: DatabaseHealthResult(healthy=True, message="Database connection is healthy."),
+        lambda: DatabaseHealthResult(
+            healthy=True,
+            message="Database connection is healthy.",
+            schema_current=True,
+        ),
     )
 
     response = client.get("/api/v1/health")
 
     assert response.status_code == 200
     assert response.json() == {
-        "status": "healthy",
-        "database": {
-            "healthy": True,
-            "message": "Database connection is healthy.",
+        "status": "ready",
+        "checks": {
+            "configuration": "ready",
+            "database": "ready",
+            "schema": "ready",
         },
     }
 
@@ -60,9 +65,24 @@ def test_database_failure_is_represented_safely_without_credentials(monkeypatch)
 
     response = client.get("/api/v1/health")
 
-    assert response.status_code == 200
+    assert response.status_code == 503
     body = response.json()
-    assert body["database"]["healthy"] is False
-    assert body["database"]["message"] == "Database connection check failed."
-    assert "secret-password" not in body["database"]["message"]
-    assert "postgresql://" not in body["database"]["message"]
+    assert body["status"] == "not_ready"
+    assert body["checks"]["database"] == "not_ready"
+    assert "secret-password" not in response.text
+    assert "postgresql://" not in response.text
+
+
+def test_configuration_failure_is_not_ready(monkeypatch) -> None:
+    client = TestClient(app)
+    monkeypatch.setattr(api_router_module, "_configuration_ready", lambda _request: False)
+    monkeypatch.setattr(
+        api_router_module,
+        "check_database_connection",
+        lambda: DatabaseHealthResult(True, "ignored", True),
+    )
+
+    response = client.get("/api/v1/health")
+
+    assert response.status_code == 503
+    assert response.json()["checks"]["configuration"] == "not_ready"

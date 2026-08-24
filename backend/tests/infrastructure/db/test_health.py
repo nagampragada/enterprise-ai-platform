@@ -9,6 +9,7 @@ class FakeConnection:
     def __init__(self, should_fail: bool = False) -> None:
         self.should_fail = should_fail
         self.executed = False
+        self.statements = []
 
     def __enter__(self):
         return self
@@ -20,7 +21,10 @@ class FakeConnection:
         if self.should_fail:
             raise RuntimeError("database unavailable")
         self.executed = True
-        return SimpleNamespace()
+        self.statements.append(str(statement))
+        return SimpleNamespace(
+            scalar_one_or_none=lambda: db_health.EXPECTED_ALEMBIC_REVISION
+        )
 
 
 class FakeEngine:
@@ -37,6 +41,7 @@ def test_check_database_connection_reports_healthy(monkeypatch) -> None:
     result = db_health.check_database_connection()
 
     assert result.healthy is True
+    assert result.schema_current is True
     assert result.message == "Database connection is healthy."
 
 

@@ -12,22 +12,38 @@ from infrastructure.db.engine import engine
 
 
 logger = logging.getLogger(__name__)
+EXPECTED_ALEMBIC_REVISION = "20260828_000019"
+READINESS_STATEMENT_TIMEOUT_MILLISECONDS = 2_000
 
 
 @dataclass(frozen=True)
 class DatabaseHealthResult:
     healthy: bool
     message: str
+    schema_current: bool = False
 
 
 def check_database_connection() -> DatabaseHealthResult:
     try:
         with engine.connect() as connection:
+            connection.execute(
+                text(
+                    f"SET LOCAL statement_timeout = "
+                    f"'{READINESS_STATEMENT_TIMEOUT_MILLISECONDS}ms'"
+                )
+            )
             connection.execute(text("SELECT 1"))
-        return DatabaseHealthResult(healthy=True, message="Database connection is healthy.")
+            revision = connection.execute(
+                text("SELECT version_num FROM alembic_version LIMIT 1")
+            ).scalar_one_or_none()
+        return DatabaseHealthResult(
+            healthy=True,
+            message="Database connection is healthy.",
+            schema_current=revision == EXPECTED_ALEMBIC_REVISION,
+        )
     except SQLAlchemyError:
-        logger.exception("Database connection health check failed")
+        logger.warning("event=database_readiness_failed")
         return DatabaseHealthResult(healthy=False, message="Database connection check failed.")
     except Exception:
-        logger.exception("Unexpected database connection health check failure")
+        logger.warning("event=database_readiness_failed")
         return DatabaseHealthResult(healthy=False, message="Database connection check failed.")

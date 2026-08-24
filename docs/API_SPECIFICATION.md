@@ -42,3 +42,9 @@ No request body is needed; arbitrary fields are rejected. Queued and retry-waiti
 Job responses contain platform job, connector, and scope IDs; deliberately mapped mode, trigger, and status; attempt counts; next-attempt, completion, and creation timestamps; cancellation state; and bounded safe error category/code. Run summaries contain run ID, deliberate status/trigger values, attempt number, start/completion/cancellation timestamps, and selected aggregate counters.
 
 The operations never expose organization ID, requester identity, priority, worker owner, lease UUID, fence, heartbeat or expiry, cursor data, provider metadata, installation or credential IDs, secret references, tokens, raw exceptions or summaries, source content, chunks, embeddings, vectors, SQL, or ORM/database details. They perform database work only and never call GitHub, Secret Manager, extraction, chunking, embeddings, OpenAI, or worker threads.
+
+## Runtime health contracts
+
+`GET /health` is public process liveness and returns the fixed payload `{"status":"healthy"}` while the process can serve requests. It performs no database, GitHub, OpenAI, Secret Manager, or other provider operation.
+
+`GET /api/v1/health` is public strict readiness. Success is HTTP 200 only when runtime configuration, bounded database connectivity, Alembic revision `20260828_000019`, and strict-runtime GitHub/Secret Manager composition are ready. Any failed check returns HTTP 503 with fixed `ready`/`not_ready` values. The contract never returns an exception, database URL, SQL, project identifier, secret reference, credential, or provider detail, and never retrieves secret values or contacts GitHub/OpenAI.

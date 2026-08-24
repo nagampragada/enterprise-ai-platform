@@ -25,7 +25,9 @@ GITHUB_APP_CLIENT_SECRET_REFERENCE=gcp-secret-manager://projects/<platform-secre
 GITHUB_APP_PRIVATE_KEY_REFERENCE=gcp-secret-manager://projects/<platform-secrets-project-id>/secrets/eap-sm-<32-lowercase-hex>/versions/<numeric-version>
 ```
 
-All three GCP settings and the complete GitHub App settings must be valid before production composition occurs. Adapter initialization uses ADC. Missing configuration, unavailable credentials, invalid references, or initialization failure leaves GitHub operations fail-closed with the existing generic provider-unavailable response. Application import, health endpoints, and unrelated APIs remain usable without GCP configuration. There is no in-memory or plaintext production fallback.
+All three GCP settings and the complete GitHub App settings must be valid before sandbox or production API composition occurs. Adapter initialization uses ADC. Missing configuration, unavailable credentials, invalid references, or initialization failure prevents strict API startup. Explicit development/test mode retains the generic provider-unavailable behavior for GitHub routes so unrelated local APIs remain usable. Strict readiness validates only local composition and canonical references; it never retrieves a secret. There is no in-memory or plaintext production fallback.
+
+The one-shot worker receives the version-pinned GitHub private-key reference but does not require or receive the OAuth client-secret reference. Scheduler and migration processes require neither Secret Manager nor GitHub settings. The temporary sandbox bootstrap requires neither provider.
 
 ## Reference and resource invariants
 
