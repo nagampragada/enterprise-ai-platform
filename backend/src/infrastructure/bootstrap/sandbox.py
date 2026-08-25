@@ -146,6 +146,9 @@ def _create_state(
         slug=values.organization_slug,
         status="active",
     )
+    session.add(organization)
+    session.flush()
+
     user = User(
         id=uuid4(),
         organization_id=organization.id,
@@ -164,11 +167,11 @@ def _create_state(
         slug=values.knowledge_space_slug,
         status="active",
     )
+    session.add_all([user, space])
+    session.flush()
+
     session.add_all(
         [
-            organization,
-            user,
-            space,
             UserRole(
                 id=uuid4(),
                 organization_id=organization.id,
@@ -187,6 +190,7 @@ def _create_state(
             ),
         ]
     )
+    session.flush()
     return SandboxBootstrapResult("created", organization.id, user.id, space.id)
 
 

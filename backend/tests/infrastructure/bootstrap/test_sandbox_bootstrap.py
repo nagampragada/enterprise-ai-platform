@@ -65,6 +65,9 @@ class Session:
     def __init__(self, results):
         self.results = iter(results)
         self.added = []
+        self.pending = []
+        self.persisted = []
+        self.flushes = []
         self.committed = False
         self.rolled_back = False
         self.closed = False
@@ -72,14 +75,28 @@ class Session:
     def execute(self, _statement):
         return next(self.results)
 
+    def add(self, value):
+        self.added.append(value)
+        self.pending.append(value)
+
     def add_all(self, values):
-        self.added.extend(values)
+        batch = list(values)
+        self.added.extend(batch)
+        self.pending.extend(batch)
+
+    def flush(self):
+        batch = tuple(self.pending)
+        self.flushes.append(batch)
+        self.persisted.extend(batch)
+        self.pending.clear()
 
     def commit(self):
         self.committed = True
 
     def rollback(self):
         self.rolled_back = True
+        self.pending.clear()
+        self.persisted.clear()
 
     def close(self):
         self.closed = True
@@ -118,7 +135,34 @@ def test_bootstrap_creates_complete_state_without_secret_output(capsys) -> None:
         KnowledgeSpace,
         KnowledgeSpaceUserGrant,
     }
+    assert [tuple(type(value) for value in batch) for batch in session.flushes] == [
+        (Organization,),
+        (User, KnowledgeSpace),
+        (UserRole, KnowledgeSpaceUserGrant),
+    ]
     assert PASSWORD not in capsys.readouterr().out
+
+
+def test_failure_after_dependent_flush_rolls_back_every_insert(capsys) -> None:
+    class FailingSession(Session):
+        def flush(self):
+            super().flush()
+            if len(self.flushes) == 3:
+                raise RuntimeError("simulated dependent-row failure")
+
+    session = FailingSession([Result(one=_role()), Result(one=None), Result(many=[])])
+
+    assert run([], environ=_environment(), session_factory=lambda: session) == 1
+
+    assert session.rolled_back and session.closed and not session.committed
+    assert session.persisted == []
+    assert session.pending == []
+    assert [tuple(type(value) for value in batch) for batch in session.flushes] == [
+        (Organization,),
+        (User, KnowledgeSpace),
+        (UserRole, KnowledgeSpaceUserGrant),
+    ]
+    assert capsys.readouterr().out.strip() == "Sandbox bootstrap failed"
 
 
 def test_exact_existing_state_is_idempotently_verified() -> None:
