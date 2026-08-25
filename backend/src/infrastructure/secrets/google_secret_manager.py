@@ -35,6 +35,7 @@ READ_RETRY_INITIAL_DELAY_SECONDS = 0.1
 READ_RETRY_MAX_DELAY_SECONDS = 1.0
 MAX_NAME_COLLISION_ATTEMPTS = 3
 MAX_VERSION_NUMBER = 9_223_372_036_854_775_807
+MAX_PROJECT_NUMBER = 9_223_372_036_854_775_807
 
 _MANAGED_LABELS = {
     "managed-by": "enterprise-ai-platform",
@@ -89,16 +90,17 @@ class GoogleSecretManagerSecretStore:
             raise SecretStoreError()
         checksum = google_crc32c.value(payload)
         secret_name: str | None = None
+        secret_id: str | None = None
         last_collision: Exception | None = None
 
         for _ in range(MAX_NAME_COLLISION_ATTEMPTS):
-            secret_id = self._new_secret_id()
-            candidate_name = self._secret_name(secret_id)
+            candidate_secret_id = self._new_secret_id()
+            candidate_name = self._secret_name(candidate_secret_id)
             try:
                 created = self._client.create_secret(
                     request={
                         "parent": self._project_name,
-                        "secret_id": secret_id,
+                        "secret_id": candidate_secret_id,
                         "secret": {
                             "replication": {"automatic": {}},
                             "labels": self._expected_labels,
@@ -112,13 +114,16 @@ class GoogleSecretManagerSecretStore:
                 continue
             except Exception as exc:
                 self._raise_provider_error(exc, not_found=False)
-            if getattr(created, "name", None) != candidate_name:
+            if not self._returned_secret_name_matches(
+                getattr(created, "name", None), candidate_secret_id
+            ):
                 self._cleanup_container(candidate_name)
                 raise SecretStoreIntegrityError()
             secret_name = candidate_name
+            secret_id = candidate_secret_id
             break
 
-        if secret_name is None:
+        if secret_name is None or secret_id is None:
             raise SecretStoreUnavailable() from last_collision
 
         try:
@@ -133,14 +138,17 @@ class GoogleSecretManagerSecretStore:
             if getattr(version, "client_specified_payload_checksum", None) is not True:
                 raise SecretStoreIntegrityError()
             resource_name = getattr(version, "name", None)
-            if not isinstance(resource_name, str):
+            if not self._returned_version_name_matches(
+                resource_name, secret_id, version=1
+            ):
                 raise SecretStoreIntegrityError()
-            reference = SecretReference(f"{REFERENCE_SCHEME}://{resource_name}")
+            version_name = f"{secret_name}/versions/1"
+            reference = SecretReference(f"{REFERENCE_SCHEME}://{version_name}")
             try:
                 parsed = self._parse_reference(reference)
             except InvalidSecretReference as exc:
                 raise SecretStoreIntegrityError() from exc
-            if parsed[0] != secret_name:
+            if parsed != (secret_name, version_name):
                 raise SecretStoreIntegrityError()
             return reference
         except SecretStoreError:
@@ -151,7 +159,7 @@ class GoogleSecretManagerSecretStore:
             self._raise_provider_error(exc, not_found=False)
 
     def retrieve(self, reference: SecretReference) -> SecretValue:
-        _, version_name = self._parse_reference(reference)
+        secret_name, version_name = self._parse_reference(reference)
         try:
             response = self._read_with_retry(
                 lambda timeout: self._client.access_secret_version(
@@ -160,7 +168,11 @@ class GoogleSecretManagerSecretStore:
             )
         except Exception as exc:
             self._raise_provider_error(exc, not_found=True)
-        if getattr(response, "name", None) != version_name:
+        secret_id = secret_name.rpartition("/")[2]
+        version = int(version_name.rpartition("/")[2])
+        if not self._returned_version_name_matches(
+            getattr(response, "name", None), secret_id, version=version
+        ):
             raise SecretStoreIntegrityError()
         provider_payload = getattr(response, "payload", None)
         data = getattr(provider_payload, "data", None)
@@ -187,7 +199,9 @@ class GoogleSecretManagerSecretStore:
         except Exception as exc:
             self._raise_provider_error(exc, not_found=False)
         if (
-            getattr(metadata, "name", None) != secret_name
+            not self._returned_secret_name_matches(
+                getattr(metadata, "name", None), secret_name.rpartition("/")[2]
+            )
             or not self._is_adapter_managed(getattr(metadata, "labels", None))
         ):
             raise InvalidSecretReference()
@@ -240,6 +254,58 @@ class GoogleSecretManagerSecretStore:
 
     def _secret_name(self, secret_id: str) -> str:
         return f"{self._project_name}/secrets/{secret_id}"
+
+    def _returned_secret_name_matches(
+        self, resource_name: object, expected_secret_id: str
+    ) -> bool:
+        if not isinstance(resource_name, str):
+            return False
+        match = re.fullmatch(
+            r"projects/(?P<project>[^/]+)/secrets/(?P<secret>[^/]+)",
+            resource_name,
+        )
+        return bool(
+            match
+            and self._returned_project_matches(match.group("project"))
+            and match.group("secret") == expected_secret_id
+        )
+
+    def _returned_version_name_matches(
+        self,
+        resource_name: object,
+        expected_secret_id: str,
+        *,
+        version: int,
+    ) -> bool:
+        if not isinstance(resource_name, str):
+            return False
+        match = re.fullmatch(
+            r"projects/(?P<project>[^/]+)/secrets/(?P<secret>[^/]+)/versions/"
+            r"(?P<version>[1-9][0-9]*)",
+            resource_name,
+        )
+        if (
+            match is None
+            or not self._returned_project_matches(match.group("project"))
+            or match.group("secret") != expected_secret_id
+        ):
+            return False
+        try:
+            returned_version = int(match.group("version"))
+        except ValueError:
+            return False
+        return returned_version <= MAX_VERSION_NUMBER and returned_version == version
+
+    def _returned_project_matches(self, project: str) -> bool:
+        if project == self._settings.project_id:
+            return True
+        if re.fullmatch(r"[1-9][0-9]*", project) is None:
+            return False
+        try:
+            project_number = int(project)
+        except ValueError:
+            return False
+        return project_number <= MAX_PROJECT_NUMBER
 
     def _parse_reference(self, reference: SecretReference) -> tuple[str, str]:
         if not isinstance(reference, SecretReference):

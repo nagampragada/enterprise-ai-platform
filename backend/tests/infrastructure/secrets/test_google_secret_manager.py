@@ -40,6 +40,7 @@ from infrastructure.connectors.github.client import GitHubAppRestClient
 
 
 PROJECT = "platform-prod-1"
+PROJECT_NUMBER = "1234567890123"
 PREFIX = "eap"
 ENVIRONMENT = "production"
 TOKEN = "a" * 32
@@ -66,6 +67,10 @@ class FakeSecretManagerClient:
         self.destroy_error: Exception | None = None
         self.delete_error: Exception | None = None
         self.checksum_acknowledged = True
+        self.create_response_name: object | None = None
+        self.add_response_name: object | None = None
+        self.access_response_name: object | None = None
+        self.get_response_name: object | None = None
 
     def _record(self, method, request, retry, timeout):
         self.calls.append((method, request, retry, timeout))
@@ -78,7 +83,7 @@ class FakeSecretManagerClient:
         if name in self.secrets:
             raise google_exceptions.AlreadyExists("unsafe collision details")
         self.secrets[name] = {"labels": dict(request["secret"]["labels"]), "versions": {}}
-        return SimpleNamespace(name=name)
+        return SimpleNamespace(name=self.create_response_name or name)
 
     def add_secret_version(self, *, request, retry, timeout):
         self._record("add", request, retry, timeout)
@@ -89,7 +94,7 @@ class FakeSecretManagerClient:
         version = len(versions) + 1
         versions[version] = bytes(request["payload"]["data"])
         return SimpleNamespace(
-            name=f"{request['parent']}/versions/{version}",
+            name=self.add_response_name or f"{request['parent']}/versions/{version}",
             client_specified_payload_checksum=self.checksum_acknowledged,
         )
 
@@ -103,7 +108,7 @@ class FakeSecretManagerClient:
         except KeyError as exc:
             raise google_exceptions.NotFound("unsafe missing details") from exc
         return SimpleNamespace(
-            name=request["name"],
+            name=self.access_response_name or request["name"],
             payload=SimpleNamespace(data=data, data_crc32c=google_crc32c.value(data)),
         )
 
@@ -115,7 +120,10 @@ class FakeSecretManagerClient:
             item = self.secrets[request["name"]]
         except KeyError as exc:
             raise google_exceptions.NotFound("unsafe missing details") from exc
-        return SimpleNamespace(name=request["name"], labels=dict(item["labels"]))
+        return SimpleNamespace(
+            name=self.get_response_name or request["name"],
+            labels=dict(item["labels"]),
+        )
 
     def destroy_secret_version(self, *, request, retry, timeout):
         self._record("destroy", request, retry, timeout)
@@ -170,6 +178,7 @@ def provision(client: FakeSecretManagerClient, name=SECRET_NAME, data=b"hidden")
         "gcp-secret-manager://projects/another-prod-1/secrets/eap-sm-" + TOKEN + "/versions/1",
         "gcp-secret-manager://projects/platform-prod-1/secrets/other-sm-" + TOKEN + "/versions/1",
         "gcp-secret-manager://projects/platform-prod-1/secrets/eap-sm-" + TOKEN + "/versions/latest",
+        REFERENCE.replace(PROJECT, PROJECT_NUMBER),
         "gcp-secret-manager://projects/platform-prod-1/secrets/eap-sm-" + TOKEN + "/versions/alias",
         "gcp-secret-manager://projects/platform-prod-1/secrets/eap-sm-" + TOKEN,
         REFERENCE + "?version=2",
@@ -205,6 +214,111 @@ def test_store_returns_numeric_version_pinned_reference_and_safe_random_name():
     assert re.fullmatch(r"eap-sm-[0-9a-f]{32}", create_request["secret_id"])
     assert repr(reference).find(reference.value) == -1
     assert repr(adapter).find(PROJECT) == -1
+
+
+@pytest.mark.parametrize(
+    ("create_project", "add_project"),
+    (
+        (PROJECT, PROJECT),
+        (PROJECT_NUMBER, PROJECT),
+        (PROJECT, PROJECT_NUMBER),
+        (PROJECT_NUMBER, PROJECT_NUMBER),
+    ),
+)
+def test_store_accepts_numeric_project_canonicalization_only_in_provider_responses(
+    create_project, add_project
+):
+    client = FakeSecretManagerClient()
+    client.create_response_name = (
+        f"projects/{create_project}/secrets/{SECRET_ID}"
+    )
+    client.add_response_name = (
+        f"projects/{add_project}/secrets/{SECRET_ID}/versions/1"
+    )
+
+    reference = store(client).store(SecretValue("hidden"))
+
+    assert reference.value == REFERENCE
+    assert client.calls[0][1]["parent"] == f"projects/{PROJECT}"
+    assert client.calls[1][1]["parent"] == SECRET_NAME
+    assert SECRET_NAME in client.secrets
+
+
+@pytest.mark.parametrize("stage", ("create", "add"))
+def test_store_rejects_wrong_textual_project_and_cleans_up(stage):
+    client = FakeSecretManagerClient()
+    if stage == "create":
+        client.create_response_name = (
+            f"projects/other-project-1/secrets/{SECRET_ID}"
+        )
+    else:
+        client.add_response_name = (
+            f"projects/other-project-1/secrets/{SECRET_ID}/versions/1"
+        )
+
+    with pytest.raises(SecretStoreIntegrityError):
+        store(client).store(SecretValue("hidden"))
+
+    assert [call[0] for call in client.calls] == (
+        ["create", "delete"]
+        if stage == "create"
+        else ["create", "add", "delete"]
+    )
+    assert client.secrets == {}
+
+
+@pytest.mark.parametrize(
+    "project", ("0", "01", "+123", "123x", "1.23", "9223372036854775808")
+)
+@pytest.mark.parametrize("stage", ("create", "add"))
+def test_store_rejects_malformed_numeric_project_and_cleans_up(stage, project):
+    client = FakeSecretManagerClient()
+    if stage == "create":
+        client.create_response_name = f"projects/{project}/secrets/{SECRET_ID}"
+    else:
+        client.add_response_name = (
+            f"projects/{project}/secrets/{SECRET_ID}/versions/1"
+        )
+
+    with pytest.raises(SecretStoreIntegrityError):
+        store(client).store(SecretValue("hidden"))
+
+    assert client.secrets == {}
+    assert client.calls[-1][0] == "delete"
+
+
+@pytest.mark.parametrize("stage", ("create", "add"))
+def test_store_rejects_wrong_secret_id_and_cleans_up(stage):
+    client = FakeSecretManagerClient()
+    wrong_secret_id = f"{PREFIX}-sm-{'b' * 32}"
+    if stage == "create":
+        client.create_response_name = (
+            f"projects/{PROJECT_NUMBER}/secrets/{wrong_secret_id}"
+        )
+    else:
+        client.add_response_name = (
+            f"projects/{PROJECT_NUMBER}/secrets/{wrong_secret_id}/versions/1"
+        )
+
+    with pytest.raises(SecretStoreIntegrityError):
+        store(client).store(SecretValue("hidden"))
+
+    assert client.secrets == {}
+    assert client.calls[-1][0] == "delete"
+
+
+@pytest.mark.parametrize("version", ("0", "01", "2", "latest"))
+def test_store_rejects_wrong_or_noncanonical_returned_version_and_cleans_up(version):
+    client = FakeSecretManagerClient()
+    client.add_response_name = (
+        f"projects/{PROJECT_NUMBER}/secrets/{SECRET_ID}/versions/{version}"
+    )
+
+    with pytest.raises(SecretStoreIntegrityError):
+        store(client).store(SecretValue("hidden"))
+
+    assert [call[0] for call in client.calls] == ["create", "add", "delete"]
+    assert client.secrets == {}
 
 
 def test_store_and_retrieve_preserve_unicode_and_multiline_pem_exactly_with_crc32c():
@@ -269,6 +383,25 @@ def test_retrieve_validates_provider_crc32c_and_utf8_without_leaking_data():
     )
     with pytest.raises(SecretStoreIntegrityError):
         adapter.retrieve(SecretReference(REFERENCE))
+
+
+def test_retrieve_and_delete_accept_numeric_response_names_but_keep_configured_requests():
+    client = FakeSecretManagerClient()
+    provision(client)
+    client.access_response_name = VERSION_NAME.replace(PROJECT, PROJECT_NUMBER)
+    client.get_response_name = SECRET_NAME.replace(PROJECT, PROJECT_NUMBER)
+    adapter = store(client)
+
+    assert adapter.retrieve(SecretReference(REFERENCE)).value == "hidden"
+    adapter.delete(SecretReference(REFERENCE))
+
+    assert [call[1]["name"] for call in client.calls if call[0] == "access"] == [
+        VERSION_NAME
+    ]
+    assert [call[1]["name"] for call in client.calls if call[0] == "get"] == [
+        SECRET_NAME
+    ]
+    assert client.secrets == {}
 
 
 @pytest.mark.parametrize(

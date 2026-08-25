@@ -85,6 +85,8 @@ Provision separate exact secrets for `DATABASE_URL`, `JWT_SECRET_KEY`, `REFRESH_
 
 Application-created PKCE verifier secrets are ephemeral adapter-managed containers. They are different from the operator-provisioned long-lived, version-pinned GitHub secrets and must not be manually relabeled as adapter owned.
 
+Secret Manager may return resource names whose project segment is the numeric project number even when the request used `$PROJECT_ID`. The adapter accepts that canonicalization only for responses to its own exact-resource RPCs; it continues to send requests and persist version-pinned references with `$PROJECT_ID`, requires the exact generated secret ID and version, and does not require an additional project-lookup IAM permission.
+
 ## 6. Build and push the common image
 
 From the repository root, build only the backend context and use an immutable tag:

@@ -39,6 +39,8 @@ gcp-secret-manager://projects/{configured_project_id}/secrets/{configured_prefix
 
 The parser runs before provider calls and rejects other projects, names outside the prefix and adapter naming pattern, zero or leading-zero versions, `latest`, aliases, query strings, fragments, percent escaping, missing or extra segments, case changes, and other noncanonical forms. References never contain payloads.
 
+Secret Manager may canonicalize the project segment in returned resource names from the configured project ID to its positive numeric project number. For responses to the adapter's own exact-resource RPCs only, the adapter accepts either the configured project ID or a strictly formed positive numeric project number while still requiring the exact generated secret ID and exact numeric version. It rejects any other textual project ID and malformed numeric segment. Outgoing requests and every application-visible reference continue to use the configured project ID; a returned project number is never persisted or exposed as an application reference. This validation requires no project lookup or additional IAM permission.
+
 Each `store()` call creates a cryptographically random 128-bit name, a new secret container, and exactly one immutable version. Names contain no organization, connector, user, email, repository, account, provider payload, or secret value. Created secrets carry only these non-sensitive labels:
 
 ```text
@@ -58,6 +60,7 @@ The adapter validates UTF-8 size before calling Google and accepts at most 65,53
 - `create_secret` tries at most 3 independently random names on `AlreadyExists`; it does not retry the same name.
 - `add_secret_version`, `destroy_secret_version`, and `delete_secret` each make one attempt. Ambiguous non-idempotent version writes are never retried.
 - If container creation succeeds and the first version operation fails or returns invalid integrity metadata, one 5-second best-effort exact-container delete is attempted. Cleanup never replaces the original failure.
+- Create and add-version responses must identify the exact generated secret ID, and the first version response must identify version `1`. Project-number canonicalization does not relax either invariant or permit suffix-only resource matching.
 - Delete first parses the reference, reads that exact container's metadata, and requires the adapter-managed single-version/environment labels. It then destroys only the referenced numeric version and deletes only that exact container. A missing container succeeds. A missing referenced version succeeds without deleting the container, which prevents a forged version number from deleting a valid version. Already-destroyed state and a missing final container are idempotent success.
 - The adapter never lists secrets or versions, accepts wildcards or aliases, or performs bulk deletion. Under normal operation, a store operation has at most 5 provider calls including three collisions, one add, and one cleanup; a delete has at most three metadata reads, one destroy, and one container delete.
 
