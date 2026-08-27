@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import logging
 import os
+import random
 import signal
 import threading
 from types import FrameType
@@ -183,7 +184,10 @@ class ConnectorSyncWorkerHost:
 def compose_connector_sync_worker_host(settings: ConnectorWorkerSettings,
                                        *, session_factory=SessionLocal,
                                        shutdown_event=None,
-                                       process_settings: WorkerProcessSettings | None = None):
+                                       process_settings: WorkerProcessSettings | None = None,
+                                       random_uniform: Callable[[float, float], float] = (
+                                           random.SystemRandom().uniform
+                                       )):
     runtime = process_settings or validate_worker_process_environment()
     secret_store = GoogleSecretManagerSecretStore(
         runtime.secret_manager
@@ -194,7 +198,7 @@ def compose_connector_sync_worker_host(settings: ConnectorWorkerSettings,
     embedding = OpenAIEmbeddingProvider()
     extractors = create_default_content_extractor_registry()
     chunker = DeterministicTextChunker()
-    retry = ConnectorSyncRetryPolicy()
+    retry = ConnectorSyncRetryPolicy(random_uniform=random_uniform)
 
     def execution(session: Session):
         return ConnectorSyncExecutionService(

@@ -1,9 +1,11 @@
+import random
 from datetime import timedelta
 from unittest.mock import Mock
 from uuid import uuid4
 
 from application.services.connector_sync_execution_service import AcquiredRoutedSyncAttempt
 from infrastructure.repositories.connector_sync_job_repository import SyncJobLease
+import infrastructure.workers.connector_sync_worker_host as worker_host_module
 from infrastructure.workers.connector_sync_worker_host import (
     ConnectorSyncWorkerHost,
     ConnectorWorkerSettings,
@@ -91,3 +93,52 @@ def test_one_shot_no_work_exits_successfully():
     assert host.run() == 0
     session.commit.assert_called_once()
     session.close.assert_called_once()
+
+
+def _patch_composition_dependencies(monkeypatch, captured):
+    class RecordingRetryPolicy:
+        def __init__(self, *, random_uniform):
+            captured["random_uniform"] = random_uniform
+
+    monkeypatch.setattr(worker_host_module, "ConnectorSyncRetryPolicy", RecordingRetryPolicy)
+    for name in (
+        "GoogleSecretManagerSecretStore",
+        "GitHubAppRestClient",
+        "OpenAIEmbeddingProvider",
+        "create_default_content_extractor_registry",
+        "DeterministicTextChunker",
+        "LocalFolderPreparationService",
+        "LocalFolderSyncWorker",
+        "GitHubRepositoryContentService",
+        "GitHubSynchronizationPreparationService",
+        "GitHubSyncWorker",
+    ):
+        monkeypatch.setattr(worker_host_module, name, Mock())
+
+
+def test_default_composition_supplies_system_seeded_retry_jitter(monkeypatch):
+    captured = {}
+    _patch_composition_dependencies(monkeypatch, captured)
+
+    host = worker_host_module.compose_connector_sync_worker_host(
+        _settings(), session_factory=Mock(), process_settings=Mock()
+    )
+
+    assert isinstance(host, ConnectorSyncWorkerHost)
+    assert callable(captured["random_uniform"])
+    assert isinstance(captured["random_uniform"].__self__, random.SystemRandom)
+
+
+def test_composition_preserves_injected_deterministic_retry_jitter(monkeypatch):
+    captured = {}
+    _patch_composition_dependencies(monkeypatch, captured)
+    deterministic_uniform = lambda low, high: low + ((high - low) / 2)
+
+    worker_host_module.compose_connector_sync_worker_host(
+        _settings(),
+        session_factory=Mock(),
+        process_settings=Mock(),
+        random_uniform=deterministic_uniform,
+    )
+
+    assert captured["random_uniform"] is deterministic_uniform
