@@ -739,6 +739,121 @@ def test_new_then_unchanged_run_persists_once_and_completes_without_deletion(eng
         assert session.scalar(select(func.count()).select_from(SourceItemScopeMembership)) == 1
 
 
+def test_unchanged_blob_is_reindexed_when_chunking_algorithm_profile_changes(engine):
+    factory = _factory(engine)
+    organization_id, connector_id, scope_id = _seed(factory)
+    old_profile = _profile()
+    first, first_snapshot = _persist_single_file_traversal(
+        factory,
+        organization_id,
+        connector_id,
+        scope_id,
+        old_profile,
+        now=NOW,
+        path="file.txt",
+    )
+    with factory() as session:
+        outcome = _staged(session, old_profile).reconcile(
+            first.lease,
+            first_snapshot,
+            worker_id="github-worker",
+            now=NOW,
+        )
+        assert outcome.outcome == "completed"
+        session.commit()
+
+    corrected_profile = replace(
+        old_profile,
+        chunking_version="9" * 64,
+        fingerprint="8" * 64,
+    )
+    second_now = NOW + timedelta(minutes=1)
+    second = _acquire(
+        factory,
+        organization_id,
+        connector_id,
+        scope_id,
+        now=second_now,
+    )
+    with factory() as session:
+        staged = _staged(session, corrected_profile, second_now)
+        second_snapshot = staged.snapshot(
+            second.lease,
+            second.sync_run_id,
+            worker_id="github-worker",
+        )
+        session.rollback()
+    second_cursor = GitHubTraversalCursor.initial(
+        GitHubRepositorySnapshot(
+            connector_id,
+            scope_id,
+            501,
+            "github:repository:501",
+            "main",
+            COMMIT,
+            TREE,
+        ),
+        second_snapshot.authorization,
+    )
+    with factory() as session:
+        _staged(session, corrected_profile, second_now).pin_snapshot(
+            second.lease,
+            second_snapshot,
+            second_cursor,
+            worker_id="github-worker",
+            now=second_now,
+        )
+        session.commit()
+    discovered = _candidate(second_cursor, second_snapshot.authorization)
+    batch = GitHubDiscoveryBatch(
+        (discovered,),
+        discovered.cursor_after,
+        1,
+        1,
+    )
+    with factory() as session:
+        item_snapshot = _staged(session, corrected_profile, second_now).item_snapshots(
+            second.lease,
+            second_snapshot,
+            batch,
+            worker_id="github-worker",
+        )[0]
+        session.rollback()
+
+    assert item_snapshot.persisted_blob_id == BLOB
+    assert not item_snapshot.profile_complete
+    with factory() as session:
+        outcome = _staged(session, corrected_profile, second_now).persist_batch(
+            second.lease,
+            second_snapshot,
+            _prepared(discovered, item_snapshot),
+            worker_id="github-worker",
+            now=second_now,
+        )
+        assert outcome.phase == "reconciliation"
+        session.commit()
+    with factory() as session:
+        outcome = _staged(session, corrected_profile, second_now).reconcile(
+            second.lease,
+            second_snapshot,
+            worker_id="github-worker",
+            now=second_now,
+        )
+        assert outcome.outcome == "completed"
+        session.commit()
+
+    with factory() as session:
+        states = session.scalars(select(DocumentIndexingState)).all()
+        assert len(states) == 2
+        assert {state.chunking_version for state in states} == {
+            old_profile.chunking_version,
+            corrected_profile.chunking_version,
+        }
+        assert session.scalar(select(func.count()).select_from(DocumentVersion)) == 1
+        assert session.scalar(select(func.count()).select_from(DocumentIndexingAttempt)) == 2
+        assert session.scalar(select(func.count()).select_from(DocumentChunk)) == 1
+
+
 def test_cursor_failure_rolls_back_all_file_version_index_and_chunk_state(engine):
     factory = _factory(engine)
     organization_id, connector_id, scope_id = _seed(factory)

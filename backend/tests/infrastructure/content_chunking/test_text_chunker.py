@@ -5,10 +5,35 @@ import hashlib
 import pytest
 
 from domain.content_chunking.models import ChunkingConfig
-from infrastructure.content_chunking.text_chunker import DeterministicTextChunker
+from infrastructure.content_chunking.text_chunker import (
+    DETERMINISTIC_TEXT_CHUNKER_ALGORITHM_VERSION,
+    DeterministicTextChunker,
+)
 
 
 chunker = DeterministicTextChunker()
+
+VERIFICATION_CONTENT = """# GitHub Incremental Sync Verification
+
+Verification marker: GITHUB_INCREMENTAL_E2E_20260827_A
+
+This document validates that the Enterprise AI Platform can detect a newly
+committed GitHub document, retrieve its contents through the GitHub App,
+extract its text, divide the content into deterministic chunks, generate
+OpenAI embeddings, and persist the chunks and vectors in the tenant-scoped
+PostgreSQL pgvector database.
+
+The document belongs to the Enterprise AI Sandbox Lab organization and is
+intended only for controlled end-to-end connector validation.
+
+A successful test must preserve the repository name, branch, file path,
+commit identity, organization identity, knowledge-space identity, chunk
+identity, content hash, embedding profile, and vector dimensions.
+
+This marker must appear in the stored chunk content:
+
+GITHUB_INCREMENTAL_E2E_20260827_A"""
+VERIFICATION_CONTENT_CHECKSUM = "16b31e618c326f3d93dccf13707b9bdb8a07a1c0afefaa7003be96471afdfd8e"
 
 
 def test_empty_and_whitespace_only_text_return_no_chunks() -> None:
@@ -100,6 +125,64 @@ def test_large_valid_overlap_makes_forward_progress() -> None:
 
 def test_leading_and_trailing_whitespace_is_trimmed_with_adjusted_offsets() -> None:
     text = "   alpha beta   "
-    result = chunker.chunk(text, config=ChunkingConfig(max_chunk_size=20, overlap=2, minimum_preferred_size=3))[0]
+    results = chunker.chunk(text, config=ChunkingConfig(max_chunk_size=20, overlap=2, minimum_preferred_size=3))
+    assert len(results) == 1
+    result = results[0]
     assert result.content == "alpha beta"
     assert text[result.start_offset : result.end_offset] == result.content
+
+
+def test_exact_verification_content_without_terminal_whitespace_is_one_deterministic_chunk() -> None:
+    assert len(VERIFICATION_CONTENT) == 858
+    results = chunker.chunk(VERIFICATION_CONTENT)
+    assert len(results) == 1
+    assert results[0].chunk_index == 0
+    assert results[0].content == VERIFICATION_CONTENT
+    assert results[0].content_checksum == VERIFICATION_CONTENT_CHECKSUM
+    assert (results[0].start_offset, results[0].end_offset) == (0, 858)
+    assert results == chunker.chunk(VERIFICATION_CONTENT)
+
+
+@pytest.mark.parametrize(
+    "terminal_whitespace",
+    ("\n", "\r\n", " ", "   ", "\n\n\n"),
+    ids=("lf", "crlf", "space", "spaces", "blank-lines"),
+)
+def test_terminal_whitespace_does_not_restart_overlap_or_emit_repeated_suffixes(
+    terminal_whitespace: str,
+) -> None:
+    results = chunker.chunk(VERIFICATION_CONTENT + terminal_whitespace)
+    assert len(results) == 1
+    assert [result.chunk_index for result in results] == [0]
+    assert results[0].content == VERIFICATION_CONTENT
+    assert results[0].content_checksum == VERIFICATION_CONTENT_CHECKSUM
+    assert (results[0].start_offset, results[0].end_offset) == (0, 858)
+
+
+def test_genuinely_nonterminal_chunks_preserve_overlap_and_terminate_at_trimmed_content() -> None:
+    text = "0123456789" * 451 + "\n\n"
+    results = chunker.chunk(text)
+    assert [result.chunk_index for result in results] == [0, 1, 2]
+    assert [result.start_offset for result in results] == [0, 1800, 3600]
+    assert [result.end_offset for result in results] == [2000, 3800, 4510]
+    assert results[1].start_offset == results[0].end_offset - 200
+    assert results[2].start_offset == results[1].end_offset - 200
+    assert len({(result.start_offset, result.end_offset) for result in results}) == 3
+
+
+def test_repeated_boundaries_and_no_boundaries_make_strict_forward_progress() -> None:
+    config = ChunkingConfig(max_chunk_size=40, overlap=39, minimum_preferred_size=5)
+    for text in (("alpha\n\n" * 100) + "omega", "x" * 250):
+        results = chunker.chunk(text, config=config)
+        assert results
+        assert all(
+            current.start_offset > previous.start_offset
+            for previous, current in zip(results, results[1:])
+        )
+        assert results[-1].end_offset == len(text)
+        assert len(results) <= len(text)
+
+
+def test_deterministic_text_chunker_exposes_corrected_algorithm_version() -> None:
+    assert DETERMINISTIC_TEXT_CHUNKER_ALGORITHM_VERSION == 2
+    assert chunker.algorithm_version == 2

@@ -39,7 +39,7 @@ from application.services.github_repository_content_service import (
 )
 from application.services.local_document_indexing_service import LocalDocumentIndexingProfile
 from application.services.local_document_ingestion_service import _normalized_profile_name, _profile_hash
-from domain.content_chunking.chunker import ContentChunker
+from domain.content_chunking.chunker import ContentChunker, chunking_profile_signature
 from domain.embeddings.models import EmbeddingRequest
 from domain.embeddings.provider import EmbeddingProvider
 from domain.embeddings.validation import validate_embedding_results
@@ -566,12 +566,7 @@ class GitHubSynchronizationPreparationService:
             "extraction_profile": "content_extraction",
             "extraction_version": _profile_hash(extractor_signature),
             "chunking_profile": _normalized_profile_name(chunker_type.__name__),
-            "chunking_version": _profile_hash(
-                {
-                    "implementation": f"{chunker_type.__module__}.{chunker_type.__qualname__}",
-                    "config": {"max_chunk_size": 2000, "overlap": 200, "minimum_preferred_size": 200},
-                }
-            ),
+            "chunking_version": _profile_hash(chunking_profile_signature(self._chunker)),
             "embedding_provider": self._embedding_provider.profile.provider_name,
             "embedding_model": self._embedding_provider.profile.model_identifier,
             "embedding_dimensions": self._embedding_provider.profile.dimension,

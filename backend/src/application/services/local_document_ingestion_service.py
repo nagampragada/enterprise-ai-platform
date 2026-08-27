@@ -9,8 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from domain.content_chunking.chunker import ContentChunker
-from domain.content_chunking.models import ChunkResult, ChunkingConfig
+from domain.content_chunking.chunker import ContentChunker, chunking_profile_signature
+from domain.content_chunking.models import ChunkResult
 from infrastructure.content_extraction.registry import ContentExtractorRegistry
 from infrastructure.db.models import Document, DocumentChunk
 from infrastructure.repositories.document_chunk_repository import DocumentChunkRepository
@@ -85,10 +85,7 @@ class LocalDocumentIngestionService:
             for extension, extractor in sorted(self._extractor_registry.extractors.items())
         )
         chunker_type = type(self._content_chunker)
-        chunking_signature = {
-            "implementation": f"{chunker_type.__module__}.{chunker_type.__qualname__}",
-            "config": ChunkingConfig().__dict__,
-        }
+        chunking_signature = chunking_profile_signature(self._content_chunker)
         return LocalDocumentIngestionProfile(
             extraction_profile="content_extraction",
             extraction_version=_profile_hash(extractor_signature),

@@ -164,7 +164,8 @@ def test_real_indexing_autoflush_false_paginates_and_commits_all_chunks(db_sessi
     assert document is not None
     assert document.checksum_latest == hashlib.sha256(payload).hexdigest()
     assert first.chunks_seen == first.chunks_embedded == len(rows)
-    assert len(rows) >= 1200
+    assert len(rows) == 1168
+    assert len(rows) > 2 * 500
     assert [row.chunk_index for row in rows] == list(range(len(rows)))
     assert all(row.embedding is not None and len(row.embedding) == DIMENSION for row in rows)
     assert all(row.embedding_model == MODEL_IDENTIFIER for row in rows)

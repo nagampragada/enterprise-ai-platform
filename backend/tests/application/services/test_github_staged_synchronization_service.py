@@ -54,6 +54,7 @@ from application.services.local_document_indexing_service import LocalDocumentIn
 from domain.content_chunking.models import ChunkResult
 from domain.content_extraction.models import ExtractedContent
 from domain.embeddings.models import EmbeddingProfile, EmbeddingResult
+from infrastructure.content_chunking.text_chunker import DeterministicTextChunker
 
 
 OBJECT = "a" * 40
@@ -371,6 +372,53 @@ def test_unchanged_and_completed_items_skip_all_expensive_work():
     registry.extract.assert_not_called()
     chunker.chunk.assert_not_called()
     provider.embed_batch.assert_not_called()
+
+
+def test_unchanged_blob_with_incompatible_chunking_profile_is_reindexed():
+    authorization = _authorization()
+    snapshot = _snapshot(authorization)
+    cursor = _cursor(authorization, snapshot)
+    entry = _entry(snapshot, "file.txt")
+    after = replace(cursor, totals=GitHubRunBudget(entries_examined=1))
+    discovered = GitHubDiscoveredFile(entry, cursor, after, None)
+    raw = b"alpha"
+    checksum = hashlib.sha256(raw).hexdigest()
+    service, content, registry, chunker, provider = _preparation()
+    content.download_blob.return_value = GitHubBlobContent(raw, len(raw), checksum)
+    registry.extract.return_value = ExtractedContent("Alpha", "alpha", "text/plain")
+    chunker.chunk.return_value = (ChunkResult(0, "alpha", checksum, 5, 0, 5),)
+    provider.embed_batch.return_value = (
+        EmbeddingResult(0, (1.0,) * 1536, "fake:model:1536", 1536),
+    )
+
+    result = service.prepare_batch(
+        authorization,
+        (_item_snapshot(blob=BLOB, complete=False),),
+        GitHubDiscoveryBatch((discovered,), after, 1, 1),
+    )
+
+    assert result.files[0].outcome == "indexed"
+    assert content.download_blob.call_count == registry.extract.call_count == 1
+    assert chunker.chunk.call_count == provider.embed_batch.call_count == 1
+
+
+def test_github_profile_identity_changes_with_chunking_algorithm_version(monkeypatch):
+    registry = Mock()
+    registry.extractors = {".txt": Mock()}
+    provider = Mock()
+    provider.profile = EmbeddingProfile("fake", "fake", 1536, "fake:model:1536", 2)
+    chunker = DeterministicTextChunker()
+    service = GitHubSynchronizationPreparationService(Mock(), registry, chunker, provider)
+
+    monkeypatch.setattr(DeterministicTextChunker, "algorithm_version", 1)
+    old_profile = service.profile
+    monkeypatch.setattr(DeterministicTextChunker, "algorithm_version", 2)
+    corrected_profile = service.profile
+
+    assert old_profile.chunking_profile == corrected_profile.chunking_profile
+    assert old_profile.chunking_version != corrected_profile.chunking_version
+    assert old_profile.fingerprint != corrected_profile.fingerprint
+    assert corrected_profile == service.profile
 
 
 def test_changed_file_downloads_extracts_chunks_and_embeds_without_raw_content_in_dto():

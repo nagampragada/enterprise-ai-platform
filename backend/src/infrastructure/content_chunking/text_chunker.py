@@ -11,6 +11,7 @@ from domain.content_chunking.models import ChunkResult, ChunkingConfig
 
 _PARAGRAPH_BOUNDARY = re.compile(r"\n[ \t]*\n[ \t]*")
 _SENTENCE_BOUNDARY = re.compile(r"[.!?](?=\s)")
+DETERMINISTIC_TEXT_CHUNKER_ALGORITHM_VERSION = 2
 
 
 class DeterministicTextChunker(ContentChunker):
@@ -20,6 +21,8 @@ class DeterministicTextChunker(ContentChunker):
     when whitespace is skipped at the next chunk start. This keeps ranges
     aligned to content while guaranteeing forward progress.
     """
+
+    algorithm_version = DETERMINISTIC_TEXT_CHUNKER_ALGORITHM_VERSION
 
     def chunk(self, text: str, *, config: ChunkingConfig | None = None) -> tuple[ChunkResult, ...]:
         active_config = config or ChunkingConfig()
@@ -58,7 +61,7 @@ class DeterministicTextChunker(ContentChunker):
                 )
             )
 
-            if end >= source_length:
+            if raw_end >= source_length:
                 break
             next_cursor = max(end - active_config.overlap, start + 1)
             if next_cursor <= cursor:
