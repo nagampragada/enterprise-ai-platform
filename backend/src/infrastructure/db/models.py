@@ -1195,6 +1195,308 @@ class ConnectorSyncJob(Base):
     )
 
 
+class ConnectorSyncGeneration(Base):
+    """Feature-gated durable repository snapshot generation coordinator."""
+
+    __tablename__ = "connector_sync_generations"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_connector_sync_generations"),
+        ForeignKeyConstraint(
+            ["organization_id"], ["organizations.id"],
+            name="fk_sync_generations_organization", ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "connector_id"],
+            ["connectors.organization_id", "connectors.id"],
+            name="fk_sync_generations_connector_tenant", ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "connector_id", "connector_scope_id"],
+            ["connector_scopes.organization_id", "connector_scopes.connector_id", "connector_scopes.id"],
+            name="fk_sync_generations_scope_tenant", ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "connector_id", "connector_scope_id", "sync_job_id"],
+            ["connector_sync_jobs.organization_id", "connector_sync_jobs.connector_id", "connector_sync_jobs.connector_scope_id", "connector_sync_jobs.id"],
+            name="fk_sync_generations_job_tenant", ondelete="RESTRICT",
+        ),
+        UniqueConstraint("organization_id", "id", name="uq_sync_generations_org_id"),
+        UniqueConstraint("organization_id", "sync_job_id", name="uq_sync_generations_org_job"),
+        UniqueConstraint(
+            "organization_id", "connector_id", "connector_scope_id", "id", "profile_fingerprint",
+            name="uq_sync_generations_scope_profile_id",
+        ),
+        CheckConstraint("provider_key ~ '^[a-z][a-z0-9_]*$'", name="provider_key_valid"),
+        CheckConstraint("btrim(repository_identity) <> ''", name="repository_identity_not_blank"),
+        CheckConstraint("btrim(branch_name) <> ''", name="branch_name_not_blank"),
+        CheckConstraint("btrim(commit_object_id) <> ''", name="commit_object_id_not_blank"),
+        CheckConstraint("btrim(root_tree_object_id) <> ''", name="root_tree_object_id_not_blank"),
+        CheckConstraint(
+            "profile_fingerprint ~ '^[a-z0-9][a-z0-9._:/-]*$'",
+            name="profile_fingerprint_valid",
+        ),
+        CheckConstraint(
+            "status IN ('discovering', 'processing', 'completed', 'completed_with_errors', 'failed', 'cancelled')",
+            name="status_valid",
+        ),
+        CheckConstraint(
+            "(discovery_complete AND discovery_completed_at IS NOT NULL) OR "
+            "(NOT discovery_complete AND discovery_completed_at IS NULL)",
+            name="discovery_completion_consistent",
+        ),
+        CheckConstraint(
+            "(reconciliation_eligible AND reconciliation_eligible_at IS NOT NULL "
+            "AND discovery_complete) OR "
+            "(NOT reconciliation_eligible AND reconciliation_eligible_at IS NULL)",
+            name="reconcile_eligibility_consistent",
+        ),
+        CheckConstraint(
+            "(resync_required AND resync_requested_at IS NOT NULL) OR "
+            "(NOT resync_required AND resync_requested_at IS NULL)",
+            name="resync_state_consistent",
+        ),
+        CheckConstraint(
+            "(status IN ('completed', 'completed_with_errors', 'failed', 'cancelled') "
+            "AND terminal_at IS NOT NULL) OR "
+            "(status IN ('discovering', 'processing') AND terminal_at IS NULL)",
+            name="terminal_state_consistent",
+        ),
+        CheckConstraint(
+            "items_discovered >= 0 AND items_registered >= 0 "
+            "AND items_registered <= items_discovered AND declared_bytes >= 0",
+            name="counters_nonnegative",
+        ),
+        CheckConstraint("updated_at >= created_at", name="updated_after_created"),
+        CheckConstraint(
+            "terminal_at IS NULL OR terminal_at >= created_at", name="terminal_after_created"
+        ),
+        Index(
+            "ix_sync_generations_org_scope_created",
+            "organization_id", "connector_scope_id", "created_at", "id",
+        ),
+        Index(
+            "ix_sync_generations_org_scope_terminal",
+            "organization_id", "connector_scope_id", "terminal_at", "id",
+            postgresql_where=text("terminal_at IS NOT NULL"),
+        ),
+        Index(
+            "ix_sync_generations_follow_up",
+            "organization_id", "resync_requested_at", "id",
+            postgresql_where=text("resync_required"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_scope_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    sync_job_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    provider_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    repository_identity: Mapped[str] = mapped_column(String(255), nullable=False)
+    branch_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    commit_object_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    root_tree_object_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    profile_fingerprint: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'discovering'"))
+    discovery_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    discovery_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reconciliation_eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    reconciliation_eligible_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resync_required: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    resync_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    items_discovered: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    items_registered: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    declared_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    terminal_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ConnectorSyncFileWorkItem(Base):
+    """Feature-gated independently leased control-plane work for one source file."""
+
+    __tablename__ = "connector_sync_file_work_items"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_connector_sync_file_work_items"),
+        ForeignKeyConstraint(
+            ["organization_id", "connector_id", "connector_scope_id", "generation_id", "profile_fingerprint"],
+            ["connector_sync_generations.organization_id", "connector_sync_generations.connector_id", "connector_sync_generations.connector_scope_id", "connector_sync_generations.id", "connector_sync_generations.profile_fingerprint"],
+            name="fk_sync_file_work_generation_tenant", ondelete="CASCADE",
+        ),
+        UniqueConstraint("organization_id", "generation_id", "id", name="uq_sync_file_work_generation_id"),
+        UniqueConstraint("lease_id", name="uq_sync_file_work_lease_id"),
+        UniqueConstraint(
+            "organization_id", "generation_id", "source_key_hash", "provider_blob_id",
+            "provider_revision_id", "profile_fingerprint",
+            name="uq_sync_file_work_logical_identity",
+        ),
+        CheckConstraint("btrim(source_item_key) <> ''", name="source_item_key_not_blank"),
+        CheckConstraint("source_key_hash ~ '^[0-9a-f]{64}$'", name="source_key_hash_valid"),
+        CheckConstraint("btrim(repository_path) <> ''", name="repository_path_not_blank"),
+        CheckConstraint("btrim(provider_blob_id) <> ''", name="provider_blob_id_not_blank"),
+        CheckConstraint("btrim(provider_revision_id) <> ''", name="provider_revision_not_blank"),
+        CheckConstraint(
+            "profile_fingerprint ~ '^[a-z0-9][a-z0-9._:/-]*$'",
+            name="profile_fingerprint_valid",
+        ),
+        CheckConstraint(
+            "file_size_bytes IS NULL OR file_size_bytes BETWEEN 0 AND 1073741824",
+            name="file_size_bounded",
+        ),
+        CheckConstraint("file_extension IS NULL OR btrim(file_extension) <> ''", name="extension_not_blank"),
+        CheckConstraint("mime_type IS NULL OR btrim(mime_type) <> ''", name="mime_type_not_blank"),
+        CheckConstraint(
+            "status IN ('pending', 'running', 'retry_wait', 'succeeded', 'skipped', "
+            "'quarantined', 'failed', 'cancelled')",
+            name="status_valid",
+        ),
+        CheckConstraint("attempt_count >= 0", name="attempt_count_nonnegative"),
+        CheckConstraint("max_attempts BETWEEN 1 AND 10", name="max_attempts_bounded"),
+        CheckConstraint("attempt_count <= max_attempts", name="attempt_count_within_max"),
+        CheckConstraint("fencing_token = attempt_count", name="fencing_matches_attempt_count"),
+        CheckConstraint(
+            "(status IN ('pending', 'retry_wait') AND next_attempt_at IS NOT NULL) OR "
+            "(status NOT IN ('pending', 'retry_wait') AND next_attempt_at IS NULL)",
+            name="availability_matches_status",
+        ),
+        CheckConstraint(
+            "status <> 'retry_wait' OR (attempt_count > 0 AND attempt_count < max_attempts)",
+            name="retry_attempt_available",
+        ),
+        CheckConstraint(
+            "(status = 'running' AND lease_owner IS NOT NULL AND lease_id IS NOT NULL "
+            "AND lease_acquired_at IS NOT NULL AND lease_expires_at IS NOT NULL "
+            "AND heartbeat_at IS NOT NULL AND attempt_count > 0) OR "
+            "(status <> 'running' AND lease_owner IS NULL AND lease_id IS NULL "
+            "AND lease_acquired_at IS NULL AND lease_expires_at IS NULL AND heartbeat_at IS NULL)",
+            name="lease_matches_status",
+        ),
+        CheckConstraint("lease_owner IS NULL OR btrim(lease_owner) <> ''", name="lease_owner_not_blank"),
+        CheckConstraint(
+            "lease_expires_at IS NULL OR lease_expires_at > lease_acquired_at",
+            name="lease_expiry_after_acquired",
+        ),
+        CheckConstraint(
+            "heartbeat_at IS NULL OR heartbeat_at >= lease_acquired_at",
+            name="heartbeat_after_acquired",
+        ),
+        CheckConstraint(
+            "heartbeat_at IS NULL OR heartbeat_at < lease_expires_at",
+            name="heartbeat_before_expiry",
+        ),
+        CheckConstraint(
+            "cancel_reason_code IS NULL OR cancel_requested_at IS NOT NULL",
+            name="cancel_reason_requires_time",
+        ),
+        CheckConstraint(
+            "cancel_reason_code IS NULL OR cancel_reason_code ~ '^[a-z][a-z0-9_]*$'",
+            name="cancel_reason_code_valid",
+        ),
+        CheckConstraint(
+            "status <> 'cancelled' OR cancel_requested_at IS NOT NULL",
+            name="cancelled_requires_request",
+        ),
+        CheckConstraint(
+            "(last_error_category IS NULL AND last_error_code IS NULL) OR "
+            "(last_error_category IS NOT NULL AND last_error_code IS NOT NULL)",
+            name="error_pair_consistent",
+        ),
+        CheckConstraint(
+            "last_error_category IS NULL OR last_error_category IN "
+            "('configuration', 'authentication', 'authorization', 'rate_limit', 'source_read', "
+            "'extraction', 'persistence', 'embedding', 'permission', 'internal')",
+            name="error_category_valid",
+        ),
+        CheckConstraint(
+            "last_error_code IS NULL OR last_error_code ~ '^[a-z][a-z0-9_]*$'",
+            name="error_code_valid",
+        ),
+        CheckConstraint(
+            "(status = 'quarantined' AND quarantine_reason_code IS NOT NULL "
+            "AND last_error_category IS NOT NULL) OR "
+            "(status <> 'quarantined' AND quarantine_reason_code IS NULL)",
+            name="quarantine_state_consistent",
+        ),
+        CheckConstraint(
+            "quarantine_reason_code IS NULL OR quarantine_reason_code ~ '^[a-z][a-z0-9_]*$'",
+            name="quarantine_reason_valid",
+        ),
+        CheckConstraint(
+            "downloaded_bytes BETWEEN 0 AND 1073741824 "
+            "AND extracted_characters BETWEEN 0 AND 100000000 "
+            "AND chunk_count BETWEEN 0 AND 100000 "
+            "AND embedding_batch_count BETWEEN 0 AND 100000",
+            name="counters_bounded",
+        ),
+        CheckConstraint(
+            "(status IN ('succeeded', 'skipped', 'quarantined', 'failed', 'cancelled') "
+            "AND terminal_at IS NOT NULL) OR "
+            "(status IN ('pending', 'running', 'retry_wait') AND terminal_at IS NULL)",
+            name="terminal_state_consistent",
+        ),
+        CheckConstraint("updated_at >= created_at", name="updated_after_created"),
+        CheckConstraint(
+            "terminal_at IS NULL OR terminal_at >= created_at", name="terminal_after_created"
+        ),
+        Index(
+            "ix_sync_file_work_claimable",
+            "organization_id", "generation_id", "next_attempt_at", "id",
+            postgresql_where=text("status IN ('pending', 'retry_wait')"),
+        ),
+        Index(
+            "ix_sync_file_work_expired",
+            "organization_id", "generation_id", "lease_expires_at", "id",
+            postgresql_where=text("status = 'running'"),
+        ),
+        Index(
+            "ix_sync_file_work_generation_barrier",
+            "organization_id", "generation_id", "status",
+        ),
+        Index(
+            "ix_sync_file_work_scope_terminal",
+            "organization_id", "connector_scope_id", "terminal_at", "id",
+            postgresql_where=text("terminal_at IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_scope_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    generation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    source_item_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    source_key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    repository_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    provider_blob_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    provider_revision_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    profile_fingerprint: Mapped[str] = mapped_column(String(255), nullable=False)
+    file_size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    file_extension: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    mime_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'pending'"))
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("3"))
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    lease_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    fencing_token: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    lease_acquired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancel_reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_error_category: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    last_error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    quarantine_reason_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    downloaded_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    extracted_characters: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    chunk_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    embedding_batch_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    terminal_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class ConnectorSyncRun(Base):
     __tablename__ = "connector_sync_runs"
     __table_args__ = (

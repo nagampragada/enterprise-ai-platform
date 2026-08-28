@@ -8,7 +8,7 @@
 | Snapshot branch | `main` |
 | Snapshot commit | `6352fa2c09cf09bddd6428d04c67cd88caee6460` (clean implementation baseline) |
 | Snapshot date | 2026-08-21 |
-| Alembic head | `20260828_000019` |
+| Alembic head | `20260828_000020` |
 | Purpose | Authoritative, code-evidenced inventory of implemented, exposed, partial, planned, deferred, and excluded capabilities |
 | Audiences | Product owners, backend/data/security/connector/operations/UI/QA engineers, and future repository agents |
 
@@ -104,7 +104,7 @@ Evidence: `backend/pyproject.toml`, `infra/docker/docker-compose.postgres.yml`, 
 | FastAPI | `>=0.112,<1.0` | Authentication, health, manual ingestion APIs; automatic OpenAPI/docs | Complete |
 | Pydantic | FastAPI dependency; v2 APIs used | Strict request/response validation | Complete |
 | SQLAlchemy | `>=2.0,<3.0` | ORM, typed models, repositories, transaction-bound sessions | Complete |
-| Alembic | `>=1.13,<2.0` | 18-revision migration chain | Complete |
+| Alembic | `>=1.13,<2.0` | 20-revision migration chain | Complete |
 | PostgreSQL | pg16 container | Primary durable store and authorization query engine | Complete for local development |
 | pgvector | `>=0.3,<1.0` | `Vector(1536)` chunk embeddings and cosine distance | Complete; no ANN vector index |
 | psycopg | `>=3.2,<4.0` | PostgreSQL driver | Complete |
@@ -125,7 +125,7 @@ Evidence: `backend/pyproject.toml`, `infra/docker/docker-compose.postgres.yml`, 
 
 ## 6. Database architecture
 
-SQLAlchemy metadata contains **42 live tables**. Alembic head is `20260828_000019`; migrations are forward-ordered, tested against real PostgreSQL, and generally provide narrow downgrades. The pgvector extension downgrade is intentionally conservative because extensions can be shared infrastructure.
+SQLAlchemy metadata contains **44 live tables**. Alembic head is `20260828_000020`; migrations are forward-ordered, tested against real PostgreSQL, and generally provide narrow downgrades. The pgvector extension downgrade is intentionally conservative because extensions can be shared infrastructure.
 
 ### Organizations, users, authentication, and structure
 
@@ -408,6 +408,24 @@ This low-level capability is backend-internal and OpenAPI is unchanged. The stag
 Cursor schema version 2 pins repository/default-branch/commit/root-tree identity plus an authorization fingerprint and scan generation. It stores explicit traversal/reconciliation/complete phase, at most 64 DFS frames, cumulative budgets, authoritative traversal completion, bounded reconciliation keyset/item/batch counters, and final completion. It uses a fixed allowlist and 96 KiB cap, rejects phase/keyset/counter regression, and fails closed on incompatible state. Per-continuation hard bounds are 25 tree calls, 1,000 entries, 10 observed files, 25 MiB, and 500 chunks/embedding inputs; per-run traversal bounds are 100,000 entries, 10,000 observed files, 10 GiB, and 500,000 chunks. One file remains capped at 10 MiB. Reconciliation defaults to 100 items, caps one page at 500, and has 100,000-item and 30-minute run limits.
 
 Stable identity is `github:repository:{repository_id}:path:{exact_path}` and provider revision is the Git blob ID. Matching source/version blob IDs plus a complete current indexing profile skip blob download and all extraction/embedding cost. A short caller-owned write transaction locks and revalidates lease owner/UUID/fence/attempt/expiry/cancellation, durable run start, current connector/scope/credential/installation/knowledge-space binding, and cursor authority before atomically persisting retirement/counters/cursor. Only a genuine terminal traversal enters deletion authority, and reconciliation makes no provider, SecretStore, extraction, chunking, or embedding calls. Exact-scope indexed keyset reconciliation rechecks freshness under lock, removes unseen membership, writes deleted tombstones, and soft-retires documents without deleting versions, materialization links, indexing attempts, or chunks. Permission-aware retrieval excludes retired state after commit; another active membership preserves access, and explicit reactivation safely restores the same source/document identity through a new available version. Equal blob hashes never imply rename: a distinct new path is created and the unseen old path is retired; rename lineage remains future work. Present unsupported/oversized/object-type/LFS paths use fixed unavailable classifications rather than provider deletion. Production GitHub job claiming/routing, independent heartbeat orchestration, and bounded public job operations are implemented; ACL synchronization and webhooks remain absent.
+
+### Feature-gated repository generation ledger
+
+Migration `20260828_000020` adds a durable tenant-qualified pinned repository
+generation and independently claimable per-file control ledger. The isolated
+repository supports idempotent manifests in batches of at most 500, ordered
+`FOR UPDATE SKIP LOCKED` claims, UUID leases, monotonic fences, heartbeats,
+retry scheduling, quarantine, cancellation, expired recovery, durable follow-up
+intent, and a read-only all-terminal barrier. Real-PostgreSQL tests cover 32
+concurrent claimers, tenant isolation, stale mutation rejection, index plans,
+and a 10,000-item synthetic workload.
+
+This is foundation only: no application/server/worker composition imports the
+ledger, and no current GitHub or Local Folder job writes it. It cannot promote
+a generation, reconcile a snapshot, alter retrieval visibility, or call a
+provider. A later integration slice must explicitly connect discovery and file
+workers and must keep promotion disabled until the stored snapshot and barrier
+are independently validated.
 
 ### GitHub App operator configuration
 
@@ -830,7 +848,7 @@ Known output at snapshot:
 | Local PostgreSQL | Docker Compose uses `pgvector/pgvector:pg16`, localhost port, health check, named volume; development credentials only |
 | pgvector | Extension migration and vector column complete |
 | Local configuration | Environment-driven database/JWT/OpenAI settings; no secrets are documented here |
-| Migrations | 19 revisions, head `20260828_000019`, real PostgreSQL lifecycle tests |
+| Migrations | 20 revisions, head `20260828_000020`, real PostgreSQL lifecycle tests |
 | Worker runner | Bounded staged callable class implemented |
 | Continuous worker host | Direct module with continuous and one-shot modes implemented |
 | Scheduler/automatic recovery | Continuous/one-shot interval scheduler and worker expired recovery implemented |

@@ -1,8 +1,58 @@
 # Database Architecture
 
+## Durable repository generations and file-work ledger (`20260828_000020`)
+
+Migration `20260828_000020` adds the feature-gated `connector_sync_generations`
+and `connector_sync_file_work_items` control-plane tables. They are not composed
+into the API, scheduler, existing connector worker, GitHub synchronization, Local
+Folder synchronization, extraction, chunking, embedding, or retrieval paths in
+this slice. The current production execution path and retrieval visibility are
+therefore unchanged.
+
+`connector_sync_generations` pins one provider repository, branch, commit, root
+tree, and complete extraction/chunking/embedding profile to one originating
+tenant-qualified connector sync job. Its lifecycle distinguishes `discovering`,
+`processing`, `completed`, `completed_with_errors`, `failed`, and `cancelled`.
+Discovery completion, reconciliation eligibility, and durable follow-up intent
+are separate state pairs. The repository supplied by this slice calculates
+eligibility read-only: the barrier opens only after discovery is complete and
+every registered item is terminal. It does not set the stored reconciliation
+flag, promote a generation, reconcile deletions, or make any generation current.
+
+`connector_sync_file_work_items` stores independently claimable metadata only:
+tenant/scope/generation identity, source key and repository path, provider blob
+and revision, profile fingerprint, bounded file descriptors, execution state,
+attempt/availability data, lease UUID, monotonically increasing fence, heartbeat,
+cancellation, redacted failure/quarantine codes, bounded counters, and timestamps.
+It never stores provider bytes, extracted text, chunks, embeddings, or vectors.
+The logical unique key uses a SHA-256 digest of the exact source key and path plus
+the exact blob, revision, and profile. Repository registration validates the
+digest result against every original attribute, so an accidental or adversarial
+digest collision fails closed rather than aliasing work.
+
+Claiming uses a tenant- and generation-qualified partial index ordered by
+`next_attempt_at, id` with `FOR UPDATE SKIP LOCKED`. Separate partial indexes
+support expired-lease recovery and terminal retention, while
+`(organization_id, generation_id, status)` supports barrier counts. Every leased
+mutation matches tenant, connector, scope, generation, item, worker, lease UUID,
+attempt, fence, running state, and unexpired lease. Recovery clears ownership;
+the next claim increments both attempt and fence, preventing a stale worker from
+committing terminal state.
+
+The pilot tables intentionally remain unpartitioned. If measured row count,
+index size, vacuum pressure, or tenant-isolated query latency requires native
+partitioning, the planned first partition key for file work is
+`HASH (organization_id)`: it preserves tenant pruning and keeps all scope and
+retention operations tenant-local. A later migration may add generation-aware
+subpartitioning or move expired terminal history to a range-partitioned archive,
+but only after benchmark evidence and after redesigning primary/unique keys to
+include every PostgreSQL partition key. `connector_sync_generations` should stay
+unpartitioned until its much smaller measured cardinality justifies the same
+change.
+
 ## GitHub repository scopes and reconciliation (`20260828_000019`)
 
-Explicit GitHub repository selection reuses `connector_scopes`. Migration `20260828_000019` adds only the partial index `ix_source_scope_memberships_reconciliation` on `(organization_id, connector_id, connector_scope_id, last_seen_at, id) WHERE status = 'active' AND removed_at IS NULL` for bounded unseen-item keyset scans and is the single Alembic head. A selection uses `scope_type = repository`, `access_mode = platform_managed`, the immutable external identity `github:repository:{positive_repository_id}`, one tenant-qualified knowledge-space foreign key, and a fixed safe metadata allowlist. The existing unique `(organization_id, connector_id, external_scope_key)` constraint permits exactly one durable identity per connector across active and removed states. It therefore prevents concurrent duplicate or different-space rows and enables same-row reactivation without a new selection table.
+Explicit GitHub repository selection reuses `connector_scopes`. Migration `20260828_000019` adds only the partial index `ix_source_scope_memberships_reconciliation` on `(organization_id, connector_id, connector_scope_id, last_seen_at, id) WHERE status = 'active' AND removed_at IS NULL` for bounded unseen-item keyset scans. A selection uses `scope_type = repository`, `access_mode = platform_managed`, the immutable external identity `github:repository:{positive_repository_id}`, one tenant-qualified knowledge-space foreign key, and a fixed safe metadata allowlist. The existing unique `(organization_id, connector_id, external_scope_key)` constraint permits exactly one durable identity per connector across active and removed states. It therefore prevents concurrent duplicate or different-space rows and enables same-row reactivation without a new selection table.
 
 The selected scope is the authorization boundary. A short read transaction copies validated immutable identifiers and must end before SecretStore, GitHub, extraction, chunking, or embedding access. The synchronization service persists only safe provider identities and platform checksums through the existing source/version/materialization/indexing/chunk schema; tokens, raw bytes, provider responses, and extracted payloads never enter provider metadata or cursor state.
 

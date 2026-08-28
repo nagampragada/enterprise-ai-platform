@@ -36,6 +36,13 @@ Selection first validates the tenant connector, active credential, connected org
 
 A new short write transaction re-locks the connector, credential, installation binding, and knowledge space, then compares all copied security-boundary identities before persistence. The canonical immutable identity is `github:repository:{repository_id}`. The existing unique `(organization_id, connector_id, external_scope_key)` constraint prevents duplicate or different-space selections, so no migration was required. Connector locking serializes create/reactivate/deselect races. Exact duplicates return one scope; a removed same-space scope is reactivated; a different-space assignment conflicts and is never moved implicitly.
 
+Migration `20260828_000020` provides an isolated repository-generation and
+independently leased file-work ledger for a future horizontally scaled GitHub
+execution path. It is deliberately not registered with the current worker or
+service composition. Existing repository-wide synchronization remains the live
+path until a later, separately validated integration slice supplies discovery,
+parallel file execution, reconciliation, and current-generation promotion.
+
 GET is a provider-free bounded `(created_at,id)` keyset page of persisted selections, including locally removed history. DELETE is provider-free and idempotently changes the exact tenant/connector-owned scope to `removed`; it does not revoke GitHub access, hard-delete history, or delete content. Neither operation requires GitHub configuration. No selection route enqueues a job, creates a schedule, retrieves content, or writes source/document/index rows. Synchronization is requested separately through the provider-neutral operational API.
 
 ## Internal repository content reader

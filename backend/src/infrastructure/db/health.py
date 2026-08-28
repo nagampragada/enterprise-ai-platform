@@ -12,7 +12,7 @@ from infrastructure.db.engine import engine
 
 
 logger = logging.getLogger(__name__)
-EXPECTED_ALEMBIC_REVISION = "20260828_000019"
+EXPECTED_ALEMBIC_REVISION = "20260828_000020"
 READINESS_STATEMENT_TIMEOUT_MILLISECONDS = 2_000
 
 
