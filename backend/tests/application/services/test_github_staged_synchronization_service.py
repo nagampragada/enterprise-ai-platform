@@ -46,6 +46,9 @@ from application.services.github_repository_content_service import (
     GitHubRepositoryContentUnavailable,
 )
 from infrastructure.repositories.connector_sync_job_repository import StaleSyncJobFence
+from infrastructure.repositories.connector_sync_work_ledger_repository import (
+    SyncWorkLedgerPersistenceError,
+)
 from infrastructure.repositories.source_item_repository import (
     MembershipReconciliationCursor,
     MembershipReconciliationPage,
@@ -109,6 +112,28 @@ def _lease(authorization):
         organization_id=authorization.organization_id,
         connector_id=authorization.connector_id,
         connector_scope_id=authorization.scope_id,
+    )
+
+
+def _planning_lease(authorization):
+    return SimpleNamespace(
+        organization_id=authorization.organization_id,
+        connector_id=authorization.connector_id,
+        connector_scope_id=authorization.scope_id,
+        job_id=uuid4(),
+    )
+
+
+def _profile():
+    return LocalDocumentIndexingProfile(
+        "extract",
+        "v1",
+        "chunk",
+        "v1",
+        "fake",
+        "fake:model:1536",
+        1536,
+        "f" * 64,
     )
 
 
@@ -541,11 +566,138 @@ def test_stale_lease_rejection_precedes_authorization_or_provider_work():
     content.authorize.assert_not_called()
 
 
+def test_disabled_shadow_planning_performs_zero_ledger_operations() -> None:
+    service = GitHubStagedSynchronizationService(
+        Mock(), Mock(), Mock(), _profile(), ledger_planning_enabled=False
+    )
+    assert service._planner is None
+    assert (
+        service.plan_manifest_batch(
+            Mock(), Mock(), Mock(), worker_id="worker", now=datetime.now(timezone.utc)
+        )
+        is None
+    )
+
+
+def test_enabled_pin_registers_generation_from_the_single_pinned_snapshot() -> None:
+    authorization = _authorization()
+    cursor = _cursor(authorization)
+    now = datetime(2026, 8, 28, tzinfo=timezone.utc)
+    run_id = uuid4()
+    lease = _planning_lease(authorization)
+    service = GitHubStagedSynchronizationService(
+        Mock(), Mock(), Mock(), _profile(), ledger_planning_enabled=True
+    )
+    service._require_context = Mock()  # type: ignore[method-assign]
+    service._replace_cursor = Mock()  # type: ignore[method-assign]
+    service._sync = Mock()
+    service._sync.get_active_cursor.return_value = None
+    service._planner = Mock()
+    snapshot = GitHubSynchronizationSnapshot(
+        authorization, run_id, now, None, _profile()
+    )
+
+    service.pin_snapshot(lease, snapshot, cursor, worker_id="worker", now=now)
+
+    service._replace_cursor.assert_called_once()
+    service._planner.ensure_generation.assert_called_once_with(
+        organization_id=authorization.organization_id,
+        connector_id=authorization.connector_id,
+        connector_scope_id=authorization.scope_id,
+        sync_job_id=lease.job_id,
+        authorization=authorization,
+        snapshot=cursor.snapshot,
+        profile_fingerprint=_profile().fingerprint,
+        now=now,
+    )
+
+
+def test_planning_batch_rejects_stale_cursor_and_registers_before_advancement() -> None:
+    authorization = _authorization()
+    cursor = _cursor(authorization)
+    now = datetime(2026, 8, 28, tzinfo=timezone.utc)
+    run_id = uuid4()
+    lease = _planning_lease(authorization)
+    after = replace(cursor, totals=GitHubRunBudget(entries_examined=1))
+    discovered = GitHubDiscoveredFile(
+        _entry(cursor.snapshot, "document.md"), cursor, after, None
+    )
+    batch = GitHubDiscoveryBatch((discovered,), after, 1, 1)
+    service = GitHubStagedSynchronizationService(
+        Mock(), Mock(), Mock(), _profile(), ledger_planning_enabled=True
+    )
+    service._require_context = Mock()  # type: ignore[method-assign]
+    service._planner = Mock()
+    service._planner.register_manifest_batch.return_value = Mock()
+    service._sync = Mock()
+    service._sync.get_active_cursor.return_value = SimpleNamespace(
+        created_by_run_id=run_id,
+        cursor_type="github_repository_progress",
+        safe_cursor=cursor.to_safe_json(),
+    )
+    snapshot = GitHubSynchronizationSnapshot(
+        authorization, run_id, now, cursor, _profile()
+    )
+
+    service.plan_manifest_batch(
+        lease, snapshot, batch, worker_id="worker", now=now
+    )
+    service._planner.register_manifest_batch.assert_called_once()
+    assert (
+        service._planner.register_manifest_batch.call_args.kwargs["entries"]
+        == (discovered.entry,)
+    )
+
+    stale = replace(cursor, totals=GitHubRunBudget(entries_examined=2))
+    service._sync.get_active_cursor.return_value.safe_cursor = stale.to_safe_json()
+    with pytest.raises(StalePreparedGitHubBatch, match="stale"):
+        service.plan_manifest_batch(
+            lease, snapshot, batch, worker_id="worker", now=now
+        )
+
+
+def test_completion_barrier_opens_only_after_legacy_cursor_is_durably_advanced() -> None:
+    authorization = _authorization()
+    cursor = _cursor(authorization)
+    complete = replace(cursor, frames=(), scan_complete=True)
+    now = datetime(2026, 8, 28, tzinfo=timezone.utc)
+    run_id = uuid4()
+    lease = _planning_lease(authorization)
+    service = GitHubStagedSynchronizationService(
+        Mock(), Mock(), Mock(), _profile(), ledger_planning_enabled=True
+    )
+    service._require_context = Mock()  # type: ignore[method-assign]
+    service._replace_cursor = Mock()  # type: ignore[method-assign]
+    service._planner = Mock()
+    service._sync = Mock()
+    service._sync.get_active_cursor.return_value = SimpleNamespace(
+        created_by_run_id=run_id,
+        cursor_type="github_repository_progress",
+        safe_cursor=cursor.to_safe_json(),
+    )
+    snapshot = GitHubSynchronizationSnapshot(
+        authorization, run_id, now, cursor, _profile()
+    )
+
+    outcome = service.persist_batch(
+        lease,
+        snapshot,
+        PreparedGitHubBatch((), complete, 0, 0),
+        worker_id="worker",
+        now=now,
+    )
+
+    assert outcome.phase == "reconciliation"
+    service._replace_cursor.assert_called_once()
+    service._planner.mark_discovery_complete.assert_called_once()
+
+
 @pytest.mark.parametrize(
     ("error", "kind", "retryable"),
     (
         (GitHubRepositoryContentUnavailable("safe"), SyncFailureKind.RETRYABLE_PROVIDER, True),
         (GitHubRepositoryContentRejected("safe"), SyncFailureKind.PERMANENT_PROVIDER, False),
+        (SyncWorkLedgerPersistenceError("safe"), SyncFailureKind.TRANSIENT_PERSISTENCE, True),
         (GitHubSynchronizationBudgetExceeded("safe"), SyncFailureKind.VALIDATION, False),
         (StaleSyncJobFence("safe"), SyncFailureKind.CANCELLED, False),
     ),

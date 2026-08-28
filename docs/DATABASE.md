@@ -3,11 +3,14 @@
 ## Durable repository generations and file-work ledger (`20260828_000020`)
 
 Migration `20260828_000020` adds the feature-gated `connector_sync_generations`
-and `connector_sync_file_work_items` control-plane tables. They are not composed
-into the API, scheduler, existing connector worker, GitHub synchronization, Local
-Folder synchronization, extraction, chunking, embedding, or retrieval paths in
-this slice. The current production execution path and retrieval visibility are
-therefore unchanged.
+and `connector_sync_file_work_items` control-plane tables. When the optional
+worker flag `GITHUB_SYNC_LEDGER_PLANNING_ENABLED=true` is set, the existing
+GitHub traversal shadows each pinned snapshot into these tables in bounded
+transactions. The flag defaults to false and accepts only lowercase `true` or
+`false`. Local Folder synchronization, file-work claiming, extraction,
+chunking, embedding, generation promotion, and retrieval do not consume the
+ledger. The existing GitHub path remains the only indexing path, so retrieval
+visibility is unchanged.
 
 `connector_sync_generations` pins one provider repository, branch, commit, root
 tree, and complete extraction/chunking/embedding profile to one originating
@@ -28,7 +31,19 @@ It never stores provider bytes, extracted text, chunks, embeddings, or vectors.
 The logical unique key uses a SHA-256 digest of the exact source key and path plus
 the exact blob, revision, and profile. Repository registration validates the
 digest result against every original attribute, so an accidental or adversarial
-digest collision fails closed rather than aliasing work.
+digest collision fails closed rather than aliasing work. It also locks the
+generation and checks every source digest already registered in that generation,
+so replay is idempotent while the same path with conflicting immutable metadata
+fails instead of creating a second work item.
+
+Shadow planning creates or resolves the generation when the legacy cursor first
+pins the default branch commit and root tree. Each discovered batch is registered
+and committed before download/extraction begins. Cursor replay after a crash
+therefore repeats the same manifest safely. The generation is marked discovery
+complete only in the same transaction that advances the authoritative legacy
+cursor into reconciliation after all tree frames are exhausted. A partial
+generation remains `discovering`, never becomes reconciliation eligible, and is
+not referenced by permission-aware retrieval.
 
 Claiming uses a tenant- and generation-qualified partial index ordered by
 `next_attempt_at, id` with `FOR UPDATE SKIP LOCKED`. Separate partial indexes

@@ -111,6 +111,7 @@ def _patch_composition_dependencies(monkeypatch, captured):
         "LocalFolderSyncWorker",
         "GitHubRepositoryContentService",
         "GitHubSynchronizationPreparationService",
+        "GitHubStagedSynchronizationService",
         "GitHubSyncWorker",
     ):
         monkeypatch.setattr(worker_host_module, name, Mock())
@@ -142,3 +143,28 @@ def test_composition_preserves_injected_deterministic_retry_jitter(monkeypatch):
     )
 
     assert captured["random_uniform"] is deterministic_uniform
+
+
+def test_composition_propagates_disabled_and_enabled_ledger_planning(monkeypatch):
+    captured = {}
+    _patch_composition_dependencies(monkeypatch, captured)
+    github_worker = worker_host_module.GitHubSyncWorker
+
+    for enabled in (False, True):
+        github_worker.reset_mock()
+        process_settings = Mock()
+        process_settings.github_sync_ledger_planning_enabled = enabled
+        worker_host_module.compose_connector_sync_worker_host(
+            _settings(), session_factory=Mock(), process_settings=process_settings
+        )
+        assert (
+            github_worker.call_args.kwargs["ledger_planning_enabled"] is enabled
+        )
+        staged_factory = github_worker.call_args.args[2]
+        staged_factory(Mock())
+        assert (
+            worker_host_module.GitHubStagedSynchronizationService.call_args.kwargs[
+                "ledger_planning_enabled"
+            ]
+            is enabled
+        )

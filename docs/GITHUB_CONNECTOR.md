@@ -38,10 +38,12 @@ A new short write transaction re-locks the connector, credential, installation b
 
 Migration `20260828_000020` provides an isolated repository-generation and
 independently leased file-work ledger for a future horizontally scaled GitHub
-execution path. It is deliberately not registered with the current worker or
-service composition. Existing repository-wide synchronization remains the live
-path until a later, separately validated integration slice supplies discovery,
-parallel file execution, reconciliation, and current-generation promotion.
+execution path. The current worker can shadow its existing pinned discovery into
+that ledger only when `GITHUB_SYNC_LEDGER_PLANNING_ENABLED=true`; the variable is
+optional, defaults to false, and startup accepts only exact lowercase `true` or
+`false`. Existing repository-wide synchronization remains the sole live indexing
+path. Shadow work is never claimed, processed, embedded, reconciled, promoted,
+or consulted by retrieval.
 
 GET is a provider-free bounded `(created_at,id)` keyset page of persisted selections, including locally removed history. DELETE is provider-free and idempotently changes the exact tenant/connector-owned scope to `removed`; it does not revoke GitHub access, hard-delete history, or delete content. Neither operation requires GitHub configuration. No selection route enqueues a job, creates a schedule, retrieves content, or writes source/document/index rows. Synchronization is requested separately through the provider-neutral operational API.
 
@@ -78,6 +80,25 @@ Reconciliation is provider-free: it performs no GitHub, SecretStore, extraction,
 Per continuation, the configurable defaults and hard maxima are 25 tree requests, 1,000 examined entries, 10 supported files, 25 MiB downloaded bytes, and 500 chunks/embedding inputs. One blob remains capped at 10 MiB and depth at 64. Per run, hard totals are 100,000 examined entries, 10,000 supported files, 10 GiB downloaded bytes, and 500,000 chunks/embedding inputs. Exhausting a run hard limit is a safe non-retryable budget failure; there is no unbounded provider or embedding loop.
 
 An incomplete, failed, cancelled, budget-exhausted, malformed, stale-lease, or provider-failed traversal never reaches deletion authority. Empty batches and continuation limits are not authority. GitHub worker-host claiming/routing and heartbeat choreography, webhooks, ACLs, arbitrary refs, Git LFS object fetching, clone/archive access, and public synchronization/content APIs remain separate work.
+
+With ledger planning enabled, snapshot pinning creates or idempotently resolves
+one tenant/job/scope/repository/branch/commit/tree/profile-bound generation.
+Every observed legacy discovery batch registers only supported regular files in
+a separate caller-owned transaction before content preparation. The ledger API
+caps manifest calls at 500 entries; the current worker's stricter ten-file
+continuation bound means production calls are smaller. Replaying a durable cursor
+re-registers the same identities without duplication. Heartbeat cancellation is
+checked before and after registration, and a later failure leaves the committed
+generation resumable but incomplete. Discovery completion is written only with
+the legacy cursor's durable transition into reconciliation.
+
+This shadow slice is bounded, but it is not yet a true million-file discovery
+implementation. GitHub Git Trees has no pagination in this usage: each
+non-recursive tree response is limited to 1 MiB and 1,000 entries and any
+`truncated` response fails closed. The durable DFS cursor caps depth at 64 and a
+single run at 100,000 examined entries and 10,000 observed files. Scaling beyond
+those limits requires a provider enumeration strategy with resumable pagination
+or repository partitioning plus a separately reviewed run-budget policy.
 
 Connector capability output reports `supports_repository_discovery`, `supports_repository_selection`, `supports_bounded_content_reading`, and `supports_staged_synchronization` as true for GitHub. Production worker routing now exists; ACL/permissions, webhooks, and provider branch-history import remain false. “Staged synchronization” describes the internal create/update/reconciliation service routed by the worker, not a public content API.
 

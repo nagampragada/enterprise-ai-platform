@@ -182,10 +182,9 @@ class ConnectorSyncWorkLedgerRepository:
             raise SyncWorkLedgerNotFound("generation was not found")
         if generation.status in {status.value for status in TERMINAL_GENERATION_STATUSES}:
             raise SyncWorkLedgerConflict("terminal generation cannot accept manifest work")
-        if generation.discovery_complete:
-            raise SyncWorkLedgerConflict("completed discovery cannot accept manifest work")
 
         keyed: dict[tuple[str, str, str, str], FileWorkManifestEntry] = {}
+        by_source_hash: dict[str, FileWorkManifestEntry] = {}
         for entry in entries:
             if entry.profile_fingerprint != generation.profile_fingerprint:
                 raise InvalidSyncWorkLedgerRequest("manifest profile does not match generation")
@@ -194,6 +193,64 @@ class ConnectorSyncWorkLedgerRepository:
             if previous is not None and previous != entry:
                 raise SyncWorkLedgerConflict("manifest logical identity collision")
             keyed[identity] = entry
+            previous_source = by_source_hash.get(identity[0])
+            if previous_source is not None and previous_source != entry:
+                raise SyncWorkLedgerConflict("manifest source identity collision")
+            by_source_hash[identity[0]] = entry
+
+        logical_keys = tuple(keyed)
+        existing_sources = self._all(
+            select(ConnectorSyncFileWorkItem).where(
+                ConnectorSyncFileWorkItem.organization_id == organization_id,
+                ConnectorSyncFileWorkItem.generation_id == generation_id,
+                ConnectorSyncFileWorkItem.source_key_hash.in_(tuple(by_source_hash)),
+            ),
+            "manifest source identity lookup failed",
+        )
+        for row in existing_sources:
+            if not _manifest_row_matches(row, by_source_hash[row.source_key_hash]):
+                raise SyncWorkLedgerConflict(
+                    "manifest source identity resolves to different attributes"
+                )
+
+        if generation.discovery_complete:
+            rows = self._all(
+                select(ConnectorSyncFileWorkItem).where(
+                    ConnectorSyncFileWorkItem.organization_id == organization_id,
+                    ConnectorSyncFileWorkItem.generation_id == generation_id,
+                    tuple_(
+                        ConnectorSyncFileWorkItem.source_key_hash,
+                        ConnectorSyncFileWorkItem.provider_blob_id,
+                        ConnectorSyncFileWorkItem.provider_revision_id,
+                        ConnectorSyncFileWorkItem.profile_fingerprint,
+                    ).in_(logical_keys),
+                ),
+                "completed manifest replay lookup failed",
+            )
+            by_key = {
+                (
+                    row.source_key_hash,
+                    row.provider_blob_id,
+                    row.provider_revision_id,
+                    row.profile_fingerprint,
+                ): row
+                for row in rows
+            }
+            if set(by_key) != set(logical_keys):
+                raise SyncWorkLedgerConflict(
+                    "completed discovery cannot accept new manifest work"
+                )
+            for identity, entry in keyed.items():
+                if not _manifest_row_matches(by_key[identity], entry):
+                    raise SyncWorkLedgerConflict(
+                        "manifest identity resolves to different attributes"
+                    )
+            return ManifestRegistrationResult(
+                generation.id,
+                0,
+                len(logical_keys),
+                tuple(by_key[key].id for key in logical_keys),
+            )
 
         values = [
             {
@@ -241,7 +298,6 @@ class ConnectorSyncWorkLedgerRepository:
             inserted = self._session.execute(statement).all()
         except SQLAlchemyError as exc:
             raise SyncWorkLedgerPersistenceError("manifest registration failed") from exc
-        logical_keys = tuple(keyed)
         rows = self._all(
             select(ConnectorSyncFileWorkItem).where(
                 ConnectorSyncFileWorkItem.organization_id == organization_id,

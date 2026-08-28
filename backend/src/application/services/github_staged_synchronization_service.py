@@ -37,6 +37,11 @@ from application.services.github_repository_content_service import (
     GitHubRepositorySnapshot,
     GitHubTreeDescriptor,
 )
+from application.services.github_sync_work_planning_service import (
+    GitHubManifestPlanningResult,
+    GitHubSyncWorkPlanningService,
+    InvalidGitHubSyncWorkPlanningRequest,
+)
 from application.services.local_document_indexing_service import LocalDocumentIndexingProfile
 from application.services.local_document_ingestion_service import _normalized_profile_name, _profile_hash
 from domain.content_chunking.chunker import ContentChunker, chunking_profile_signature
@@ -60,6 +65,13 @@ from infrastructure.repositories.connector_sync_job_repository import (
     StaleSyncJobFence,
     SyncJobCancellationConflict,
     SyncJobLease,
+)
+from infrastructure.repositories.connector_sync_work_ledger_repository import (
+    ConnectorSyncWorkLedgerRepository,
+    InvalidSyncWorkLedgerRequest,
+    SyncWorkLedgerConflict,
+    SyncWorkLedgerNotFound,
+    SyncWorkLedgerPersistenceError,
 )
 from infrastructure.repositories.connector_sync_repository import ConnectorSyncRepository
 from infrastructure.repositories.connector_sync_repository import SafeSyncError
@@ -535,6 +547,18 @@ def classify_github_synchronization_failure(error: BaseException) -> FailureClas
         return classification_for(SyncFailureKind.PERMANENT_PROVIDER)
     if isinstance(error, (InvalidGitHubStagedSynchronizationRequest, StalePreparedGitHubBatch)):
         return classification_for(SyncFailureKind.VALIDATION)
+    if isinstance(
+        error,
+        (
+            InvalidGitHubSyncWorkPlanningRequest,
+            InvalidSyncWorkLedgerRequest,
+            SyncWorkLedgerConflict,
+            SyncWorkLedgerNotFound,
+        ),
+    ):
+        return classification_for(SyncFailureKind.VALIDATION)
+    if isinstance(error, SyncWorkLedgerPersistenceError):
+        return classification_for(SyncFailureKind.TRANSIENT_PERSISTENCE)
     if isinstance(error, (LostSyncJobLease, StaleSyncJobFence, SyncJobCancellationConflict)):
         return classification_for(SyncFailureKind.CANCELLED)
     return classify_exception(error)
@@ -818,7 +842,13 @@ class GitHubStagedSynchronizationService:
         execution_service: ConnectorSyncExecutionService,
         content_service: GitHubRepositoryContentService,
         profile: LocalDocumentIndexingProfile,
+        *,
+        ledger_planning_enabled: bool = False,
     ) -> None:
+        if not isinstance(ledger_planning_enabled, bool):
+            raise InvalidGitHubStagedSynchronizationRequest(
+                "GitHub ledger-planning flag is invalid"
+            )
         self._session = session
         self._execution = execution_service
         self._content = content_service
@@ -831,6 +861,14 @@ class GitHubStagedSynchronizationService:
         self._indexing = DocumentIndexingRepository(session)
         self._documents = DocumentRepository(session)
         self._chunks = DocumentChunkRepository(session)
+        self._ledger_planning_enabled = ledger_planning_enabled
+        self._planner = (
+            GitHubSyncWorkPlanningService(
+                ConnectorSyncWorkLedgerRepository(session)
+            )
+            if ledger_planning_enabled
+            else None
+        )
 
     def snapshot(
         self, lease: SyncJobLease, sync_run_id: UUID, *, worker_id: str
@@ -913,6 +951,67 @@ class GitHubStagedSynchronizationService:
             )
         return tuple(results)
 
+    def plan_manifest_batch(
+        self,
+        lease: SyncJobLease,
+        snapshot: GitHubSynchronizationSnapshot,
+        batch: GitHubDiscoveryBatch,
+        *,
+        worker_id: str,
+        now: datetime,
+    ) -> GitHubManifestPlanningResult | None:
+        if not self._ledger_planning_enabled or self._planner is None:
+            return None
+        self._execution.validate_attempt(
+            lease, snapshot.sync_run_id, worker_id=worker_id
+        )
+        _require_persistence_time(snapshot, now)
+        self._require_context(snapshot)
+        if (
+            not isinstance(batch, GitHubDiscoveryBatch)
+            or snapshot.cursor is None
+            or batch.cursor_after.snapshot != snapshot.cursor.snapshot
+            or len(batch.files) > HARD_MAX_FILES
+        ):
+            raise InvalidGitHubStagedSynchronizationRequest(
+                "GitHub planning batch is invalid"
+            )
+        for discovered in batch.files:
+            _validate_discovered_file(discovered, snapshot.cursor.snapshot)
+        current_row = self._sync.get_active_cursor(
+            lease.organization_id,
+            lease.connector_id,
+            lease.connector_scope_id,
+            lock=True,
+        )
+        if (
+            current_row is None
+            or current_row.created_by_run_id != snapshot.sync_run_id
+            or current_row.cursor_type != CURSOR_TYPE
+            or current_row.safe_cursor is None
+        ):
+            raise StalePreparedGitHubBatch(
+                "GitHub planning cursor is unavailable"
+            )
+        current = GitHubTraversalCursor.from_safe_json(
+            current_row.safe_cursor,
+            connector_id=lease.connector_id,
+            scope_id=lease.connector_scope_id,
+        )
+        if current != snapshot.cursor:
+            raise StalePreparedGitHubBatch("GitHub planning cursor is stale")
+        return self._planner.register_manifest_batch(
+            organization_id=lease.organization_id,
+            connector_id=lease.connector_id,
+            connector_scope_id=lease.connector_scope_id,
+            sync_job_id=lease.job_id,
+            authorization=snapshot.authorization,
+            snapshot=snapshot.cursor.snapshot,
+            profile_fingerprint=snapshot.profile.fingerprint,
+            entries=tuple(discovered.entry for discovered in batch.files),
+            now=now,
+        )
+
     def pin_snapshot(
         self,
         lease: SyncJobLease,
@@ -946,6 +1045,17 @@ class GitHubStagedSynchronizationService:
         if current is not None and current.created_by_run_id == snapshot.sync_run_id:
             raise StalePreparedGitHubBatch("GitHub snapshot was concurrently pinned")
         self._replace_cursor(snapshot, cursor, current, now)
+        if self._planner is not None:
+            self._planner.ensure_generation(
+                organization_id=lease.organization_id,
+                connector_id=lease.connector_id,
+                connector_scope_id=lease.connector_scope_id,
+                sync_job_id=lease.job_id,
+                authorization=snapshot.authorization,
+                snapshot=cursor.snapshot,
+                profile_fingerprint=snapshot.profile.fingerprint,
+                now=now,
+            )
 
     def persist_batch(
         self,
@@ -992,6 +1102,17 @@ class GitHubStagedSynchronizationService:
                 completion_marker=False,
             )
         self._replace_cursor(snapshot, target, current_row, now)
+        if target.phase == "reconciliation" and self._planner is not None:
+            self._planner.mark_discovery_complete(
+                organization_id=lease.organization_id,
+                connector_id=lease.connector_id,
+                connector_scope_id=lease.connector_scope_id,
+                sync_job_id=lease.job_id,
+                authorization=snapshot.authorization,
+                snapshot=target.snapshot,
+                profile_fingerprint=snapshot.profile.fingerprint,
+                now=now,
+            )
         return GitHubPersistenceOutcome(
             "in_progress",
             len(prepared.files),

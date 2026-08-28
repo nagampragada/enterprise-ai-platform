@@ -225,12 +225,14 @@ def compose_connector_sync_worker_host(settings: ConnectorWorkerSettings,
         lambda session: GitHubStagedSynchronizationService(
             session, execution(session), GitHubRepositoryContentService(session, github_client),
             github_preparation.profile,
+            ledger_planning_enabled=runtime.github_sync_ledger_planning_enabled,
         ),
         github_preparation,
         worker_id=settings.worker_id,
         lease_duration=settings.lease_duration,
         heartbeat_interval=settings.heartbeat_interval,
         heartbeat_shutdown_timeout=settings.shutdown_timeout,
+        ledger_planning_enabled=runtime.github_sync_ledger_planning_enabled,
     )
     return ConnectorSyncWorkerHost(
         session_factory, execution, local, github, settings, shutdown_event=shutdown_event

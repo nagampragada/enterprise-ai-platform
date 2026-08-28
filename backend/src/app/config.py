@@ -135,6 +135,7 @@ class WorkerProcessSettings:
     database: DatabaseSettings
     github: GitHubWorkerSettings
     secret_manager: GoogleSecretManagerSettings
+    github_sync_ledger_planning_enabled: bool = False
 
 
 def load_runtime_environment(environ: Mapping[str, str] | None = None) -> str:
@@ -335,7 +336,17 @@ def validate_worker_process_environment(
             or any(character.isspace() for character in api_key)
         ):
             raise InvalidRuntimeConfiguration("Runtime configuration is invalid")
-    return WorkerProcessSettings(database, github, secret_manager)
+    ledger_planning_enabled = _optional_strict_boolean(
+        values,
+        "GITHUB_SYNC_LEDGER_PLANNING_ENABLED",
+        default=False,
+    )
+    return WorkerProcessSettings(
+        database,
+        github,
+        secret_manager,
+        ledger_planning_enabled,
+    )
 
 
 def validate_scheduler_process_environment(
@@ -502,3 +513,16 @@ def _float(values: Mapping[str, str], name: str, default: float) -> float:
         return float(values.get(name, str(default)))
     except (TypeError, ValueError) as exc:
         raise ValueError("GitHub App configuration is invalid") from exc
+
+
+def _optional_strict_boolean(
+    values: Mapping[str, str], name: str, *, default: bool
+) -> bool:
+    supplied = values.get(name)
+    if supplied is None:
+        return default
+    if supplied == "true":
+        return True
+    if supplied == "false":
+        return False
+    raise InvalidRuntimeConfiguration("Runtime configuration is invalid")

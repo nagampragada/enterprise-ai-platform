@@ -17,6 +17,14 @@ from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
+from application.services.github_repository_content_service import (
+    GitHubRepositoryContentAuthorization,
+    GitHubRepositoryEntry,
+    GitHubRepositorySnapshot,
+)
+from application.services.github_sync_work_planning_service import (
+    GitHubSyncWorkPlanningService,
+)
 from domain.connectors.sync_work_ledger import (
     FileWorkCounters,
     FileWorkManifestEntry,
@@ -192,6 +200,73 @@ def _entry(index: int, *, max_attempts: int = 3) -> FileWorkManifestEntry:
     )
 
 
+def _github_planning_context(context: tuple[UUID, UUID, UUID, UUID]):
+    organization_id, connector_id, scope_id, job_id = context
+    repository_id = 123456
+    repository_identity = f"github:repository:{repository_id}"
+    authorization = GitHubRepositoryContentAuthorization(
+        organization_id,
+        connector_id,
+        scope_id,
+        uuid4(),
+        uuid4(),
+        101,
+        202,
+        303,
+        "sandbox-org",
+        repository_id,
+        "repository",
+        "sandbox-org/repository",
+        "sandbox-org",
+        repository_identity,
+        "main",
+    )
+    snapshot = GitHubRepositorySnapshot(
+        connector_id,
+        scope_id,
+        repository_id,
+        repository_identity,
+        "main",
+        "a" * 40,
+        "b" * 40,
+    )
+    return organization_id, connector_id, scope_id, job_id, authorization, snapshot
+
+
+def _github_entry(snapshot: GitHubRepositorySnapshot, index: int):
+    path = f"documents/file-{index:06d}.md"
+    return GitHubRepositoryEntry(
+        snapshot.connector_id,
+        snapshot.scope_id,
+        snapshot.repository_id,
+        snapshot.canonical_repository_identity,
+        snapshot.commit_object_id,
+        snapshot.root_tree_object_id,
+        snapshot.root_tree_object_id,
+        path.rsplit("/", 1)[-1],
+        path,
+        "regular_blob",
+        f"{index:040x}",
+        100 + index,
+        False,
+    )
+
+
+def _plan(service, context, entries):
+    organization_id, connector_id, scope_id, job_id, authorization, snapshot = context
+    return service.register_manifest_batch(
+        organization_id=organization_id,
+        connector_id=connector_id,
+        connector_scope_id=scope_id,
+        sync_job_id=job_id,
+        authorization=authorization,
+        snapshot=snapshot,
+        profile_fingerprint=PROFILE,
+        entries=entries,
+        now=NOW,
+    )
+
+
 def _generation(session: Session, label: str = "Ledger"):
     context = _setup(session, label)
     generation, created = ConnectorSyncWorkLedgerRepository(session).register_generation(
@@ -253,6 +328,137 @@ def test_generation_and_duplicate_manifest_registration_are_idempotent(engine) -
                 [_entry(index) for index in range(501)], now=NOW,
             )
         session.rollback()
+
+
+def test_github_planner_persists_multiple_bounded_batches_resumes_and_replays(
+    engine,
+) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context = _github_planning_context(_setup(session, "GitHubPlanner"))
+        service = GitHubSyncWorkPlanningService(
+            ConnectorSyncWorkLedgerRepository(session)
+        )
+        first = _plan(
+            service,
+            context,
+            tuple(_github_entry(context[-1], index) for index in range(500)),
+        )
+        session.commit()
+        assert (first.created_count, first.existing_count) == (500, 0)
+        generation_id = first.generation_id
+
+    # A new transaction/session models resumption after an interrupted worker.
+    with Session(engine, expire_on_commit=False) as session:
+        service = GitHubSyncWorkPlanningService(
+            ConnectorSyncWorkLedgerRepository(session)
+        )
+        resumed = _plan(
+            service,
+            context,
+            tuple(_github_entry(context[-1], index) for index in range(500, 537)),
+        )
+        session.commit()
+        assert resumed.generation_id == generation_id
+        assert resumed.generation_created is False
+        assert (resumed.created_count, resumed.existing_count) == (37, 0)
+
+        completed = service.mark_discovery_complete(
+            organization_id=context[0],
+            connector_id=context[1],
+            connector_scope_id=context[2],
+            sync_job_id=context[3],
+            authorization=context[4],
+            snapshot=context[5],
+            profile_fingerprint=PROFILE,
+            now=NOW,
+        )
+        session.commit()
+        assert completed.discovery_complete is True
+        assert completed.reconciliation_eligible is False
+
+        replay = _plan(
+            service,
+            context,
+            tuple(_github_entry(context[-1], index) for index in range(500)),
+        )
+        session.commit()
+        assert replay.generation_id == generation_id
+        assert (replay.created_count, replay.existing_count) == (0, 500)
+
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        summary = repository.barrier_summary(context[0], generation_id)
+        assert summary.discovery_complete is True
+        assert summary.total_items == summary.pending_items == 537
+        assert summary.barrier_open is False
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncFileWorkItem).where(
+                ConnectorSyncFileWorkItem.generation_id == generation_id
+            )
+        ) == 537
+
+
+def test_github_planner_concurrent_replay_is_unique_and_conflicts_fail_closed(
+    engine,
+) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context = _github_planning_context(_setup(session, "GitHubConcurrent"))
+    entries = tuple(_github_entry(context[-1], index) for index in range(100))
+    start = threading.Barrier(8)
+    results: list[object] = []
+    errors: list[BaseException] = []
+    guard = threading.Lock()
+
+    def plan() -> None:
+        with Session(engine, expire_on_commit=False) as session:
+            try:
+                start.wait(timeout=20)
+                result = _plan(
+                    GitHubSyncWorkPlanningService(
+                        ConnectorSyncWorkLedgerRepository(session)
+                    ),
+                    context,
+                    entries,
+                )
+                session.commit()
+                with guard:
+                    results.append(result)
+            except BaseException as exc:  # pragma: no cover - asserted below
+                session.rollback()
+                with guard:
+                    errors.append(exc)
+
+    threads = [threading.Thread(target=plan) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len(results) == 8
+    assert sum(result.created_count for result in results) == 100
+    assert len({result.generation_id for result in results}) == 1
+
+    with Session(engine, expire_on_commit=False) as session:
+        generation_id = results[0].generation_id
+        rows = session.scalars(
+            select(ConnectorSyncFileWorkItem).where(
+                ConnectorSyncFileWorkItem.generation_id == generation_id
+            )
+        ).all()
+        assert len(rows) == len({row.id for row in rows}) == 100
+        service = GitHubSyncWorkPlanningService(
+            ConnectorSyncWorkLedgerRepository(session)
+        )
+        conflicting = replace(entries[0], object_id="f" * 40)
+        with pytest.raises(SyncWorkLedgerConflict, match="source identity"):
+            _plan(service, context, (conflicting,))
+        session.rollback()
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncFileWorkItem).where(
+                ConnectorSyncFileWorkItem.generation_id == generation_id
+            )
+        ) == 100
 
 
 def test_tenant_qualified_foreign_keys_uniqueness_and_reads_fail_closed(engine) -> None:
@@ -555,6 +761,7 @@ def test_claim_and_barrier_queries_use_dedicated_indexes(engine) -> None:
         context, generation = _generation(session, "Plans")
         _register(session, context[0], generation.generation_id, [_entry(1), _entry(2)])
         session.execute(text("SET LOCAL enable_seqscan = off"))
+        session.execute(text("SET LOCAL enable_sort = off"))
         claim_plan = "\n".join(
             row[0]
             for row in session.execute(
@@ -646,6 +853,18 @@ def test_ten_thousand_item_ledger_benchmark_is_bounded_and_unique(engine) -> Non
             session.commit()
         insert_seconds = time.perf_counter() - started
 
+        replay_started = time.perf_counter()
+        for start in range(0, 10_000, 500):
+            replay = ConnectorSyncWorkLedgerRepository(session).register_manifest(
+                context[0],
+                generation.generation_id,
+                [_entry(index) for index in range(start, start + 500)],
+                now=NOW,
+            )
+            assert (replay.created_count, replay.existing_count) == (0, 500)
+            session.commit()
+        replay_seconds = time.perf_counter() - replay_started
+
         total, distinct_id, distinct_identity = session.execute(
             select(
                 func.count(),
@@ -684,7 +903,10 @@ def test_ten_thousand_item_ledger_benchmark_is_bounded_and_unique(engine) -> Non
         memory_peak = _peak_process_memory_bytes()
         metrics = {
             "items": 10_000,
+            "registration_batch_count": 20,
+            "maximum_batch_size": 500,
             "insert_items_per_second": round(10_000 / insert_seconds, 2),
+            "replay_items_per_second": round(10_000 / replay_seconds, 2),
             "claim_p50_ms": round(statistics.median(claim_latencies), 3),
             "claim_p95_ms": round(_percentile(claim_latencies, 0.95), 3),
             "barrier_p50_ms": round(statistics.median(barrier_latencies), 3),

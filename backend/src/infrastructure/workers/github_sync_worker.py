@@ -44,8 +44,11 @@ class GitHubSyncWorker:
         lease_duration: timedelta,
         heartbeat_interval: timedelta,
         heartbeat_shutdown_timeout: timedelta,
+        ledger_planning_enabled: bool = False,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
+        if not isinstance(ledger_planning_enabled, bool):
+            raise ValueError("GitHub ledger-planning flag is invalid")
         self._sessions = session_factory
         self._execution = execution_factory
         self._staged = staged_factory
@@ -54,6 +57,7 @@ class GitHubSyncWorker:
         self._lease_duration = lease_duration
         self._heartbeat_interval = heartbeat_interval
         self._heartbeat_shutdown_timeout = heartbeat_shutdown_timeout
+        self._ledger_planning_enabled = ledger_planning_enabled
         self._clock = clock
 
     def execute(self, context: LocalFolderAttemptContext) -> LocalFolderWorkerResult:
@@ -112,6 +116,15 @@ class GitHubSyncWorker:
             snapshot.authorization, snapshot.cursor, progress_check=progress
         )
         heartbeat.raise_if_failed()
+        if self._ledger_planning_enabled:
+            self._read(lambda service: service.plan_manifest_batch(
+                lease,
+                snapshot,
+                batch,
+                worker_id=self._worker_id,
+                now=self._now(),
+            ))
+            heartbeat.raise_if_failed()
         item_snapshots = self._read(lambda service: service.item_snapshots(
             lease, snapshot, batch, worker_id=self._worker_id
         ))

@@ -420,12 +420,20 @@ intent, and a read-only all-terminal barrier. Real-PostgreSQL tests cover 32
 concurrent claimers, tenant isolation, stale mutation rejection, index plans,
 and a 10,000-item synthetic workload.
 
-This is foundation only: no application/server/worker composition imports the
-ledger, and no current GitHub or Local Folder job writes it. It cannot promote
-a generation, reconcile a snapshot, alter retrieval visibility, or call a
-provider. A later integration slice must explicitly connect discovery and file
-workers and must keep promotion disabled until the stored snapshot and barrier
-are independently validated.
+The worker now has an optional shadow-planning integration. The strictly parsed
+`GITHUB_SYNC_LEDGER_PLANNING_ENABLED` flag defaults to false; disabled mode makes
+no ledger calls or writes. Enabled GitHub runs bind one generation to the legacy
+cursor's single pinned commit/tree/profile, register supported file metadata in
+short idempotent batches, and mark discovery complete only with the cursor's
+durable transition to reconciliation. Cancellation is checked between batches,
+and interruption replays from the existing cursor without duplicating work.
+
+The ledger is still not an execution or retrieval path. No work item is claimed,
+downloaded, extracted, embedded, reconciled, promoted, or exposed to retrieval;
+the existing GitHub path remains the only indexer. Nonrecursive Git Trees remain
+limited to 1 MiB and 1,000 entries per tree, and the legacy cursor still caps one
+run at 100,000 examined entries and 10,000 observed files, so true million-file
+repository discovery remains future work.
 
 ### GitHub App operator configuration
 

@@ -2,6 +2,12 @@
 
 Run the API, scheduler, and connector synchronization worker as separate processes. Start the connector worker with `python -m infrastructure.workers.connector_sync_worker_host`; add `--once` for one bounded claim attempt. Production requires database, OpenAI embedding, GitHub App, and Google Secret Manager configuration. Worker identity, lease, heartbeat, polling, shutdown, and expired-recovery bounds use the `CONNECTOR_WORKER_*` settings documented in `GITHUB_CONNECTOR.md`. An entry point does not by itself mean the worker is deployed or monitored.
 
+`GITHUB_SYNC_LEDGER_PLANNING_ENABLED` is an optional worker-only rollout flag.
+It defaults to `false` and accepts only exact lowercase `true` or `false`.
+Enabled mode shadows bounded GitHub discovery metadata into the durable work
+ledger while the established GitHub path remains the only processor and
+indexer. It does not enable ledger claims, embeddings, promotion, or retrieval.
+
 ## Connector synchronization operations
 
 Authenticated active `organization_admin` users can enqueue, list, inspect, and cancel synchronization jobs for a tenant-owned Local Folder or selected GitHub repository scope:
