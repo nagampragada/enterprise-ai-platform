@@ -2,6 +2,16 @@
 
 ## Retrieval-isolated file-work materialization (`20260831_000021`)
 
+The Phase 3 expand-migration rollout uses an explicit schema compatibility
+window. The application head remains `20260831_000021`, while readiness accepts
+exactly `20260828_000020` and `20260831_000021`. At the predecessor revision it
+reports compatible but not current with migration required; at the application
+head it reports compatible and current. There is no lexical ordering, prefix,
+timestamp, minimum-version, or range comparison, and multiple or unknown heads
+fail closed. Compatibility with `20260828_000020` is temporary rollout policy
+and must be removed in a later cleanup only after every environment reaches
+`20260831_000021`.
+
 Migration `20260828_000020` adds the feature-gated `connector_sync_generations`
 and `connector_sync_file_work_items` control-plane tables. When the optional
 worker flag `GITHUB_SYNC_LEDGER_PLANNING_ENABLED=true` is set, the existing

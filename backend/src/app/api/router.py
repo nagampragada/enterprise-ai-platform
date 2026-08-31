@@ -22,13 +22,16 @@ api_router = APIRouter()
 def health_with_database(request: Request) -> JSONResponse:
     configuration_ready = _configuration_ready(request)
     db_health = check_database_connection()
-    ready = configuration_ready and db_health.healthy and db_health.schema_current
+    ready = configuration_ready and db_health.healthy and db_health.schema_compatible
     payload = {
         "status": "ready" if ready else "not_ready",
         "checks": {
             "configuration": "ready" if configuration_ready else "not_ready",
             "database": "ready" if db_health.healthy else "not_ready",
-            "schema": "ready" if db_health.schema_current else "not_ready",
+            "schema": "ready" if db_health.schema_compatible else "not_ready",
+            "schema_compatible": db_health.schema_compatible,
+            "schema_current": db_health.schema_current,
+            "migration_required": db_health.migration_required,
         },
     }
     return JSONResponse(

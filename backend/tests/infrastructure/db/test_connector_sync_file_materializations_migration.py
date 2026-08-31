@@ -11,6 +11,7 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import configure_mappers
 
+import infrastructure.db.health as db_health
 from infrastructure.db import models as db_models  # noqa: F401
 from infrastructure.db.base import Base
 
@@ -128,7 +129,10 @@ def test_materialization_schema_matches_models_and_single_head(engine) -> None:
     }.intersection(Base.metadata.tables["connector_sync_file_materializations"].columns)
 
 
-def test_materialization_revision_downgrades_without_removing_phase1_ledger(engine) -> None:
+def test_materialization_revision_downgrades_without_removing_phase1_ledger(
+    engine,
+    monkeypatch,
+) -> None:
     url = os.environ[TEST_URL]
     engine.dispose()
     command.downgrade(_config(url), PRIOR_REVISION)
@@ -143,6 +147,12 @@ def test_materialization_revision_downgrades_without_removing_phase1_ledger(engi
             assert connection.execute(
                 text("SELECT version_num FROM alembic_version")
             ).scalar_one() == PRIOR_REVISION
+        monkeypatch.setattr(db_health, "engine", downgraded)
+        compatibility = db_health.check_database_connection()
+        assert compatibility.healthy is True
+        assert compatibility.schema_compatible is True
+        assert compatibility.schema_current is False
+        assert compatibility.migration_required is True
     finally:
         downgraded.dispose()
     command.upgrade(_config(url), REVISION)

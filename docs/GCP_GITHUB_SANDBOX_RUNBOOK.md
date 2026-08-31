@@ -137,7 +137,26 @@ gcloud run jobs create $BOOTSTRAP_JOB --image=$IMAGE --region=$REGION --project=
 
 ## 9. Execute migrations, bootstrap, and readiness verification
 
-Run operations in this order and inspect each execution's nonsecret status before continuing:
+For the Phase 3 expand-migration transition, deploy in this order and inspect
+each operation's nonsecret status before continuing:
+
+1. deploy the transition-compatible API image before changing the database;
+2. require readiness HTTP 200 with `schema_compatible=true`,
+   `schema_current=false`, and `migration_required=true` at revision
+   `20260828_000020`;
+3. update only the established migration job to the same immutable image;
+4. execute the migration job exactly once and verify revision
+   `20260831_000021`;
+5. require readiness HTTP 200 with `schema_compatible=true`,
+   `schema_current=true`, and `migration_required=false`;
+6. update the worker image with both ledger flags explicitly false;
+7. continue only with the separately authorized controlled Phase 3 verification.
+
+The predecessor compatibility entry is deliberate temporary expand-migration
+policy. Remove it in a later cleanup only after all environments are confirmed
+at `20260831_000021`. Do not broaden it into revision ordering or a range.
+
+For initial provisioning after the compatible API is deployed:
 
 ```powershell
 gcloud run jobs execute $MIGRATION_JOB --region=$REGION --project=$PROJECT_ID --wait
@@ -146,7 +165,9 @@ curl.exe --fail-with-body https://<generated-service-host>/health
 curl.exe --fail-with-body https://<generated-service-host>/api/v1/health
 ```
 
-Readiness must return HTTP 200 only after database connectivity, revision `20260831_000021`, configuration, and local GitHub/Secret Manager composition are ready. It makes no GitHub, OpenAI, or secret-value request.
+Readiness must return HTTP 200 only after database connectivity, an exact
+compatible revision, configuration, and local GitHub/Secret Manager composition
+are ready. It makes no GitHub, OpenAI, or secret-value request.
 
 Immediately after bootstrap success:
 

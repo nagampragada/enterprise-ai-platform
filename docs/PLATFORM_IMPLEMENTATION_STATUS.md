@@ -444,6 +444,14 @@ Nonrecursive Git Trees remain limited to 1 MiB and 1,000 entries per tree, and
 the legacy cursor still caps one run at 100,000 examined entries and 10,000
 observed files, so true million-file repository discovery remains future work.
 
+Phase 3 API readiness supports the zero-downtime expand-migration sequence with
+an exact immutable compatibility set containing only `20260828_000020` and
+`20260831_000021`. The predecessor is compatible but not current and reports
+migration required; the application head is compatible and current. Unknown,
+missing, malformed, older, newer, and multiple heads fail closed. The
+predecessor allowance is temporary and must be removed after every environment
+has reached `20260831_000021`.
+
 ### GitHub App operator configuration
 
 - Register a **GitHub App**, not an OAuth App, and permit organization installations only.
