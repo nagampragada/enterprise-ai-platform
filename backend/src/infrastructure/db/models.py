@@ -1497,6 +1497,121 @@ class ConnectorSyncFileWorkItem(Base):
     terminal_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class ConnectorSyncFileMaterialization(Base):
+    """Immutable generation-scoped file output that is not retrieval-visible."""
+
+    __tablename__ = "connector_sync_file_materializations"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_connector_sync_file_materializations"),
+        ForeignKeyConstraint(
+            ["organization_id", "connector_id", "connector_scope_id", "generation_id", "profile_fingerprint"],
+            ["connector_sync_generations.organization_id", "connector_sync_generations.connector_id", "connector_sync_generations.connector_scope_id", "connector_sync_generations.id", "connector_sync_generations.profile_fingerprint"],
+            name="fk_sync_file_materializations_generation_tenant",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "generation_id", "work_item_id"],
+            ["connector_sync_file_work_items.organization_id", "connector_sync_file_work_items.generation_id", "connector_sync_file_work_items.id"],
+            name="fk_sync_file_materializations_work_tenant",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "organization_id", "generation_id", "id",
+            name="uq_sync_file_materializations_generation_id",
+        ),
+        UniqueConstraint(
+            "organization_id", "generation_id", "work_item_id",
+            name="uq_sync_file_materializations_generation_work",
+        ),
+        UniqueConstraint(
+            "organization_id", "generation_id", "source_key_hash", "provider_blob_id",
+            "provider_revision_id", "profile_fingerprint",
+            name="uq_sync_file_materializations_logical_identity",
+        ),
+        CheckConstraint("btrim(repository_identity) <> ''", name="repo_not_blank"),
+        CheckConstraint("btrim(branch_name) <> ''", name="branch_name_not_blank"),
+        CheckConstraint("btrim(root_tree_object_id) <> ''", name="tree_not_blank"),
+        CheckConstraint("btrim(source_item_key) <> ''", name="key_not_blank"),
+        CheckConstraint("source_key_hash ~ '^[0-9a-f]{64}$'", name="key_hash_valid"),
+        CheckConstraint("btrim(repository_path) <> ''", name="path_not_blank"),
+        CheckConstraint("btrim(provider_blob_id) <> ''", name="blob_not_blank"),
+        CheckConstraint("btrim(provider_revision_id) <> ''", name="revision_valid"),
+        CheckConstraint(
+            "profile_fingerprint ~ '^[a-z0-9][a-z0-9._:/-]*$'",
+            name="profile_valid",
+        ),
+        CheckConstraint("content_checksum ~ '^[0-9a-f]{64}$'", name="checksum_valid"),
+        CheckConstraint("btrim(title) <> ''", name="title_not_blank"),
+        CheckConstraint("btrim(mime_type) <> ''", name="mime_not_blank"),
+        CheckConstraint("btrim(embedding_model) <> ''", name="model_not_blank"),
+        CheckConstraint("chunk_count BETWEEN 1 AND 100000", name="count_bounded"),
+        Index(
+            "ix_sync_file_materializations_generation",
+            "organization_id", "generation_id", "work_item_id",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_scope_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    generation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    work_item_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    repository_identity: Mapped[str] = mapped_column(String(255), nullable=False)
+    branch_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    root_tree_object_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_item_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    source_key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    repository_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    provider_blob_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    provider_revision_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    profile_fingerprint: Mapped[str] = mapped_column(String(255), nullable=False)
+    content_checksum: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    mime_type: Mapped[str] = mapped_column(String(255), nullable=False)
+    embedding_model: Mapped[str] = mapped_column(String(255), nullable=False)
+    chunk_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ConnectorSyncFileMaterializationChunk(Base):
+    """Immutable staged chunk/vector owned only by one ledger materialization."""
+
+    __tablename__ = "connector_sync_file_materialization_chunks"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_connector_sync_file_materialization_chunks"),
+        ForeignKeyConstraint(
+            ["organization_id", "generation_id", "materialization_id"],
+            ["connector_sync_file_materializations.organization_id", "connector_sync_file_materializations.generation_id", "connector_sync_file_materializations.id"],
+            name="fk_sync_file_materialization_chunks_parent",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "organization_id", "generation_id", "materialization_id", "chunk_index",
+            name="uq_sync_file_materialization_chunks_index",
+        ),
+        CheckConstraint("chunk_index >= 0", name="index_valid"),
+        CheckConstraint("btrim(chunk_text) <> ''", name="text_valid"),
+        CheckConstraint("btrim(content_hash) <> ''", name="hash_valid"),
+        CheckConstraint("btrim(embedding_model) <> ''", name="model_valid"),
+        Index(
+            "ix_sync_file_materialization_chunks_parent",
+            "organization_id", "generation_id", "materialization_id", "chunk_index",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    generation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    materialization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    chunk_text: Mapped[str] = mapped_column(Text, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(Vector(1536), nullable=False)
+    embedding_model: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class ConnectorSyncRun(Base):
     __tablename__ = "connector_sync_runs"
     __table_args__ = (

@@ -41,9 +41,20 @@ independently leased file-work ledger for a future horizontally scaled GitHub
 execution path. The current worker can shadow its existing pinned discovery into
 that ledger only when `GITHUB_SYNC_LEDGER_PLANNING_ENABLED=true`; the variable is
 optional, defaults to false, and startup accepts only exact lowercase `true` or
-`false`. Existing repository-wide synchronization remains the sole live indexing
-path. Shadow work is never claimed, processed, embedded, reconciled, promoted,
-or consulted by retrieval.
+`false`. Existing repository-wide synchronization remains authoritative. A
+separate worker-only `GITHUB_SYNC_LEDGER_PROCESSING_ENABLED` gate, also strict
+and default-false, enables the first bounded processing slice. Only after the
+legacy job queue is empty does it claim one completed-discovery GitHub item,
+validate its lease/fence and immutable generation attribution, fetch its exact
+blob, and reuse the existing extraction, chunking, and embedding pipeline. Its
+output is written only to the generation-scoped
+`connector_sync_file_materializations` and
+`connector_sync_file_materialization_chunks` staging tables. The final staging
+write and ledger completion share one fenced transaction. These tables are not
+joined by permission-aware retrieval and do not mutate legacy source,
+membership, document, version, indexing, or chunk state. This slice does not
+promote, reconcile, retire, or expose a ledger generation; those generation-wide
+transitions remain future work.
 
 GET is a provider-free bounded `(created_at,id)` keyset page of persisted selections, including locally removed history. DELETE is provider-free and idempotently changes the exact tenant/connector-owned scope to `removed`; it does not revoke GitHub access, hard-delete history, or delete content. Neither operation requires GitHub configuration. No selection route enqueues a job, creates a schedule, retrieves content, or writes source/document/index rows. Synchronization is requested separately through the provider-neutral operational API.
 

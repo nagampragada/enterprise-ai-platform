@@ -9,6 +9,8 @@ import pytest
 from domain.connectors.sync_work_ledger import (
     FileWorkCounters,
     FileWorkManifestEntry,
+    FileWorkMaterialization,
+    FileWorkMaterializationChunk,
     RepositoryGenerationRegistration,
 )
 
@@ -50,6 +52,30 @@ def _entry(**overrides: object) -> FileWorkManifestEntry:
     return FileWorkManifestEntry(**values)  # type: ignore[arg-type]
 
 
+def _materialization(**overrides: object) -> FileWorkMaterialization:
+    values: dict[str, object] = {
+        "repository_identity": "github:repository:123",
+        "branch_name": "main",
+        "root_tree_object_id": "b" * 40,
+        "source_item_key": "github:file:README.md",
+        "repository_path": "README.md",
+        "provider_blob_id": "c" * 40,
+        "provider_revision_id": "a" * 40,
+        "profile_fingerprint": PROFILE,
+        "content_checksum": "d" * 64,
+        "title": "README",
+        "mime_type": "text/markdown",
+        "embedding_model": "fake:model:1536",
+        "chunks": (
+            FileWorkMaterializationChunk(
+                0, "content", "e" * 64, (1.0,) * 1536, "fake:model:1536"
+            ),
+        ),
+    }
+    values.update(overrides)
+    return FileWorkMaterialization(**values)  # type: ignore[arg-type]
+
+
 def test_generation_and_manifest_contracts_are_immutable() -> None:
     generation = _generation()
     entry = _entry()
@@ -58,6 +84,42 @@ def test_generation_and_manifest_contracts_are_immutable() -> None:
         generation.branch_name = "other"  # type: ignore[misc]
     with pytest.raises(FrozenInstanceError):
         entry.repository_path = "other.md"  # type: ignore[misc]
+
+
+def test_file_materialization_contract_is_immutable_and_generation_ready() -> None:
+    value = _materialization()
+    assert value.chunks[0].chunk_index == 0
+    assert len(value.chunks[0].embedding) == 1536
+    with pytest.raises(FrozenInstanceError):
+        value.repository_path = "other.md"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "chunks",
+    (
+        (),
+        (
+            FileWorkMaterializationChunk(
+                1, "content", "e" * 64, (1.0,) * 1536, "fake:model:1536"
+            ),
+        ),
+        (
+            FileWorkMaterializationChunk(
+                0, "content", "e" * 64, (1.0,) * 1536, "other:model:1536"
+            ),
+        ),
+    ),
+)
+def test_file_materialization_rejects_missing_or_inconsistent_chunks(chunks) -> None:
+    with pytest.raises(ValueError):
+        _materialization(chunks=chunks)
+
+
+def test_file_materialization_chunk_rejects_wrong_vector_dimension() -> None:
+    with pytest.raises(ValueError, match="1536"):
+        FileWorkMaterializationChunk(
+            0, "content", "e" * 64, (1.0,), "fake:model:1536"
+        )
 
 
 @pytest.mark.parametrize(

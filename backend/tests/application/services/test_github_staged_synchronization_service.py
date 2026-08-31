@@ -474,6 +474,59 @@ def test_changed_file_downloads_extracts_chunks_and_embeds_without_raw_content_i
     assert provider.embed_batch.call_count == 1
 
 
+def test_single_file_preparation_uses_exact_pinned_blob_and_reports_bounded_counters():
+    authorization = _authorization()
+    snapshot = _snapshot(authorization)
+    entry = _entry(snapshot, "folder/file.txt")
+    raw = b"alpha"
+    checksum = hashlib.sha256(raw).hexdigest()
+    service, content, registry, chunker, provider = _preparation()
+    content.download_blob.return_value = GitHubBlobContent(raw, len(raw), checksum)
+    registry.extract.return_value = ExtractedContent("Alpha", "alpha", "text/plain")
+    chunker.chunk.return_value = (ChunkResult(0, "alpha", checksum, 5, 0, 5),)
+    provider.embed_batch.return_value = (
+        EmbeddingResult(0, (1.0,) * 1536, "fake:model:1536", 1536),
+    )
+    progress_check = Mock()
+
+    result = service.prepare_file(
+        authorization,
+        snapshot,
+        entry,
+        _item_snapshot(),
+        progress_check=progress_check,
+    )
+
+    assert result.outcome == "indexed"
+    assert result.discovered.entry == entry
+    assert result.downloaded_bytes == 5
+    assert result.extracted_characters == 5
+    assert result.embedding_batch_count == 1
+    content.download_blob.assert_called_once_with(authorization, snapshot, entry)
+    assert progress_check.call_count == 4
+
+
+def test_single_file_preparation_never_resolves_mutable_head_when_current_profile_matches():
+    authorization = _authorization()
+    snapshot = _snapshot(authorization)
+    entry = _entry(snapshot, "file.txt")
+    service, content, registry, chunker, provider = _preparation()
+
+    result = service.prepare_file(
+        authorization,
+        snapshot,
+        entry,
+        _item_snapshot(blob=BLOB, complete=True),
+    )
+
+    assert result.outcome == "unchanged"
+    content.resolve_default_branch_snapshot.assert_not_called()
+    content.download_blob.assert_not_called()
+    registry.extract.assert_not_called()
+    chunker.chunk.assert_not_called()
+    provider.embed_batch.assert_not_called()
+
+
 def test_git_lfs_is_seen_and_classified_without_extraction_or_embedding():
     authorization = _authorization()
     snapshot = _snapshot(authorization)

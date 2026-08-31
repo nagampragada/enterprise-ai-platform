@@ -498,6 +498,9 @@ class PreparedGitHubFile:
     chunks: tuple[PreparedGitHubChunk, ...]
     embedding_model: str | None
     retirement_reason: str | None = None
+    downloaded_bytes: int = 0
+    extracted_characters: int = 0
+    embedding_batch_count: int = 0
 
     def __post_init__(self) -> None:
         if self.outcome not in {"already_complete", "unchanged", "indexed", "unsupported"}:
@@ -519,6 +522,15 @@ class PreparedGitHubFile:
             raise InvalidGitHubStagedSynchronizationRequest(
                 "prepared GitHub retirement classification is invalid"
             )
+        for name, value, maximum in (
+            ("downloaded_bytes", self.downloaded_bytes, MAX_GITHUB_BLOB_BYTES),
+            ("extracted_characters", self.extracted_characters, 100_000_000),
+            ("embedding_batch_count", self.embedding_batch_count, MAX_PREPARED_CHUNKS),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
+                raise InvalidGitHubStagedSynchronizationRequest(
+                    f"prepared GitHub {name} is invalid"
+                )
 
 
 @dataclass(frozen=True)
@@ -765,6 +777,36 @@ class GitHubSynchronizationPreparationService:
         cursor_after = replace(position, totals=next_totals)
         return PreparedGitHubBatch(tuple(prepared), cursor_after, downloaded_bytes, prepared_chunks)
 
+    def prepare_file(
+        self,
+        authorization: GitHubRepositoryContentAuthorization,
+        snapshot: GitHubRepositorySnapshot,
+        entry: GitHubRepositoryEntry,
+        item_snapshot: GitHubItemSnapshot,
+        *,
+        progress_check: Callable[[], None] = lambda: None,
+    ) -> PreparedGitHubFile:
+        """Prepare one exact pinned blob for independently claimed ledger work."""
+        cursor = GitHubTraversalCursor.initial(snapshot, authorization)
+        advanced = replace(
+            cursor,
+            totals=GitHubRunBudget(entries_examined=1),
+        )
+        discovered = GitHubDiscoveredFile(entry, cursor, advanced, None)
+        _validate_discovered_file(discovered, snapshot)
+        if (
+            item_snapshot.persisted_blob_id == entry.object_id
+            and item_snapshot.current_provider_version_id == entry.object_id
+            and item_snapshot.profile_complete
+        ):
+            return _prepared_without_content(discovered, item_snapshot, "unchanged")
+        return self._prepare_changed(
+            authorization,
+            discovered,
+            item_snapshot,
+            progress_check=progress_check,
+        )
+
     def _prepare_changed(
         self,
         authorization: GitHubRepositoryContentAuthorization,
@@ -795,6 +837,7 @@ class GitHubSynchronizationPreparationService:
         finally:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
+        progress_check()
         chunk_results = self._chunker.chunk(extracted.text)
         if not chunk_results or len(chunk_results) > MAX_PREPARED_CHUNKS:
             raise GitHubSynchronizationBudgetExceeded("GitHub file chunk budget was exceeded")
@@ -820,6 +863,7 @@ class GitHubSynchronizationPreparationService:
                 )
                 for chunk, result in zip(group, results, strict=True)
             )
+        progress_check()
         return PreparedGitHubFile(
             discovered,
             item_snapshot.source_item_id,
@@ -830,6 +874,10 @@ class GitHubSynchronizationPreparationService:
             extracted.mime_type or _MIME_TYPES[extension],
             tuple(chunks),
             profile.model_identifier,
+            None,
+            raw.byte_count,
+            len(extracted.text),
+            (len(chunk_results) + batch_size - 1) // batch_size,
         )
 
 

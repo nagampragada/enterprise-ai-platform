@@ -95,6 +95,34 @@ def test_one_shot_no_work_exits_successfully():
     session.close.assert_called_once()
 
 
+def test_ledger_file_work_is_considered_only_after_legacy_queue_is_empty():
+    execution = Mock()
+    execution.recover_expired_routed.return_value = ()
+    execution.acquire_one_routed.return_value = None
+    file_work = Mock()
+    file_work.execute_one.return_value = "completed"
+    host = ConnectorSyncWorkerHost(
+        lambda: Mock(),
+        lambda _session: execution,
+        Mock(),
+        Mock(),
+        _settings(),
+        github_file_work_worker=file_work,
+    )
+
+    assert host.run_cycle() == "completed"
+    file_work.execute_one.assert_called_once_with()
+
+
+def test_legacy_queue_has_priority_over_ledger_file_work():
+    host, _execution, _local, _github = _host("github")
+    file_work = Mock()
+    host._github_file_work = file_work
+
+    assert host.run_cycle() == "completed"
+    file_work.execute_one.assert_not_called()
+
+
 def _patch_composition_dependencies(monkeypatch, captured):
     class RecordingRetryPolicy:
         def __init__(self, *, random_uniform):
@@ -113,6 +141,9 @@ def _patch_composition_dependencies(monkeypatch, captured):
         "GitHubSynchronizationPreparationService",
         "GitHubStagedSynchronizationService",
         "GitHubSyncWorker",
+        "GitHubSyncWorkProcessingService",
+        "ConnectorSyncWorkLedgerRepository",
+        "GitHubSyncWorkItemWorker",
     ):
         monkeypatch.setattr(worker_host_module, name, Mock())
 
@@ -168,3 +199,25 @@ def test_composition_propagates_disabled_and_enabled_ledger_planning(monkeypatch
             ]
             is enabled
         )
+
+
+def test_composition_only_constructs_ledger_processor_when_explicitly_enabled(monkeypatch):
+    captured = {}
+    _patch_composition_dependencies(monkeypatch, captured)
+
+    disabled = Mock()
+    disabled.github_sync_ledger_planning_enabled = False
+    disabled.github_sync_ledger_processing_enabled = False
+    worker_host_module.compose_connector_sync_worker_host(
+        _settings(), session_factory=Mock(), process_settings=disabled
+    )
+    worker_host_module.GitHubSyncWorkItemWorker.assert_not_called()
+
+    enabled = Mock()
+    enabled.github_sync_ledger_planning_enabled = False
+    enabled.github_sync_ledger_processing_enabled = True
+    host = worker_host_module.compose_connector_sync_worker_host(
+        _settings(), session_factory=Mock(), process_settings=enabled
+    )
+    worker_host_module.GitHubSyncWorkItemWorker.assert_called_once()
+    assert host._github_file_work is worker_host_module.GitHubSyncWorkItemWorker.return_value

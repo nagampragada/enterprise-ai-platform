@@ -31,6 +31,9 @@ from application.services.github_staged_synchronization_service import (
     GitHubStagedSynchronizationService,
     GitHubSynchronizationPreparationService,
 )
+from application.services.github_sync_work_processing_service import (
+    GitHubSyncWorkProcessingService,
+)
 from application.services.staged_local_folder_synchronization_service import (
     LocalFolderPreparationService,
     StagedLocalFolderSynchronizationService,
@@ -41,8 +44,12 @@ from infrastructure.content_extraction.registry import create_default_content_ex
 from infrastructure.db.session import SessionLocal
 from infrastructure.embeddings.openai import OpenAIEmbeddingProvider
 from infrastructure.repositories.connector_sync_job_repository import ConnectorSyncJobRepository
+from infrastructure.repositories.connector_sync_work_ledger_repository import (
+    ConnectorSyncWorkLedgerRepository,
+)
 from infrastructure.secrets.google_secret_manager import GoogleSecretManagerSecretStore
 from infrastructure.workers.github_sync_worker import GitHubSyncWorker
+from infrastructure.workers.github_sync_work_item_worker import GitHubSyncWorkItemWorker
 from infrastructure.workers.local_folder_sync_worker import LocalFolderSyncWorker
 
 LOGGER = logging.getLogger(__name__)
@@ -96,11 +103,13 @@ class ConnectorWorkerSettings:
 
 class ConnectorSyncWorkerHost:
     def __init__(self, session_factory, execution_factory, local_worker, github_worker,
-                 settings, *, shutdown_event=None, wait=None, logger=LOGGER):
+                 settings, *, github_file_work_worker=None, shutdown_event=None,
+                 wait=None, logger=LOGGER):
         self._sessions = session_factory
         self._execution = execution_factory
         self._local = local_worker
         self._github = github_worker
+        self._github_file_work = github_file_work_worker
         self._settings = settings
         self._shutdown = shutdown_event or threading.Event()
         self._wait = wait or self._shutdown.wait
@@ -124,7 +133,11 @@ class ConnectorSyncWorkerHost:
             return "shutdown"
         acquired = self._recover_and_claim()
         if acquired is None:
-            return "no_work"
+            return (
+                self._github_file_work.execute_one()
+                if self._github_file_work is not None
+                else "no_work"
+            )
         if self._shutdown.is_set():
             return "shutdown"
         context = self._local.attempt_context(acquired)
@@ -220,13 +233,16 @@ def compose_connector_sync_worker_host(settings: ConnectorWorkerSettings,
         GitHubRepositoryContentService(None, github_client),
         extractors, chunker, embedding,
     )
-    github = GitHubSyncWorker(
-        session_factory, execution,
-        lambda session: GitHubStagedSynchronizationService(
+    def github_staged(session: Session):
+        return GitHubStagedSynchronizationService(
             session, execution(session), GitHubRepositoryContentService(session, github_client),
             github_preparation.profile,
             ledger_planning_enabled=runtime.github_sync_ledger_planning_enabled,
-        ),
+        )
+
+    github = GitHubSyncWorker(
+        session_factory, execution,
+        github_staged,
         github_preparation,
         worker_id=settings.worker_id,
         lease_duration=settings.lease_duration,
@@ -234,8 +250,35 @@ def compose_connector_sync_worker_host(settings: ConnectorWorkerSettings,
         heartbeat_shutdown_timeout=settings.shutdown_timeout,
         ledger_planning_enabled=runtime.github_sync_ledger_planning_enabled,
     )
+    github_file_work = None
+    if runtime.github_sync_ledger_processing_enabled is True:
+        def github_file_work_service(session: Session):
+            content = GitHubRepositoryContentService(session, github_client)
+            return GitHubSyncWorkProcessingService(
+                ConnectorSyncWorkLedgerRepository(session),
+                content,
+                github_preparation.profile,
+            )
+
+        github_file_work = GitHubSyncWorkItemWorker(
+            session_factory,
+            github_file_work_service,
+            github_preparation,
+            retry,
+            worker_id=settings.worker_id,
+            lease_duration=settings.lease_duration,
+            heartbeat_interval=settings.heartbeat_interval,
+            heartbeat_shutdown_timeout=settings.shutdown_timeout,
+            recovery_limit=settings.recovery_limit,
+        )
     return ConnectorSyncWorkerHost(
-        session_factory, execution, local, github, settings, shutdown_event=shutdown_event
+        session_factory,
+        execution,
+        local,
+        github,
+        settings,
+        github_file_work_worker=github_file_work,
+        shutdown_event=shutdown_event,
     )
 
 

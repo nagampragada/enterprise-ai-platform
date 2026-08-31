@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 from threading import Barrier
 import uuid
+from unittest.mock import Mock
 
 import pytest
 from sqlalchemy import create_engine, func, select, text
@@ -36,9 +37,15 @@ from application.services.github_staged_synchronization_service import (
     PreparedGitHubFile,
     StalePreparedGitHubBatch,
 )
+from application.services.github_sync_work_processing_service import (
+    GitHubSyncWorkProcessingService,
+)
 from application.services.local_document_indexing_service import LocalDocumentIndexingProfile
 from domain.embeddings.models import EmbeddingProfile
 from infrastructure.db.models import (
+    ConnectorSyncFileMaterialization,
+    ConnectorSyncFileMaterializationChunk,
+    ConnectorSyncFileWorkItem,
     ConnectorSyncItem,
     ConnectorSyncJob,
     ConnectorSyncCursor,
@@ -53,7 +60,17 @@ from infrastructure.db.models import (
     SourceItem,
     SourceItemScopeMembership,
 )
+from domain.connectors.sync_work_ledger import (
+    FileWorkManifestEntry,
+    FileWorkStatus,
+    RepositoryGenerationRegistration,
+)
 from infrastructure.repositories.connector_sync_job_repository import ConnectorSyncJobRepository
+from infrastructure.repositories.connector_sync_work_ledger_repository import (
+    ConnectorSyncWorkLedgerRepository,
+    LostFileWorkLease,
+    StaleFileWorkFence,
+)
 from infrastructure.repositories.connector_sync_job_repository import (
     LostSyncJobLease,
     StaleSyncJobFence,
@@ -61,6 +78,7 @@ from infrastructure.repositories.connector_sync_job_repository import (
 )
 from infrastructure.repositories.permission_aware_document_chunk_search_repository import (
     PermissionAwareDocumentChunkSearchRepository,
+    SEARCH_SQL,
 )
 from infrastructure.workers.connector_sync_worker_host import (
     ConnectorSyncWorkerHost,
@@ -124,6 +142,8 @@ def engine():
 def clean(engine):
     with engine.begin() as connection:
         for table in (
+            "connector_sync_file_work_items",
+            "connector_sync_generations",
             "document_indexing_attempts",
             "document_indexing_states",
             "document_version_documents",
@@ -2085,3 +2105,533 @@ def test_production_routing_completes_github_traversal_and_reconciliation(engine
         assert job.status == "succeeded"
         assert run.status == "completed"
         assert session.scalar(select(func.count()).select_from(SourceItem)) == 1
+
+
+def _phase3_claim(
+    factory,
+    organization_id,
+    connector_id,
+    scope_id,
+    profile,
+    *,
+    path="file.txt",
+    blob=BLOB,
+    commit=COMMIT,
+    now=NOW,
+):
+    attempt = _acquire(factory, organization_id, connector_id, scope_id, now=now)
+    with factory() as session:
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        generation, created = repository.register_generation(
+            RepositoryGenerationRegistration(
+                organization_id,
+                connector_id,
+                scope_id,
+                attempt.lease.job_id,
+                "github",
+                "github:repository:501",
+                "main",
+                commit,
+                TREE,
+                profile.fingerprint,
+                NOW,
+            )
+        )
+        assert created
+        repository.register_manifest(
+            organization_id,
+            generation.generation_id,
+            (
+                FileWorkManifestEntry(
+                    f"github:repository:501:path:{path}",
+                    path,
+                    blob,
+                    commit,
+                    profile.fingerprint,
+                    len(CONTENT),
+                    ".txt",
+                    "text/plain",
+                ),
+            ),
+            now=now,
+        )
+        repository.mark_discovery_complete(
+            organization_id, generation.generation_id, now=now
+        )
+        session.commit()
+    with factory() as session:
+        lease = ConnectorSyncWorkLedgerRepository(session).claim_next_available(
+            provider_key="github",
+            profile_fingerprint=profile.fingerprint,
+            worker_id="phase3-worker",
+            now=now,
+            lease_duration=timedelta(minutes=15),
+        )
+        assert lease is not None
+        session.commit()
+        return lease
+
+
+def _phase3_service(session, profile):
+    content = GitHubRepositoryContentService(session, Client())
+    return GitHubSyncWorkProcessingService(
+        ConnectorSyncWorkLedgerRepository(session), content, profile
+    )
+
+
+def _phase3_context(factory, lease, profile, *, worker_id="phase3-worker", now=NOW):
+    with factory() as session:
+        context = _phase3_service(session, profile).load_context(
+            lease,
+            worker_id=worker_id,
+            now=now,
+            lease_duration=timedelta(minutes=15),
+        )
+        session.commit()
+        return context
+
+
+def _phase3_prepared(context):
+    cursor = GitHubTraversalCursor.initial(
+        context.snapshot, context.authorization
+    )
+    advanced = replace(cursor, totals=GitHubRunBudget(entries_examined=1))
+    return PreparedGitHubFile(
+        GitHubDiscoveredFile(context.entry, cursor, advanced, None),
+        context.item_snapshot.source_item_id,
+        context.item_snapshot.persisted_blob_id,
+        "indexed",
+        CHECKSUM,
+        "Alpha",
+        "text/plain",
+        (PreparedGitHubChunk(0, "alpha", CHECKSUM, (1.0,) * 1536),),
+        "fake:model:1536",
+        None,
+        len(CONTENT),
+        len(CONTENT.decode()),
+        1,
+    )
+
+
+def test_phase3_file_materialization_and_fenced_completion_commit_atomically(engine):
+    factory = _factory(engine)
+    organization_id, connector_id, scope_id = _seed(factory)
+    profile = _profile()
+    lease = _phase3_claim(factory, organization_id, connector_id, scope_id, profile)
+    context = _phase3_context(factory, lease, profile)
+    prepared = _phase3_prepared(context)
+
+    with factory() as session:
+        result = _phase3_service(session, profile).persist(
+            lease,
+            context,
+            prepared,
+            worker_id="phase3-worker",
+            now=NOW,
+            lease_duration=timedelta(minutes=15),
+        )
+        session.commit()
+        assert result.work_item.status is FileWorkStatus.SUCCEEDED
+
+    with factory() as session:
+        assert session.scalar(select(func.count()).select_from(SourceItem)) == 0
+        assert session.scalar(select(func.count()).select_from(Document)) == 0
+        assert session.scalar(select(func.count()).select_from(DocumentVersion)) == 0
+        assert session.scalar(select(func.count()).select_from(DocumentChunk)) == 0
+        assert session.scalar(select(func.count()).select_from(DocumentIndexingAttempt)) == 0
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncFileMaterialization)
+        ) == 1
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncFileMaterializationChunk)
+        ) == 1
+        work = session.get(ConnectorSyncFileWorkItem, lease.work_item_id)
+        assert work.status == "succeeded"
+        assert (work.downloaded_bytes, work.extracted_characters) == (5, 5)
+        assert (work.chunk_count, work.embedding_batch_count) == (1, 1)
+
+
+def test_phase3_replay_of_preexisting_staged_output_converges_without_legacy_writes(engine):
+    factory = _factory(engine)
+    organization_id, connector_id, scope_id = _seed(factory)
+    profile = _profile()
+    lease = _phase3_claim(factory, organization_id, connector_id, scope_id, profile)
+    context = _phase3_context(factory, lease, profile)
+    prepared = _phase3_prepared(context)
+
+    with factory() as session:
+        service = _phase3_service(session, profile)
+        result = service.persist(
+            lease,
+            context,
+            prepared,
+            worker_id="phase3-worker",
+            now=NOW,
+            lease_duration=timedelta(minutes=15),
+        )
+        assert result.work_item.status is FileWorkStatus.SUCCEEDED
+        session.commit()
+
+    # Exact replay is resolved from the immutable staged output and does not
+    # re-enter legacy source/document persistence.
+    with factory() as session:
+        materialization = ConnectorSyncWorkLedgerRepository(session).get_materialization(
+            lease.organization_id, lease.generation_id, lease.work_item_id
+        )
+        assert materialization is not None and materialization.chunk_count == 1
+        assert session.scalar(select(func.count()).select_from(Document)) == 0
+        assert session.scalar(select(func.count()).select_from(DocumentVersion)) == 0
+        assert session.scalar(select(func.count()).select_from(DocumentChunk)) == 0
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncFileMaterialization)
+        ) == 1
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncFileMaterializationChunk)
+        ) == 1
+
+    with factory() as session:
+        with pytest.raises(LostFileWorkLease):
+            _phase3_service(session, profile).persist(
+                lease,
+                context,
+                prepared,
+                worker_id="phase3-worker",
+                now=NOW,
+                lease_duration=timedelta(minutes=15),
+            )
+        session.rollback()
+
+    with factory() as session:
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncFileMaterialization)
+        ) == 1
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncFileMaterializationChunk)
+        ) == 1
+
+
+def test_phase3_completion_failure_rolls_back_every_materialized_row(engine):
+    factory = _factory(engine)
+    organization_id, connector_id, scope_id = _seed(factory)
+    profile = _profile()
+    lease = _phase3_claim(factory, organization_id, connector_id, scope_id, profile)
+    context = _phase3_context(factory, lease, profile)
+    prepared = _phase3_prepared(context)
+
+    with factory() as session:
+        service = _phase3_service(session, profile)
+        original_flush = service._ledger._flush
+
+        def fail_completion(message):
+            if message == "file materialization completion failed":
+                raise RuntimeError("controlled completion failure")
+            return original_flush(message)
+
+        service._ledger._flush = fail_completion
+        with pytest.raises(RuntimeError, match="controlled completion failure"):
+            service.persist(
+                lease,
+                context,
+                prepared,
+                worker_id="phase3-worker",
+                now=NOW,
+                lease_duration=timedelta(minutes=15),
+            )
+        session.rollback()
+
+    with factory() as session:
+        assert session.scalar(select(func.count()).select_from(SourceItem)) == 0
+        assert session.scalar(select(func.count()).select_from(Document)) == 0
+        assert session.scalar(select(func.count()).select_from(DocumentVersion)) == 0
+        assert session.scalar(select(func.count()).select_from(DocumentChunk)) == 0
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncFileMaterialization)
+        ) == 0
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncFileMaterializationChunk)
+        ) == 0
+        work = session.get(ConnectorSyncFileWorkItem, lease.work_item_id)
+        assert work.status == "running"
+
+    with factory() as session:
+        result = _phase3_service(session, profile).persist(
+            lease,
+            context,
+            prepared,
+            worker_id="phase3-worker",
+            now=NOW,
+            lease_duration=timedelta(minutes=15),
+        )
+        session.commit()
+        assert result.work_item.status is FileWorkStatus.SUCCEEDED
+
+    with factory() as session:
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncFileMaterialization)
+        ) == 1
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncFileMaterializationChunk)
+        ) == 1
+
+
+def test_phase3_stale_fence_is_rejected_before_any_materialization(engine):
+    factory = _factory(engine)
+    organization_id, connector_id, scope_id = _seed(factory)
+    profile = _profile()
+    stale_lease = _phase3_claim(
+        factory, organization_id, connector_id, scope_id, profile
+    )
+    context = _phase3_context(factory, stale_lease, profile)
+    prepared = _phase3_prepared(context)
+    later = NOW + timedelta(minutes=16)
+
+    with factory() as session:
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        recovered = repository.recover_expired_available(
+            provider_key="github",
+            profile_fingerprint=profile.fingerprint,
+            now=later,
+            limit=10,
+        )
+        assert len(recovered) == 1
+        current_lease = repository.claim_next_available(
+            provider_key="github",
+            profile_fingerprint=profile.fingerprint,
+            worker_id="replacement-worker",
+            now=later,
+            lease_duration=timedelta(minutes=15),
+        )
+        assert current_lease is not None
+        assert current_lease.fencing_token == stale_lease.fencing_token + 1
+        session.commit()
+
+    with factory() as session:
+        with pytest.raises(StaleFileWorkFence):
+            _phase3_service(session, profile).persist(
+                stale_lease,
+                context,
+                prepared,
+                worker_id="phase3-worker",
+                now=later,
+                lease_duration=timedelta(minutes=15),
+            )
+        session.rollback()
+
+    with factory() as session:
+        assert session.scalar(select(func.count()).select_from(SourceItem)) == 0
+        assert session.scalar(select(func.count()).select_from(Document)) == 0
+        assert session.scalar(select(func.count()).select_from(DocumentChunk)) == 0
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncFileMaterialization)
+        ) == 0
+        work = session.get(ConnectorSyncFileWorkItem, stale_lease.work_item_id)
+        assert work.status == "running"
+        assert work.lease_owner == "replacement-worker"
+
+    replacement_context = _phase3_context(
+        factory,
+        current_lease,
+        profile,
+        worker_id="replacement-worker",
+        now=later,
+    )
+    replacement_prepared = _phase3_prepared(replacement_context)
+    with factory() as session:
+        result = _phase3_service(session, profile).persist(
+            current_lease,
+            replacement_context,
+            replacement_prepared,
+            worker_id="replacement-worker",
+            now=later,
+            lease_duration=timedelta(minutes=15),
+        )
+        session.commit()
+        assert result.work_item.status is FileWorkStatus.SUCCEEDED
+
+    with factory() as session:
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncFileMaterialization)
+        ) == 1
+
+
+def _row_snapshot(row):
+    return tuple(
+        (column.name, getattr(row, column.name))
+        for column in row.__table__.columns
+    )
+
+
+def test_phase3_changed_blob_cannot_change_legacy_retrieval_or_authoritative_rows(engine):
+    factory = _factory(engine)
+    organization_id, connector_id, scope_id = _seed(factory)
+    profile = _profile()
+    legacy_attempt, legacy_snapshot = _persist_single_file_traversal(
+        factory,
+        organization_id,
+        connector_id,
+        scope_id,
+        profile,
+        now=NOW,
+        path="file.txt",
+    )
+    with factory() as session:
+        outcome = _staged(session, profile).reconcile(
+            legacy_attempt.lease,
+            legacy_snapshot,
+            worker_id="github-worker",
+            now=NOW,
+        )
+        assert outcome.outcome == "completed"
+        session.commit()
+
+    user_id, _space_id = _grant_and_search_context(
+        factory, organization_id, scope_id
+    )
+    before_results = _search(factory, organization_id, user_id)
+    assert len(before_results) == 1
+
+    with factory() as session:
+        source = session.scalar(select(SourceItem))
+        membership = session.scalar(select(SourceItemScopeMembership))
+        document = session.scalar(select(Document))
+        version = session.scalar(select(DocumentVersion))
+        version_document = session.scalar(select(DocumentVersionDocument))
+        indexing = session.scalar(select(DocumentIndexingState))
+        chunk = session.scalar(select(DocumentChunk))
+        assert all(
+            row is not None
+            for row in (
+                source,
+                membership,
+                document,
+                version,
+                version_document,
+                indexing,
+                chunk,
+            )
+        )
+        legacy_ids = (
+            source.id,
+            document.id,
+            version.id,
+            chunk.id,
+        )
+        before_rows = {
+            row.__tablename__: _row_snapshot(row)
+            for row in (
+                source,
+                membership,
+                document,
+                version,
+                version_document,
+                indexing,
+                chunk,
+            )
+        }
+
+    changed_blob = "d" * 40
+    changed_commit = "e" * 40
+    lease = _phase3_claim(
+        factory,
+        organization_id,
+        connector_id,
+        scope_id,
+        profile,
+        path="file.txt",
+        blob=changed_blob,
+        commit=changed_commit,
+        now=NOW + timedelta(minutes=1),
+    )
+    context = _phase3_context(
+        factory, lease, profile, now=NOW + timedelta(minutes=1)
+    )
+    with factory() as session:
+        result = _phase3_service(session, profile).persist(
+            lease,
+            context,
+            _phase3_prepared(context),
+            worker_id="phase3-worker",
+            now=NOW + timedelta(minutes=1),
+            lease_duration=timedelta(minutes=15),
+        )
+        session.commit()
+        assert result.work_item.status is FileWorkStatus.SUCCEEDED
+
+    after_results = _search(factory, organization_id, user_id)
+    assert after_results == before_results
+    assert (
+        after_results[0].source_item_id,
+        after_results[0].document_id,
+        after_results[0].document_version_id,
+        after_results[0].chunk_id,
+    ) == legacy_ids
+
+    with factory() as session:
+        rows = (
+            session.get(SourceItem, legacy_ids[0]),
+            session.scalar(select(SourceItemScopeMembership)),
+            session.get(Document, legacy_ids[1]),
+            session.get(DocumentVersion, legacy_ids[2]),
+            session.scalar(select(DocumentVersionDocument)),
+            session.scalar(select(DocumentIndexingState)),
+            session.get(DocumentChunk, legacy_ids[3]),
+        )
+        assert all(row is not None for row in rows)
+        assert {
+            row.__tablename__: _row_snapshot(row) for row in rows
+        } == before_rows
+        staged = session.scalar(select(ConnectorSyncFileMaterialization))
+        assert staged is not None
+        assert staged.provider_blob_id == changed_blob
+        assert staged.provider_revision_id == changed_commit
+        assert session.scalar(select(func.count()).select_from(SourceItem)) == 1
+        assert session.scalar(select(func.count()).select_from(DocumentVersion)) == 1
+        assert session.scalar(select(func.count()).select_from(DocumentChunk)) == 1
+
+
+def test_phase3_only_file_is_not_retrieval_visible_before_promotion(engine):
+    factory = _factory(engine)
+    organization_id, connector_id, scope_id = _seed(factory)
+    profile = _profile()
+    user_id, _space_id = _grant_and_search_context(
+        factory, organization_id, scope_id
+    )
+    lease = _phase3_claim(
+        factory,
+        organization_id,
+        connector_id,
+        scope_id,
+        profile,
+        path="new-file.txt",
+    )
+    context = _phase3_context(factory, lease, profile)
+    with factory() as session:
+        result = _phase3_service(session, profile).persist(
+            lease,
+            context,
+            _phase3_prepared(context),
+            worker_id="phase3-worker",
+            now=NOW,
+            lease_duration=timedelta(minutes=15),
+        )
+        session.commit()
+        assert result.work_item.status is FileWorkStatus.SUCCEEDED
+
+    assert _search(factory, organization_id, user_id) == ()
+    with factory() as session:
+        assert session.scalar(select(func.count()).select_from(SourceItem)) == 0
+        assert session.scalar(select(func.count()).select_from(Document)) == 0
+        assert session.scalar(select(func.count()).select_from(DocumentVersion)) == 0
+        assert session.scalar(select(func.count()).select_from(DocumentChunk)) == 0
+        assert session.scalar(select(func.count()).select_from(DocumentIndexingState)) == 0
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncFileMaterialization)
+        ) == 1
+
+
+def test_permission_aware_retrieval_sql_has_no_ledger_dependency():
+    normalized = SEARCH_SQL.casefold()
+    assert "connector_sync_generations" not in normalized
+    assert "connector_sync_file_work_items" not in normalized
+    assert "connector_sync_file_materializations" not in normalized
+    assert "connector_sync_file_materialization_chunks" not in normalized

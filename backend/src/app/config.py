@@ -136,6 +136,7 @@ class WorkerProcessSettings:
     github: GitHubWorkerSettings
     secret_manager: GoogleSecretManagerSettings
     github_sync_ledger_planning_enabled: bool = False
+    github_sync_ledger_processing_enabled: bool = False
 
 
 def load_runtime_environment(environ: Mapping[str, str] | None = None) -> str:
@@ -341,11 +342,17 @@ def validate_worker_process_environment(
         "GITHUB_SYNC_LEDGER_PLANNING_ENABLED",
         default=False,
     )
+    ledger_processing_enabled = _optional_strict_boolean(
+        values,
+        "GITHUB_SYNC_LEDGER_PROCESSING_ENABLED",
+        default=False,
+    )
     return WorkerProcessSettings(
         database,
         github,
         secret_manager,
         ledger_planning_enabled,
+        ledger_processing_enabled,
     )
 
 

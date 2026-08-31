@@ -51,7 +51,7 @@ def engine():
     environment = os.environ.copy()
     environment[DEV_URL] = url
     subprocess.run(
-        [str(PYTHON), "-m", "alembic", "-c", str(INI), "upgrade", "head"],
+        [str(PYTHON), "-m", "alembic", "-c", str(INI), "upgrade", REVISION],
         check=True,
         cwd=str(ROOT),
         env=environment,

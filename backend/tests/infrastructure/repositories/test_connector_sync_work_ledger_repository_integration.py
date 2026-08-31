@@ -28,10 +28,16 @@ from application.services.github_sync_work_planning_service import (
 from domain.connectors.sync_work_ledger import (
     FileWorkCounters,
     FileWorkManifestEntry,
+    FileWorkMaterialization,
+    FileWorkMaterializationChunk,
     FileWorkStatus,
     RepositoryGenerationRegistration,
 )
-from infrastructure.db.models import ConnectorSyncFileWorkItem
+from infrastructure.db.models import (
+    ConnectorSyncFileMaterialization,
+    ConnectorSyncFileMaterializationChunk,
+    ConnectorSyncFileWorkItem,
+)
 from infrastructure.repositories.connector_sync_work_ledger_repository import (
     ConnectorSyncWorkLedgerRepository,
     FileWorkCancellationConflict,
@@ -287,6 +293,33 @@ def _register(
     return result
 
 
+def _materialization(generation, work, *, text_value="alpha"):
+    content_hash = "d" * 64
+    return FileWorkMaterialization(
+        generation.repository_identity,
+        generation.branch_name,
+        generation.root_tree_object_id,
+        work.source_item_key,
+        work.repository_path,
+        work.provider_blob_id,
+        work.provider_revision_id,
+        work.profile_fingerprint,
+        "c" * 64,
+        "File",
+        work.mime_type,
+        "fake:model:1536",
+        (
+            FileWorkMaterializationChunk(
+                0,
+                text_value,
+                content_hash,
+                (1.0,) * 1536,
+                "fake:model:1536",
+            ),
+        ),
+    )
+
+
 def test_generation_and_duplicate_manifest_registration_are_idempotent(engine) -> None:
     with Session(engine, expire_on_commit=False) as session:
         context = _setup(session, "Idempotent")
@@ -328,6 +361,311 @@ def test_generation_and_duplicate_manifest_registration_are_idempotent(engine) -
                 [_entry(index) for index in range(501)], now=NOW,
             )
         session.rollback()
+
+
+def test_cross_tenant_provider_claim_is_single_bounded_and_requires_completed_discovery(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        first_context, first_generation = _generation(session, "First")
+        second_context, second_generation = _generation(session, "Second")
+        _register(
+            session,
+            first_context[0],
+            first_generation.generation_id,
+            (_entry(1), _entry(2)),
+        )
+        _register(
+            session,
+            second_context[0],
+            second_generation.generation_id,
+            (_entry(3),),
+        )
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        repository.mark_discovery_complete(
+            second_context[0], second_generation.generation_id, now=NOW
+        )
+        session.commit()
+
+        lease = repository.claim_next_available(
+            provider_key="github",
+            profile_fingerprint=second_generation.profile_fingerprint,
+            worker_id="phase3-worker",
+            now=NOW,
+            lease_duration=LEASE,
+        )
+        session.commit()
+
+        assert lease is not None
+        assert lease.organization_id == second_context[0]
+        assert lease.generation_id == second_generation.generation_id
+        assert repository.get_work_item(
+            lease.organization_id, lease.generation_id, lease.work_item_id
+        ).status is FileWorkStatus.RUNNING
+        assert repository.claim_next_available(
+            provider_key="github",
+            profile_fingerprint=second_generation.profile_fingerprint,
+            worker_id="phase3-worker",
+            now=NOW,
+            lease_duration=LEASE,
+        ) is None
+        session.rollback()
+
+
+def test_generation_scoped_materialization_and_completion_are_atomic(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation = _generation(session, "Materialization")
+        _register(session, context[0], generation.generation_id, (_entry(1),))
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        repository.mark_discovery_complete(context[0], generation.generation_id, now=NOW)
+        session.commit()
+        lease = repository.claim_next_available(
+            provider_key="github", profile_fingerprint=PROFILE,
+            worker_id="phase3-worker", now=NOW, lease_duration=LEASE,
+        )
+        session.commit()
+        assert lease is not None
+        generation = repository.get_generation(context[0], generation.generation_id)
+        work = repository.get_work_item(context[0], lease.generation_id, lease.work_item_id)
+        assert generation is not None and work is not None
+        completed, staged, created = repository.stage_materialization_and_complete(
+            lease,
+            worker_id="phase3-worker",
+            generation=generation,
+            work_item=work,
+            materialization=_materialization(generation, work),
+            counters=FileWorkCounters(5, 5, 1, 1),
+            now=NOW,
+        )
+        session.commit()
+        assert created is True
+        assert completed.status is FileWorkStatus.SUCCEEDED
+        assert staged.generation_id == generation.generation_id
+        assert staged.work_item_id == work.work_item_id
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncFileMaterialization)
+        ) == 1
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncFileMaterializationChunk)
+        ) == 1
+
+
+def test_concurrent_same_lease_completion_converges_to_one_materialization(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation = _generation(session, "ConcurrentMaterialization")
+        _register(session, context[0], generation.generation_id, (_entry(1),))
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        repository.mark_discovery_complete(
+            context[0], generation.generation_id, now=NOW
+        )
+        session.commit()
+        lease = repository.claim_next_available(
+            provider_key="github",
+            profile_fingerprint=PROFILE,
+            worker_id="phase3-worker",
+            now=NOW,
+            lease_duration=LEASE,
+        )
+        session.commit()
+        assert lease is not None
+        generation_view = repository.get_generation(
+            context[0], generation.generation_id
+        )
+        work_view = repository.get_work_item(
+            context[0], lease.generation_id, lease.work_item_id
+        )
+        assert generation_view is not None and work_view is not None
+
+    gate = threading.Barrier(2)
+    outcomes: list[str] = []
+
+    def complete_once() -> None:
+        with Session(engine, expire_on_commit=False) as session:
+            repository = ConnectorSyncWorkLedgerRepository(session)
+            gate.wait(timeout=10)
+            try:
+                repository.stage_materialization_and_complete(
+                    lease,
+                    worker_id="phase3-worker",
+                    generation=generation_view,
+                    work_item=work_view,
+                    materialization=_materialization(generation_view, work_view),
+                    counters=FileWorkCounters(5, 5, 1, 1),
+                    now=NOW,
+                )
+                session.commit()
+                outcomes.append("completed")
+            except LostFileWorkLease:
+                session.rollback()
+                outcomes.append("lost_lease")
+
+    workers = [threading.Thread(target=complete_once) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=15)
+        assert not worker.is_alive()
+
+    assert sorted(outcomes) == ["completed", "lost_lease"]
+    with Session(engine) as session:
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncFileMaterialization)
+        ) == 1
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncFileMaterializationChunk)
+        ) == 1
+        work = session.get(ConnectorSyncFileWorkItem, lease.work_item_id)
+        assert work.status == FileWorkStatus.SUCCEEDED.value
+
+
+def test_same_path_different_blobs_are_isolated_between_generations(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        first_context, first_generation = _generation(session, "FirstGeneration")
+        second_context = _setup(session, "SecondGeneration")
+        second_generation, created = ConnectorSyncWorkLedgerRepository(
+            session
+        ).register_generation(
+            replace(
+                _generation_request(second_context),
+                commit_object_id="f" * 40,
+                root_tree_object_id="e" * 40,
+            )
+        )
+        session.commit()
+        assert created
+        first_entry = _entry(1)
+        second_entry = replace(
+            first_entry,
+            provider_blob_id="e" * 40,
+            provider_revision_id="f" * 40,
+        )
+        _register(
+            session,
+            first_context[0],
+            first_generation.generation_id,
+            (first_entry,),
+        )
+        _register(
+            session,
+            second_context[0],
+            second_generation.generation_id,
+            (second_entry,),
+        )
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        repository.mark_discovery_complete(
+            first_context[0], first_generation.generation_id, now=NOW
+        )
+        repository.mark_discovery_complete(
+            second_context[0], second_generation.generation_id, now=NOW
+        )
+        session.commit()
+
+        persisted = []
+        for context, generation, worker_id in (
+            (first_context, first_generation, "first-worker"),
+            (second_context, second_generation, "second-worker"),
+        ):
+            lease = repository.claim_next(
+                context[0],
+                generation.generation_id,
+                worker_id=worker_id,
+                now=NOW,
+                lease_duration=LEASE,
+            )
+            session.commit()
+            assert lease is not None
+            generation_view = repository.get_generation(
+                context[0], generation.generation_id
+            )
+            work_view = repository.get_work_item(
+                context[0], generation.generation_id, lease.work_item_id
+            )
+            assert generation_view is not None and work_view is not None
+            completed, materialization, created = (
+                repository.stage_materialization_and_complete(
+                    lease,
+                    worker_id=worker_id,
+                    generation=generation_view,
+                    work_item=work_view,
+                    materialization=_materialization(generation_view, work_view),
+                    counters=FileWorkCounters(5, 5, 1, 1),
+                    now=NOW,
+                )
+            )
+            session.commit()
+            assert completed.status is FileWorkStatus.SUCCEEDED
+            assert created
+            persisted.append(materialization)
+
+        assert persisted[0].generation_id != persisted[1].generation_id
+        assert persisted[0].provider_blob_id != persisted[1].provider_blob_id
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncFileMaterialization)
+        ) == 2
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncFileMaterializationChunk)
+        ) == 2
+
+
+def test_materialization_rollback_preserves_running_work_and_no_staged_rows(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation = _generation(session, "MaterializationRollback")
+        _register(session, context[0], generation.generation_id, (_entry(1),))
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        repository.mark_discovery_complete(context[0], generation.generation_id, now=NOW)
+        session.commit()
+        lease = repository.claim_next_available(
+            provider_key="github", profile_fingerprint=PROFILE,
+            worker_id="phase3-worker", now=NOW, lease_duration=LEASE,
+        )
+        session.commit()
+        assert lease is not None
+        generation = repository.get_generation(context[0], generation.generation_id)
+        work = repository.get_work_item(context[0], lease.generation_id, lease.work_item_id)
+        assert generation is not None and work is not None
+        repository.stage_materialization_and_complete(
+            lease,
+            worker_id="phase3-worker",
+            generation=generation,
+            work_item=work,
+            materialization=_materialization(generation, work),
+            counters=FileWorkCounters(5, 5, 1, 1),
+            now=NOW,
+        )
+        session.rollback()
+
+    with Session(engine) as session:
+        work_row = session.get(ConnectorSyncFileWorkItem, lease.work_item_id)
+        assert work_row.status == FileWorkStatus.RUNNING.value
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncFileMaterialization)
+        ) == 0
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncFileMaterializationChunk)
+        ) == 0
+
+
+def test_global_claim_rejects_profile_mismatch_and_cancelled_job(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation = _generation(session, "ClaimRestrictions")
+        _register(session, context[0], generation.generation_id, (_entry(1),))
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        repository.mark_discovery_complete(context[0], generation.generation_id, now=NOW)
+        session.commit()
+        assert repository.claim_next_available(
+            provider_key="github", profile_fingerprint="other:profile",
+            worker_id="phase3-worker", now=NOW, lease_duration=LEASE,
+        ) is None
+        session.execute(
+            text(
+                    "UPDATE connector_sync_jobs SET cancel_requested_at=created_at, "
+                    "cancel_reason_code='operator_cancelled' WHERE id=:job"
+                ),
+                {"job": context[3]},
+        )
+        session.commit()
+        assert repository.claim_next_available(
+            provider_key="github", profile_fingerprint=PROFILE,
+            worker_id="phase3-worker", now=NOW, lease_duration=LEASE,
+        ) is None
 
 
 def test_github_planner_persists_multiple_bounded_batches_resumes_and_replays(

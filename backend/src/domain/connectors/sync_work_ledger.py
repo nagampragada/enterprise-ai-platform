@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+import math
 from uuid import UUID
 
 
@@ -19,6 +20,8 @@ MAX_FILE_SIZE_BYTES = 1024 * 1024 * 1024
 MAX_EXTRACTED_CHARACTERS = 100_000_000
 MAX_CHUNK_COUNT = 100_000
 MAX_EMBEDDING_BATCH_COUNT = 100_000
+FILE_WORK_EMBEDDING_DIMENSION = 1536
+MAX_CHUNK_TEXT_LENGTH = 1_000_000
 
 
 class RepositoryGenerationStatus(StrEnum):
@@ -158,6 +161,95 @@ class FileWorkCounters:
         )
 
 
+@dataclass(frozen=True, repr=False)
+class FileWorkMaterializationChunk:
+    chunk_index: int
+    chunk_text: str
+    content_hash: str
+    embedding: tuple[float, ...]
+    embedding_model: str
+
+    def __post_init__(self) -> None:
+        _require_bounded_counter("chunk_index", self.chunk_index, MAX_CHUNK_COUNT - 1)
+        if (
+            not isinstance(self.chunk_text, str)
+            or not self.chunk_text.strip()
+            or len(self.chunk_text) > MAX_CHUNK_TEXT_LENGTH
+        ):
+            raise ValueError("chunk_text must be nonblank and bounded")
+        _require_nonblank("content_hash", self.content_hash, 128)
+        _require_identifier("embedding_model", self.embedding_model, 255)
+        if len(self.embedding) != FILE_WORK_EMBEDDING_DIMENSION or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            for value in self.embedding
+        ):
+            raise ValueError(
+                f"embedding must contain {FILE_WORK_EMBEDDING_DIMENSION} finite values"
+            )
+
+
+@dataclass(frozen=True, repr=False)
+class FileWorkMaterialization:
+    repository_identity: str
+    branch_name: str
+    root_tree_object_id: str
+    source_item_key: str
+    repository_path: str
+    provider_blob_id: str
+    provider_revision_id: str
+    profile_fingerprint: str
+    content_checksum: str
+    title: str
+    mime_type: str
+    embedding_model: str
+    chunks: tuple[FileWorkMaterializationChunk, ...]
+
+    def __post_init__(self) -> None:
+        for name in ("repository_identity", "branch_name", "root_tree_object_id"):
+            _require_nonblank(name, getattr(self, name), MAX_PROVIDER_IDENTITY_LENGTH)
+        _require_nonblank("source_item_key", self.source_item_key, MAX_SOURCE_ITEM_KEY_LENGTH)
+        _require_nonblank("repository_path", self.repository_path, MAX_REPOSITORY_PATH_LENGTH)
+        _require_nonblank("provider_blob_id", self.provider_blob_id, MAX_PROVIDER_IDENTITY_LENGTH)
+        _require_nonblank(
+            "provider_revision_id", self.provider_revision_id, MAX_PROVIDER_IDENTITY_LENGTH
+        )
+        _require_identifier(
+            "profile_fingerprint", self.profile_fingerprint, MAX_PROFILE_FINGERPRINT_LENGTH
+        )
+        _require_nonblank("content_checksum", self.content_checksum, 128)
+        _require_nonblank("title", self.title, 255)
+        _require_nonblank("mime_type", self.mime_type, 255)
+        _require_identifier("embedding_model", self.embedding_model, 255)
+        if not isinstance(self.chunks, tuple) or not self.chunks:
+            raise ValueError("materialization chunks must be a nonempty tuple")
+        if len(self.chunks) > MAX_CHUNK_COUNT:
+            raise ValueError("materialization chunk count exceeds its maximum")
+        if any(
+            not isinstance(chunk, FileWorkMaterializationChunk)
+            or chunk.chunk_index != index
+            or chunk.embedding_model != self.embedding_model
+            for index, chunk in enumerate(self.chunks)
+        ):
+            raise ValueError("materialization chunks are inconsistent")
+
+
+@dataclass(frozen=True)
+class FileWorkMaterializationView:
+    materialization_id: UUID
+    organization_id: UUID
+    connector_id: UUID
+    connector_scope_id: UUID
+    generation_id: UUID
+    work_item_id: UUID
+    provider_blob_id: str
+    provider_revision_id: str
+    profile_fingerprint: str
+    chunk_count: int
+    created_at: datetime
+
+
 @dataclass(frozen=True)
 class FileWorkLease:
     organization_id: UUID
@@ -213,6 +305,9 @@ class FileWorkItemView:
     provider_blob_id: str
     provider_revision_id: str
     profile_fingerprint: str
+    file_size_bytes: int | None
+    file_extension: str | None
+    mime_type: str | None
     status: FileWorkStatus
     attempt_count: int
     max_attempts: int

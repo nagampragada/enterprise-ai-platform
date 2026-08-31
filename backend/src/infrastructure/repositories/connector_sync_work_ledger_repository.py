@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import Callable
@@ -17,6 +18,8 @@ from domain.connectors.sync_work_ledger import (
     FileWorkCounters,
     FileWorkItemView,
     FileWorkLease,
+    FileWorkMaterialization,
+    FileWorkMaterializationView,
     FileWorkManifestEntry,
     FileWorkStatus,
     GenerationBarrierSummary,
@@ -29,6 +32,8 @@ from domain.connectors.sync_work_ledger import (
     TERMINAL_GENERATION_STATUSES,
 )
 from infrastructure.db.models import (
+    ConnectorSyncFileMaterialization,
+    ConnectorSyncFileMaterializationChunk,
     ConnectorSyncFileWorkItem,
     ConnectorSyncGeneration,
     ConnectorSyncJob,
@@ -91,11 +96,15 @@ class ConnectorSyncWorkLedgerRepository:
         generation_id_factory: Callable[[], UUID] = uuid4,
         work_item_id_factory: Callable[[], UUID] = uuid4,
         lease_id_factory: Callable[[], UUID] = uuid4,
+        materialization_id_factory: Callable[[], UUID] = uuid4,
+        materialization_chunk_id_factory: Callable[[], UUID] = uuid4,
     ) -> None:
         self._session = session
         self._generation_id_factory = generation_id_factory
         self._work_item_id_factory = work_item_id_factory
         self._lease_id_factory = lease_id_factory
+        self._materialization_id_factory = materialization_id_factory
+        self._materialization_chunk_id_factory = materialization_chunk_id_factory
 
     def register_generation(
         self, request: RepositoryGenerationRegistration
@@ -417,6 +426,72 @@ class ConnectorSyncWorkLedgerRepository:
             .with_for_update(of=ConnectorSyncFileWorkItem, skip_locked=True)
             .limit(1)
         )
+        return self._claim_one(statement, worker_id=worker_id, now=now, lease_duration=lease_duration)
+
+    def claim_next_available(
+        self,
+        *,
+        provider_key: str,
+        profile_fingerprint: str,
+        worker_id: str,
+        now: datetime,
+        lease_duration: timedelta,
+    ) -> FileWorkLease | None:
+        """Claim one ready item across tenants after immutable discovery completes."""
+        provider_key = _code("provider_key", provider_key, 64)
+        profile_fingerprint = _identifier(
+            "profile_fingerprint", profile_fingerprint, 255
+        )
+        worker_id = _worker_id(worker_id)
+        now = _aware("now", now)
+        lease_duration = _lease_duration(lease_duration)
+        statement = (
+            select(ConnectorSyncFileWorkItem)
+            .join(
+                ConnectorSyncGeneration,
+                (ConnectorSyncGeneration.organization_id == ConnectorSyncFileWorkItem.organization_id)
+                & (ConnectorSyncGeneration.id == ConnectorSyncFileWorkItem.generation_id),
+            )
+            .join(
+                ConnectorSyncJob,
+                (ConnectorSyncJob.organization_id == ConnectorSyncGeneration.organization_id)
+                & (ConnectorSyncJob.connector_id == ConnectorSyncGeneration.connector_id)
+                & (ConnectorSyncJob.connector_scope_id == ConnectorSyncGeneration.connector_scope_id)
+                & (ConnectorSyncJob.id == ConnectorSyncGeneration.sync_job_id),
+            )
+            .where(
+                ConnectorSyncGeneration.provider_key == provider_key,
+                ConnectorSyncGeneration.profile_fingerprint == profile_fingerprint,
+                ConnectorSyncGeneration.status == RepositoryGenerationStatus.PROCESSING.value,
+                ConnectorSyncGeneration.discovery_complete.is_(True),
+                ConnectorSyncJob.status != "cancelled",
+                ConnectorSyncJob.cancel_requested_at.is_(None),
+                ConnectorSyncFileWorkItem.status.in_(
+                    (FileWorkStatus.PENDING.value, FileWorkStatus.RETRY_WAIT.value)
+                ),
+                ConnectorSyncFileWorkItem.next_attempt_at <= now,
+                ConnectorSyncFileWorkItem.cancel_requested_at.is_(None),
+                ConnectorSyncFileWorkItem.attempt_count < ConnectorSyncFileWorkItem.max_attempts,
+            )
+            .order_by(
+                ConnectorSyncGeneration.created_at,
+                ConnectorSyncGeneration.id,
+                ConnectorSyncFileWorkItem.next_attempt_at,
+                ConnectorSyncFileWorkItem.id,
+            )
+            .with_for_update(of=ConnectorSyncFileWorkItem, skip_locked=True)
+            .limit(1)
+        )
+        return self._claim_one(statement, worker_id=worker_id, now=now, lease_duration=lease_duration)
+
+    def _claim_one(
+        self,
+        statement,
+        *,
+        worker_id: str,
+        now: datetime,
+        lease_duration: timedelta,
+    ) -> FileWorkLease | None:
         row = self._one(statement, "file work claim failed")
         if row is None:
             return None
@@ -601,6 +676,57 @@ class ConnectorSyncWorkLedgerRepository:
             .limit(limit),
             "expired file work lookup failed",
         )
+        self._recover_rows(rows, now)
+        return tuple(_work_view(row) for row in rows)
+
+    def recover_expired_available(
+        self,
+        *,
+        provider_key: str,
+        profile_fingerprint: str,
+        now: datetime,
+        limit: int,
+    ) -> tuple[FileWorkItemView, ...]:
+        """Recover expired provider work across tenants without exposing payloads."""
+        provider_key = _code("provider_key", provider_key, 64)
+        profile_fingerprint = _identifier(
+            "profile_fingerprint", profile_fingerprint, 255
+        )
+        now = _aware("now", now)
+        limit = _limit(limit, MAX_CLAIM_LIMIT)
+        rows = self._all(
+            select(ConnectorSyncFileWorkItem)
+            .join(
+                ConnectorSyncGeneration,
+                (ConnectorSyncGeneration.organization_id == ConnectorSyncFileWorkItem.organization_id)
+                & (ConnectorSyncGeneration.id == ConnectorSyncFileWorkItem.generation_id),
+            )
+            .join(
+                ConnectorSyncJob,
+                (ConnectorSyncJob.organization_id == ConnectorSyncGeneration.organization_id)
+                & (ConnectorSyncJob.connector_id == ConnectorSyncGeneration.connector_id)
+                & (ConnectorSyncJob.connector_scope_id == ConnectorSyncGeneration.connector_scope_id)
+                & (ConnectorSyncJob.id == ConnectorSyncGeneration.sync_job_id),
+            )
+            .where(
+                ConnectorSyncGeneration.provider_key == provider_key,
+                ConnectorSyncGeneration.profile_fingerprint == profile_fingerprint,
+                ConnectorSyncGeneration.status == RepositoryGenerationStatus.PROCESSING.value,
+                ConnectorSyncGeneration.discovery_complete.is_(True),
+                ConnectorSyncJob.status != "cancelled",
+                ConnectorSyncJob.cancel_requested_at.is_(None),
+                ConnectorSyncFileWorkItem.status == FileWorkStatus.RUNNING.value,
+                ConnectorSyncFileWorkItem.lease_expires_at <= now,
+            )
+            .order_by(ConnectorSyncFileWorkItem.lease_expires_at, ConnectorSyncFileWorkItem.id)
+            .with_for_update(of=ConnectorSyncFileWorkItem, skip_locked=True)
+            .limit(limit),
+            "expired file work lookup failed",
+        )
+        self._recover_rows(rows, now)
+        return tuple(_work_view(row) for row in rows)
+
+    def _recover_rows(self, rows, now: datetime) -> None:
         for row in rows:
             if row.cancel_requested_at is not None:
                 _apply_terminal(row, FileWorkStatus.CANCELLED.value, now)
@@ -617,7 +743,6 @@ class ConnectorSyncWorkLedgerRepository:
                 _apply_terminal(row, FileWorkStatus.FAILED.value, now)
         if rows:
             self._flush("expired file work recovery failed")
-        return tuple(_work_view(row) for row in rows)
 
     def barrier_summary(
         self, organization_id: UUID, generation_id: UUID
@@ -672,6 +797,183 @@ class ConnectorSyncWorkLedgerRepository:
             "file work lookup failed",
         )
         return _work_view(row) if row is not None else None
+
+    def get_materialization(
+        self, organization_id: UUID, generation_id: UUID, work_item_id: UUID
+    ) -> FileWorkMaterializationView | None:
+        organization_id = _uuid("organization_id", organization_id)
+        generation_id = _uuid("generation_id", generation_id)
+        work_item_id = _uuid("work_item_id", work_item_id)
+        row = self._one(
+            select(ConnectorSyncFileMaterialization).where(
+                ConnectorSyncFileMaterialization.organization_id == organization_id,
+                ConnectorSyncFileMaterialization.generation_id == generation_id,
+                ConnectorSyncFileMaterialization.work_item_id == work_item_id,
+            ),
+            "file materialization lookup failed",
+        )
+        if row is None:
+            return None
+        count = self._one(
+            select(func.count(ConnectorSyncFileMaterializationChunk.id)).where(
+                ConnectorSyncFileMaterializationChunk.organization_id == organization_id,
+                ConnectorSyncFileMaterializationChunk.generation_id == generation_id,
+                ConnectorSyncFileMaterializationChunk.materialization_id == row.id,
+            ),
+            "file materialization chunk count failed",
+        )
+        if count != row.chunk_count:
+            raise SyncWorkLedgerPersistenceError(
+                "file materialization chunks are incomplete"
+            )
+        return _materialization_view(row)
+
+    def stage_materialization_and_complete(
+        self,
+        lease: FileWorkLease,
+        *,
+        worker_id: str,
+        generation: RepositoryGenerationView,
+        work_item: FileWorkItemView,
+        materialization: FileWorkMaterialization,
+        counters: FileWorkCounters,
+        now: datetime,
+    ) -> tuple[FileWorkItemView, FileWorkMaterializationView, bool]:
+        """Atomically stage immutable output and complete the currently fenced item."""
+        if not isinstance(generation, RepositoryGenerationView):
+            raise InvalidSyncWorkLedgerRequest("generation view is invalid")
+        if not isinstance(work_item, FileWorkItemView):
+            raise InvalidSyncWorkLedgerRequest("file work view is invalid")
+        if not isinstance(materialization, FileWorkMaterialization):
+            raise InvalidSyncWorkLedgerRequest("file materialization is invalid")
+        if not isinstance(counters, FileWorkCounters):
+            raise InvalidSyncWorkLedgerRequest("file work counters are invalid")
+        now = _aware("now", now)
+
+        work_row = self._locked_lease(lease, worker_id=worker_id, now=now)
+        generation_row = self._locked_generation(
+            lease.organization_id, lease.generation_id
+        )
+        if generation_row is None:
+            raise SyncWorkLedgerNotFound("file materialization generation was not found")
+        job = self._one(
+            select(ConnectorSyncJob)
+            .where(
+                ConnectorSyncJob.organization_id == generation_row.organization_id,
+                ConnectorSyncJob.connector_id == generation_row.connector_id,
+                ConnectorSyncJob.connector_scope_id == generation_row.connector_scope_id,
+                ConnectorSyncJob.id == generation_row.sync_job_id,
+            )
+            .with_for_update(),
+            "file materialization job validation failed",
+        )
+        if (
+            job is None
+            or job.status == "cancelled"
+            or job.cancel_requested_at is not None
+            or generation_row.status != RepositoryGenerationStatus.PROCESSING.value
+            or not generation_row.discovery_complete
+            or _generation_view(generation_row) != generation
+            or _work_view(work_row).work_item_id != work_item.work_item_id
+            or _work_view(work_row).source_item_key != work_item.source_item_key
+            or _work_view(work_row).repository_path != work_item.repository_path
+            or _work_view(work_row).provider_blob_id != work_item.provider_blob_id
+            or _work_view(work_row).provider_revision_id != work_item.provider_revision_id
+            or _work_view(work_row).profile_fingerprint != work_item.profile_fingerprint
+            or not _materialization_matches_context(
+                materialization, generation, work_item
+            )
+        ):
+            raise SyncWorkLedgerConflict(
+                "file materialization attribution changed"
+            )
+
+        existing = self._one(
+            select(ConnectorSyncFileMaterialization)
+            .where(
+                ConnectorSyncFileMaterialization.organization_id == lease.organization_id,
+                ConnectorSyncFileMaterialization.generation_id == lease.generation_id,
+                ConnectorSyncFileMaterialization.work_item_id == lease.work_item_id,
+            )
+            .with_for_update(),
+            "file materialization lock failed",
+        )
+        created = existing is None
+        if existing is None:
+            existing = ConnectorSyncFileMaterialization(
+                id=self._new_uuid(
+                    "materialization_id", self._materialization_id_factory
+                ),
+                organization_id=lease.organization_id,
+                connector_id=lease.connector_id,
+                connector_scope_id=lease.connector_scope_id,
+                generation_id=lease.generation_id,
+                work_item_id=lease.work_item_id,
+                repository_identity=materialization.repository_identity,
+                branch_name=materialization.branch_name,
+                root_tree_object_id=materialization.root_tree_object_id,
+                source_item_key=materialization.source_item_key,
+                source_key_hash=_source_key_hash(
+                    materialization.source_item_key,
+                    materialization.repository_path,
+                ),
+                repository_path=materialization.repository_path,
+                provider_blob_id=materialization.provider_blob_id,
+                provider_revision_id=materialization.provider_revision_id,
+                profile_fingerprint=materialization.profile_fingerprint,
+                content_checksum=materialization.content_checksum,
+                title=materialization.title,
+                mime_type=materialization.mime_type,
+                embedding_model=materialization.embedding_model,
+                chunk_count=len(materialization.chunks),
+                created_at=now,
+            )
+            self._session.add(existing)
+            self._flush("file materialization could not be created")
+            self._session.add_all(
+                ConnectorSyncFileMaterializationChunk(
+                    id=self._new_uuid(
+                        "materialization_chunk_id",
+                        self._materialization_chunk_id_factory,
+                    ),
+                    organization_id=lease.organization_id,
+                    generation_id=lease.generation_id,
+                    materialization_id=existing.id,
+                    chunk_index=chunk.chunk_index,
+                    chunk_text=chunk.chunk_text,
+                    content_hash=chunk.content_hash,
+                    embedding=[float(value) for value in chunk.embedding],
+                    embedding_model=chunk.embedding_model,
+                    created_at=now,
+                )
+                for chunk in materialization.chunks
+            )
+            self._flush("file materialization chunks could not be created")
+        else:
+            chunks = self._all(
+                select(ConnectorSyncFileMaterializationChunk)
+                .where(
+                    ConnectorSyncFileMaterializationChunk.organization_id
+                    == lease.organization_id,
+                    ConnectorSyncFileMaterializationChunk.generation_id
+                    == lease.generation_id,
+                    ConnectorSyncFileMaterializationChunk.materialization_id
+                    == existing.id,
+                )
+                .order_by(ConnectorSyncFileMaterializationChunk.chunk_index)
+                .with_for_update(),
+                "file materialization chunks could not be locked",
+            )
+            if not _persisted_materialization_matches(
+                existing, chunks, materialization
+            ):
+                raise SyncWorkLedgerConflict(
+                    "file materialization conflicts with immutable output"
+                )
+
+        _apply_terminal(work_row, FileWorkStatus.SUCCEEDED.value, now, counters=counters)
+        self._flush("file materialization completion failed")
+        return _work_view(work_row), _materialization_view(existing), created
 
     def _generation(self, organization_id: UUID, generation_id: UUID):
         return self._one(
@@ -792,15 +1094,75 @@ def _generation_matches(row, request: RepositoryGenerationRegistration) -> bool:
 
 
 def _manifest_identity(entry: FileWorkManifestEntry) -> tuple[str, str, str, str]:
-    digest = hashlib.sha256()
-    digest.update(entry.source_item_key.encode("utf-8"))
-    digest.update(b"\x00")
-    digest.update(entry.repository_path.encode("utf-8"))
     return (
-        digest.hexdigest(),
+        _source_key_hash(entry.source_item_key, entry.repository_path),
         entry.provider_blob_id,
         entry.provider_revision_id,
         entry.profile_fingerprint,
+    )
+
+
+def _source_key_hash(source_item_key: str, repository_path: str) -> str:
+    digest = hashlib.sha256()
+    digest.update(source_item_key.encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update(repository_path.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _materialization_matches_context(
+    materialization: FileWorkMaterialization,
+    generation: RepositoryGenerationView,
+    work_item: FileWorkItemView,
+) -> bool:
+    return (
+        materialization.repository_identity == generation.repository_identity
+        and materialization.branch_name == generation.branch_name
+        and materialization.root_tree_object_id == generation.root_tree_object_id
+        and materialization.source_item_key == work_item.source_item_key
+        and materialization.repository_path == work_item.repository_path
+        and materialization.provider_blob_id == work_item.provider_blob_id
+        and materialization.provider_revision_id == generation.commit_object_id
+        and materialization.provider_revision_id == work_item.provider_revision_id
+        and materialization.profile_fingerprint == generation.profile_fingerprint
+        and materialization.profile_fingerprint == work_item.profile_fingerprint
+    )
+
+
+def _persisted_materialization_matches(row, rows, requested) -> bool:
+    header_matches = (
+        row.repository_identity == requested.repository_identity
+        and row.branch_name == requested.branch_name
+        and row.root_tree_object_id == requested.root_tree_object_id
+        and row.source_item_key == requested.source_item_key
+        and row.source_key_hash
+        == _source_key_hash(requested.source_item_key, requested.repository_path)
+        and row.repository_path == requested.repository_path
+        and row.provider_blob_id == requested.provider_blob_id
+        and row.provider_revision_id == requested.provider_revision_id
+        and row.profile_fingerprint == requested.profile_fingerprint
+        and row.content_checksum == requested.content_checksum
+        and row.title == requested.title
+        and row.mime_type == requested.mime_type
+        and row.embedding_model == requested.embedding_model
+        and row.chunk_count == len(requested.chunks)
+        and len(rows) == len(requested.chunks)
+    )
+    if not header_matches:
+        return False
+    return all(
+        row_chunk.chunk_index == requested_chunk.chunk_index
+        and row_chunk.chunk_text == requested_chunk.chunk_text
+        and row_chunk.content_hash == requested_chunk.content_hash
+        and row_chunk.embedding_model == requested_chunk.embedding_model
+        and len(row_chunk.embedding) == len(requested_chunk.embedding)
+        and all(
+            math.isclose(float(left), float(right), rel_tol=1e-6, abs_tol=1e-7)
+            for left, right in zip(
+                row_chunk.embedding, requested_chunk.embedding, strict=True
+            )
+        )
+        for row_chunk, requested_chunk in zip(rows, requested.chunks, strict=True)
     )
 
 
@@ -911,6 +1273,9 @@ def _work_view(row) -> FileWorkItemView:
         row.provider_blob_id,
         row.provider_revision_id,
         row.profile_fingerprint,
+        row.file_size_bytes,
+        row.file_extension,
+        row.mime_type,
         FileWorkStatus(row.status),
         row.attempt_count,
         row.max_attempts,
@@ -928,6 +1293,22 @@ def _work_view(row) -> FileWorkItemView:
         row.created_at,
         row.updated_at,
         row.terminal_at,
+    )
+
+
+def _materialization_view(row) -> FileWorkMaterializationView:
+    return FileWorkMaterializationView(
+        row.id,
+        row.organization_id,
+        row.connector_id,
+        row.connector_scope_id,
+        row.generation_id,
+        row.work_item_id,
+        row.provider_blob_id,
+        row.provider_revision_id,
+        row.profile_fingerprint,
+        row.chunk_count,
+        row.created_at,
     )
 
 
@@ -969,6 +1350,24 @@ def _code(name: str, value: object, maximum: int) -> str:
         or any(not (character.isalnum() or character == "_") for character in value)
     ):
         raise InvalidSyncWorkLedgerRequest(f"{name} must be a normalized code")
+    return value
+
+
+def _identifier(name: str, value: object, maximum: int) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > maximum
+        or value.lower() != value
+        or any(
+            not (character.isalnum() or character in "._:/-")
+            for character in value
+        )
+    ):
+        raise InvalidSyncWorkLedgerRequest(
+            f"{name} must be a normalized identifier"
+        )
     return value
 
 

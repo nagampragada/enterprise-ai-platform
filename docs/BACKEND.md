@@ -8,6 +8,17 @@ Enabled mode shadows bounded GitHub discovery metadata into the durable work
 ledger while the established GitHub path remains the only processor and
 indexer. It does not enable ledger claims, embeddings, promotion, or retrieval.
 
+`GITHUB_SYNC_LEDGER_PROCESSING_ENABLED` is a separate optional worker-only
+rollout flag. It also defaults to `false` and accepts only exact lowercase
+`true` or `false`. When enabled, the worker considers one completed-discovery
+GitHub file-work item only after the legacy synchronization queue is empty. It
+uses the recorded commit/blob/path/profile, existing extraction/chunking/
+embedding pipeline, file-work lease and fence, and an atomic generation-scoped
+staging plus completion transaction. Staged text/vectors are stored outside the
+legacy source/document/version/chunk graph and are not retrieval-visible. It
+does not promote or reconcile a generation.
+The API, scheduler, migration, and bootstrap processes do not consume the flag.
+
 ## Connector synchronization operations
 
 Authenticated active `organization_admin` users can enqueue, list, inspect, and cancel synchronization jobs for a tenant-owned Local Folder or selected GitHub repository scope:
@@ -39,6 +50,6 @@ python -m infrastructure.bootstrap.sandbox
 
 The API launcher runs one Uvicorn process on `0.0.0.0` with a validated `PORT`; reload and debug behavior are absent. `APP_ENVIRONMENT` accepts only `development`, `test`, `sandbox`, and `production`. Its deliberate missing-value default is `development`, never production. Sandbox and production require a non-development PostgreSQL URL plus distinct strong JWT and refresh-token secrets. Validation is process-specific so provider credentials are not required by operations that do not consume them.
 
-`GET /health` is dependency-free liveness. `GET /api/v1/health` is readiness: it returns 200 only when configuration is valid, bounded database checks succeed, the schema is at `20260828_000020`, and required GitHub/Secret Manager composition is available in a strict runtime. It uses only fixed values and never retrieves provider secrets.
+`GET /health` is dependency-free liveness. `GET /api/v1/health` is readiness: it returns 200 only when configuration is valid, bounded database checks succeed, the schema is at `20260831_000021`, and required GitHub/Secret Manager composition is available in a strict runtime. It uses only fixed values and never retrieves provider secrets.
 
 The image and runbook are implemented and statically tested, but no image or cloud resource has been built or deployed. See `GCP_GITHUB_SANDBOX_RUNBOOK.md`.

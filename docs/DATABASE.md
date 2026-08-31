@@ -1,16 +1,19 @@
 # Database Architecture
 
-## Durable repository generations and file-work ledger (`20260828_000020`)
+## Retrieval-isolated file-work materialization (`20260831_000021`)
 
 Migration `20260828_000020` adds the feature-gated `connector_sync_generations`
 and `connector_sync_file_work_items` control-plane tables. When the optional
 worker flag `GITHUB_SYNC_LEDGER_PLANNING_ENABLED=true` is set, the existing
 GitHub traversal shadows each pinned snapshot into these tables in bounded
 transactions. The flag defaults to false and accepts only lowercase `true` or
-`false`. Local Folder synchronization, file-work claiming, extraction,
-chunking, embedding, generation promotion, and retrieval do not consume the
-ledger. The existing GitHub path remains the only indexing path, so retrieval
-visibility is unchanged.
+`false`. Local Folder synchronization, generation promotion, and retrieval do
+not consume the ledger. A separate strict worker-only
+`GITHUB_SYNC_LEDGER_PROCESSING_ENABLED=true` gate enables one-at-a-time GitHub
+file-work claiming only after discovery is complete and only when the legacy
+job queue is empty. Its default is false. The first processing slice reuses the
+existing extraction/chunking/embedding/materialization pipeline but performs no
+generation promotion or distributed deletion reconciliation.
 
 `connector_sync_generations` pins one provider repository, branch, commit, root
 tree, and complete extraction/chunking/embedding profile to one originating
@@ -35,6 +38,27 @@ digest collision fails closed rather than aliasing work. It also locks the
 generation and checks every source digest already registered in that generation,
 so replay is idempotent while the same path with conflicting immutable metadata
 fails instead of creating a second work item.
+
+Migration `20260831_000021` adds
+`connector_sync_file_materializations` and
+`connector_sync_file_materialization_chunks`. These tables own immutable text,
+hashes, embedding-model attribution, and `Vector(1536)` output exclusively by
+organization, connector, scope, generation, and work item. They deliberately
+have no foreign key or materialization link to `source_items`, `documents`,
+`document_versions`, `document_indexing_states`, or `document_chunks`, and the
+permission-aware retrieval SQL does not join them. Phase 3 output therefore
+cannot become visible or replace legacy-authoritative content before a future
+explicit generation-promotion transaction.
+
+File-work provider preparation occurs without an open database transaction.
+The final transaction locks and revalidates the active lease and monotonic
+fence, exact tenant/generation/repository/commit/blob/path/profile attribution,
+processing/discovery state, and noncancelled job. It inserts or exactly matches
+the generation-scoped materialization and completes the work item under the
+same fence. Staging and acknowledgement therefore commit or roll back together;
+a stale owner fails before any staged or legacy document row is written.
+Retryable failures use the established bounded retry jitter; safe permanent
+file-level validation/provider failures are quarantined with fixed codes only.
 
 Shadow planning creates or resolves the generation when the legacy cursor first
 pins the default branch commit and root tree. Each discovered batch is registered

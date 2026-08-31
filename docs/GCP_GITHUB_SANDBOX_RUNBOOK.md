@@ -146,7 +146,7 @@ curl.exe --fail-with-body https://<generated-service-host>/health
 curl.exe --fail-with-body https://<generated-service-host>/api/v1/health
 ```
 
-Readiness must return HTTP 200 only after database connectivity, revision `20260828_000020`, configuration, and local GitHub/Secret Manager composition are ready. It makes no GitHub, OpenAI, or secret-value request.
+Readiness must return HTTP 200 only after database connectivity, revision `20260831_000021`, configuration, and local GitHub/Secret Manager composition are ready. It makes no GitHub, OpenAI, or secret-value request.
 
 Immediately after bootstrap success:
 
