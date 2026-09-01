@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Callable
+from uuid import UUID
 
 from sqlalchemy.orm import Session
 
 from application.services.connector_sync_retry_policy import (
     ConnectorSyncRetryPolicy,
+    FailureClassification,
     SyncFailureKind,
 )
 from application.services.github_staged_synchronization_service import (
@@ -42,6 +45,28 @@ _QUARANTINED_FAILURES = frozenset(
     }
 )
 
+_GRACEFUL_SHUTDOWN_CLASSIFICATION = FailureClassification(
+    SyncFailureKind.TRANSIENT_PERSISTENCE,
+    "internal",
+    "shutdown_grace_expired",
+    True,
+)
+
+
+@dataclass(frozen=True)
+class GitHubFileWorkExecution:
+    """Bounded, nonsecret result from one ledger claim attempt."""
+
+    outcome: str
+    work_item_id: UUID | None = None
+    attempt_number: int | None = None
+    counters: FileWorkCounters = FileWorkCounters()
+    reason_code: str | None = None
+
+
+class FileWorkGracefulShutdownExpired(RuntimeError):
+    """Raised at a safe progress boundary after the shutdown grace window."""
+
 
 class GitHubSyncWorkItemWorker:
     """Claim and process at most one GitHub file per bounded operation."""
@@ -59,6 +84,7 @@ class GitHubSyncWorkItemWorker:
         heartbeat_shutdown_timeout: timedelta,
         recovery_limit: int,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        progress_check: Callable[[], None] = lambda: None,
     ) -> None:
         self._sessions = session_factory
         self._service = service_factory
@@ -70,11 +96,22 @@ class GitHubSyncWorkItemWorker:
         self._heartbeat_shutdown_timeout = heartbeat_shutdown_timeout
         self._recovery_limit = recovery_limit
         self._clock = clock
+        self._progress_check = progress_check
 
     def execute_one(self) -> str:
-        lease = self._recover_and_claim()
+        """Preserve the Slice 1 one-item outcome contract."""
+        return self.execute_one_result().outcome
+
+    def execute_one_result(
+        self, *, claim_allowed: Callable[[], bool] | None = None
+    ) -> GitHubFileWorkExecution:
+        lease = (
+            self._recover_and_claim()
+            if claim_allowed is None
+            else self._recover_and_claim(claim_allowed)
+        )
         if lease is None:
-            return "no_work"
+            return GitHubFileWorkExecution("no_work")
         try:
             with FileWorkLeaseHeartbeat(
                 self._sessions,
@@ -84,6 +121,10 @@ class GitHubSyncWorkItemWorker:
                 interval=self._heartbeat_interval,
                 shutdown_timeout=self._heartbeat_shutdown_timeout,
             ) as heartbeat:
+                def progress() -> None:
+                    heartbeat.raise_if_failed()
+                    self._progress_check()
+
                 context = self._transaction(
                     lambda service: service.load_context(
                         lease,
@@ -92,16 +133,15 @@ class GitHubSyncWorkItemWorker:
                         lease_duration=self._lease_duration,
                     )
                 )
-                heartbeat.raise_if_failed()
+                progress()
                 prepared = self._preparation.prepare_file(
                     context.authorization,
                     context.snapshot,
                     context.entry,
                     context.item_snapshot,
-                    progress_check=heartbeat.raise_if_failed,
+                    progress_check=progress,
                 )
-                heartbeat.raise_if_failed()
-                heartbeat.stop()
+                progress()
                 result = self._transaction(
                     lambda service: service.persist(
                         lease,
@@ -112,22 +152,59 @@ class GitHubSyncWorkItemWorker:
                         lease_duration=self._lease_duration,
                     )
                 )
-            return "completed" if result.work_item.status.value in {"succeeded", "skipped"} else "failed"
+            outcome = (
+                "completed"
+                if result.work_item.status.value in {"succeeded", "skipped"}
+                else "failed"
+            )
+            return GitHubFileWorkExecution(
+                outcome,
+                lease.work_item_id,
+                lease.attempt_number,
+                result.work_item.counters,
+            )
         except FileWorkCancellationConflict:
-            return self._cancel(lease)
+            return GitHubFileWorkExecution(
+                self._cancel(lease), lease.work_item_id, lease.attempt_number
+            )
         except (LostFileWorkLease, StaleFileWorkFence):
-            return "lost_lease"
+            return GitHubFileWorkExecution(
+                "lost_lease", lease.work_item_id, lease.attempt_number
+            )
         except LeaseHeartbeatFailure as error:
             cause = error.__cause__
             if isinstance(cause, FileWorkCancellationConflict):
-                return self._cancel(lease)
+                return GitHubFileWorkExecution(
+                    self._cancel(lease), lease.work_item_id, lease.attempt_number
+                )
             if isinstance(cause, (LostFileWorkLease, StaleFileWorkFence)):
-                return "lost_lease"
-            return self._fail(lease, error)
+                return GitHubFileWorkExecution(
+                    "lost_lease", lease.work_item_id, lease.attempt_number
+                )
+            return self._failure_execution(lease, error)
         except Exception as error:
-            return self._fail(lease, error)
+            return self._failure_execution(lease, error)
 
-    def _recover_and_claim(self) -> FileWorkLease | None:
+    def _failure_execution(
+        self, lease: FileWorkLease, error: BaseException
+    ) -> GitHubFileWorkExecution:
+        outcome = self._fail(lease, error)
+        reason_code = (
+            "shutdown_grace_expired"
+            if outcome == "retry_scheduled"
+            and isinstance(error, FileWorkGracefulShutdownExpired)
+            else None
+        )
+        return GitHubFileWorkExecution(
+            outcome,
+            lease.work_item_id,
+            lease.attempt_number,
+            reason_code=reason_code,
+        )
+
+    def _recover_and_claim(
+        self, claim_allowed: Callable[[], bool] = lambda: True
+    ) -> FileWorkLease | None:
         session = self._sessions()
         try:
             repository = ConnectorSyncWorkLedgerRepository(session)
@@ -137,13 +214,15 @@ class GitHubSyncWorkItemWorker:
                 now=self._now(),
                 limit=self._recovery_limit,
             )
-            lease = repository.claim_next_available(
-                provider_key="github",
-                profile_fingerprint=self._preparation.profile.fingerprint,
-                worker_id=self._worker_id,
-                now=self._now(),
-                lease_duration=self._lease_duration,
-            )
+            lease = None
+            if claim_allowed():
+                lease = repository.claim_next_available(
+                    provider_key="github",
+                    profile_fingerprint=self._preparation.profile.fingerprint,
+                    worker_id=self._worker_id,
+                    now=self._now(),
+                    lease_duration=self._lease_duration,
+                )
             session.commit()
             return lease
         except Exception:
@@ -175,11 +254,18 @@ class GitHubSyncWorkItemWorker:
         except (LostFileWorkLease, StaleFileWorkFence):
             session.rollback()
             return "lost_lease"
+        except Exception:
+            session.rollback()
+            raise
         finally:
             session.close()
 
     def _fail(self, lease: FileWorkLease, error: BaseException) -> str:
-        classification = classify_github_synchronization_failure(error)
+        classification = (
+            _GRACEFUL_SHUTDOWN_CLASSIFICATION
+            if isinstance(error, FileWorkGracefulShutdownExpired)
+            else classify_github_synchronization_failure(error)
+        )
         if classification.kind is SyncFailureKind.CANCELLED:
             return "lost_lease"
         now = self._now()
@@ -218,6 +304,9 @@ class GitHubSyncWorkItemWorker:
         except (LostFileWorkLease, StaleFileWorkFence):
             session.rollback()
             return "lost_lease"
+        except Exception:
+            session.rollback()
+            raise
         finally:
             session.close()
 

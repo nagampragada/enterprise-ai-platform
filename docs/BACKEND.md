@@ -19,6 +19,38 @@ legacy source/document/version/chunk graph and are not retrieval-visible. It
 does not promote or reconcile a generation.
 The API, scheduler, migration, and bootstrap processes do not consume the flag.
 
+Phase 3 Slice 2 adds a dedicated ledger-only host at
+`python -m infrastructure.workers.github_sync_ledger_worker_host`. It is
+independent of the legacy synchronization queue: it never claims a legacy job,
+performs discovery, promotes a generation, reconciles deletion, or changes
+retrieval-visible state. The host checks the processing gate before composing
+ledger/provider services and before every claim. Defaults are 25 items, a
+20-minute drain deadline, a 12-minute minimum claim runway, a 15-minute lease,
+a 60-second heartbeat, one empty poll with a 5-second interval, a 5-minute
+heartbeat shutdown bound, and recovery of at most 10 expired items. All bounds
+are positive, hard-capped, and may be overridden only by the corresponding
+validated `GITHUB_LEDGER_WORKER_*` environment values or explicit command-line
+options. A runtime drain deadline never interrupts a claimed item. After a
+signal, the active item receives the configured graceful window; an indivisible
+provider request remains governed by its provider timeout, and an expired grace
+window schedules a fixed-code durable retry at the next safe progress boundary.
+The dedicated OpenAI client has a 10-minute per-call timeout and no SDK retry;
+the claim runway and lease must each cover that timeout plus two heartbeat
+margins. No new item is then claimed.
+
+The dedicated host emits fixed structured per-item and terminal summary fields
+only. Process status is `0` for disabled, empty, bounded/partial drain, durable
+retry scheduling, quarantine, cancellation, and safely completed signal stop.
+Their distinct meaning is retained in `run_status`, `stop_reason`,
+`graceful_shutdown`, and `partial_drain`. Process status is `1` only for invalid
+configuration/composition, unhandled or contradictory results, an undurable
+terminal transition, or lease/fence correctness loss. A retryable failure stops
+the execution only after database backoff is durable; `next_attempt_at` remains
+the claim authority and the future Cloud Run Job must use task retries `0` so a
+platform retry cannot compete with application backoff. Quarantined and
+cancelled items are terminal and allow the drain to continue. Tenant fairness
+is not implemented in this slice.
+
 ## Connector synchronization operations
 
 Authenticated active `organization_admin` users can enqueue, list, inspect, and cancel synchronization jobs for a tenant-owned Local Folder or selected GitHub repository scope:
@@ -43,6 +75,7 @@ Cancellation is database-only and cooperative. Queued and retry-waiting jobs bec
 ```text
 python -m app.server
 python -m infrastructure.workers.connector_sync_worker_host --once
+python -m infrastructure.workers.github_sync_ledger_worker_host
 python -m infrastructure.workers.connector_sync_scheduler_host --once
 python -m alembic -c alembic.ini upgrade head
 python -m infrastructure.bootstrap.sandbox

@@ -179,6 +179,18 @@ SQLAlchemy metadata contains **46 live tables**. Alembic head is `20260831_00002
 | `connector_sync_file_materializations` | Retrieval-isolated Phase 3 file output | UUID PK; one per generation work item; immutable logical identity | Exact repository/blob/commit/profile attribution; no legacy document FK |
 | `connector_sync_file_materialization_chunks` | Ordered staged text and vectors | UUID PK; unique materialization/index; `Vector(1536)` | Generation-owned and excluded from retrieval SQL |
 
+Phase 3 Slice 1 is production verified. Phase 3 Slice 2 is local-only: a
+dedicated default-off GitHub ledger host provides bounded multi-item draining,
+safe claim runway, interruptible empty polling, signal-aware stop-before-claim,
+existing independent lease heartbeat/fencing/retry/cancellation behavior, and
+fixed nonsecret summaries. Expected durable outcomes exit zero and retain their
+meaning in structured status fields; only true host/invariant failures exit
+nonzero. Database `next_attempt_at` controls retry and the future task must use
+zero Cloud Run retries. Real PostgreSQL multi-host tests cover disjoint
+claims and duplicate-free staging. It has not been built or deployed. Tenant
+fairness is still open; generation promotion, deletion reconciliation, cleanup,
+and retrieval switching remain Phase 4.
+
 ### Immutable versions and indexing
 
 | Table | Purpose; tenant ownership | Keys and important relationships | Lifecycle/feature |

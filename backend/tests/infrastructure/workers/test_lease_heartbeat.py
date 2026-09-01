@@ -5,14 +5,30 @@ from uuid import uuid4
 
 import pytest
 
+from domain.connectors.sync_work_ledger import FileWorkLease
 from infrastructure.repositories.connector_sync_job_repository import SyncJobLease
-from infrastructure.workers.lease_heartbeat import LeaseHeartbeat, LeaseHeartbeatFailure
+from infrastructure.repositories.connector_sync_work_ledger_repository import (
+    LostFileWorkLease,
+)
+import infrastructure.workers.lease_heartbeat as heartbeat_module
+from infrastructure.workers.lease_heartbeat import (
+    FileWorkLeaseHeartbeat,
+    LeaseHeartbeat,
+    LeaseHeartbeatFailure,
+)
 
 
 def _lease():
     return SyncJobLease(
         uuid4(), uuid4(), uuid4(), uuid4(), "incremental", "scheduled",
         1, 3, uuid4(), 1, datetime.now(UTC) + timedelta(minutes=5),
+    )
+
+
+def _file_lease():
+    return FileWorkLease(
+        uuid4(), uuid4(), uuid4(), uuid4(), uuid4(), "worker-1", uuid4(),
+        1, 1, 3, datetime.now(UTC) + timedelta(minutes=5),
     )
 
 
@@ -60,6 +76,36 @@ def test_heartbeat_rejection_is_observed_without_retry_loop():
     with pytest.raises(LeaseHeartbeatFailure):
         heartbeat.stop()
     assert execution.heartbeat.call_count == 1
+
+
+def test_file_heartbeat_ignores_only_terminal_fence_loss_after_stop(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    repository = Mock()
+
+    def terminal_race(*_args, **_kwargs):
+        entered.set()
+        assert release.wait(1)
+        raise LostFileWorkLease("terminal transition committed")
+
+    repository.heartbeat.side_effect = terminal_race
+    monkeypatch.setattr(
+        heartbeat_module,
+        "ConnectorSyncWorkLedgerRepository",
+        Mock(return_value=repository),
+    )
+    heartbeat = FileWorkLeaseHeartbeat(
+        lambda: _Session([]), _file_lease(), worker_id="worker-1",
+        lease_duration=timedelta(seconds=1), interval=timedelta(milliseconds=10),
+        shutdown_timeout=timedelta(seconds=1),
+    )
+    heartbeat.__enter__()
+    assert entered.wait(1)
+    heartbeat._stop.set()
+    release.set()
+
+    heartbeat.stop()
+    assert repository.heartbeat.call_count == 1
 
 
 @pytest.mark.parametrize("interval", [0.5, 0.9])

@@ -987,6 +987,12 @@ def test_retry_max_attempt_quarantine_and_barrier_semantics(engine) -> None:
         session.commit()
         assert retry.status is FileWorkStatus.RETRY_WAIT
         assert quarantined.status is FileWorkStatus.QUARANTINED
+        assert repository.claim_next(
+            context[0], generation.generation_id,
+            worker_id="early-platform-retry", now=NOW + timedelta(minutes=9),
+            lease_duration=LEASE,
+        ) is None
+        session.rollback()
 
         repository.mark_discovery_complete(context[0], generation.generation_id, now=NOW)
         assert repository.barrier_summary(context[0], generation.generation_id).barrier_open is False

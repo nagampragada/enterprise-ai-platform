@@ -70,6 +70,23 @@ a stale owner fails before any staged or legacy document row is written.
 Retryable failures use the established bounded retry jitter; safe permanent
 file-level validation/provider failures are quarantined with fixed codes only.
 
+Phase 3 Slice 2 adds no migration. Its dedicated bounded host reuses the same
+`FOR UPDATE SKIP LOCKED` claim, lease, heartbeat, monotonic fence, recovery,
+retry, quarantine, cancellation, and atomic staging/completion operations.
+Each host has independent item and runtime bounds, and a claim is not attempted
+without a configured minimum runtime runway. Real PostgreSQL contention tests
+prove disjoint claims, one materialization per work item, stale-fence rejection,
+expired-lease recovery, independent worker progress, and no generation
+promotion. The global ordering is deterministic, but it is not a durable
+tenant-fair scheduling mechanism; tenant fairness remains a later Phase 3
+requirement.
+
+Retry timing is database-authoritative. A committed `retry_wait` transition
+stores `next_attempt_at`; claim predicates exclude it until that UTC instant.
+The dedicated host exits successfully after the durable transition and its
+Cloud Run task must have platform retries disabled, preventing immediate
+re-entry from bypassing the persisted backoff.
+
 Shadow planning creates or resolves the generation when the legacy cursor first
 pins the default branch commit and root tree. Each discovered batch is registered
 and committed before download/extraction begins. Cursor replay after a crash

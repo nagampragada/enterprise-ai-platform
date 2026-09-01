@@ -129,6 +129,21 @@ gcloud run jobs create $MIGRATION_JOB --image=$IMAGE --region=$REGION --project=
 
 The worker receives no OAuth client secret. Scheduler and migration receive no GitHub, GCP application-secret, or OpenAI settings. Successful work and legitimate no-work both exit zero; fatal startup/database/processing failures remain nonzero.
 
+The dedicated Phase 3 Slice 2 ledger host is implemented locally but is not
+deployed by this runbook. Its future private Cloud Run Job command is
+`python -m infrastructure.workers.github_sync_ledger_worker_host`; it requires
+the same database, OpenAI, GitHub private-key reference, and nonsecret GitHub/
+Secret Manager settings as the connector worker, plus an explicitly authorized
+`GITHUB_SYNC_LEDGER_PROCESSING_ENABLED=true`. Keep it absent or exactly
+lowercase `false` until a separate controlled rollout. Do not give this job the
+GitHub OAuth client secret. Its task timeout must exceed the validated drain and
+graceful shutdown bounds, and set Cloud Run task retries to `0`. Disabled,
+empty, bounded drain, safe signal shutdown, and a durably database-scheduled
+retry all exit `0`; inspect `run_status` and `stop_reason` rather than treating
+those expected outcomes as task failures. The database `next_attempt_at` gate,
+not Cloud Run retry timing, controls another claim. The host does not discover, promote, reconcile, or
+activate retrieval, and tenant fairness remains unimplemented.
+
 Create the bootstrap job with no command-line bootstrap values:
 
 ```powershell

@@ -13,6 +13,9 @@ from infrastructure.repositories.connector_sync_job_repository import SyncJobLea
 from domain.connectors.sync_work_ledger import FileWorkLease
 from infrastructure.repositories.connector_sync_work_ledger_repository import (
     ConnectorSyncWorkLedgerRepository,
+    FileWorkCancellationConflict,
+    LostFileWorkLease,
+    StaleFileWorkFence,
 )
 
 
@@ -156,6 +159,15 @@ class FileWorkLeaseHeartbeat:
                 session.commit()
             except BaseException as error:
                 session.rollback()
+                if self._stop.is_set() and isinstance(
+                    error,
+                    (
+                        FileWorkCancellationConflict,
+                        LostFileWorkLease,
+                        StaleFileWorkFence,
+                    ),
+                ):
+                    return
                 self._failure = error
                 self._stop.set()
                 return

@@ -56,6 +56,48 @@ membership, document, version, indexing, or chunk state. This slice does not
 promote, reconcile, retire, or expose a ledger generation; those generation-wide
 transitions remain future work.
 
+Phase 3 Slice 1 has completed its controlled production verification. Slice 2
+is implemented and validated locally only; its dedicated entry point is
+`python -m infrastructure.workers.github_sync_ledger_worker_host`. Unlike the
+legacy-first connector host, this process can claim only eligible GitHub ledger
+file work. It neither reads nor claims the legacy job queue and cannot plan,
+promote, reconcile, clean up, or switch retrieval. The default-off gate is
+checked before composition and every claim.
+
+One execution drains at most 25 items for at most 20 minutes by default. It
+requires 12 minutes of safe runway before another claim, uses a 15-minute
+lease with a 60-second independent heartbeat, and exits after one empty poll.
+The exact `GITHUB_LEDGER_WORKER_*` controls are listed in `.env.example`; every
+numeric value is a canonical positive integer with a hard maximum. The
+dedicated OpenAI client uses one attempt bounded to 10 minutes; minimum claim
+runway and lease must each cover that timeout plus two heartbeat intervals,
+heartbeat must leave a full renewal margin, and shutdown cannot exceed the
+lease. CLI options use the same
+validators and take deterministic precedence over environment values.
+
+Signals stop new claims. A runtime drain deadline never abandons or falsely
+completes an active lease. After a signal, the active item has the configured
+graceful window; indivisible calls remain provider-timeout-bounded, and grace
+expiry durably schedules fixed-code retry at the next progress boundary. Retry
+scheduling and lease/fence loss stop the current execution; quarantined and
+cancelled terminal items permit later items to proceed. Summary telemetry contains only run/work IDs, counts, bounded byte/
+character/chunk/embedding totals, duration, outcome, and stop reason. Content,
+vectors, provider payloads, URLs, tokens, and credentials are never logged.
+PostgreSQL multi-host tests prove `SKIP LOCKED` disjointness, safe expired
+recovery, stale-fence rejection, convergence without duplicate staging, and
+worker independence. Durable tenant fairness remains unimplemented and is not
+claimed. The dedicated host has not been built or deployed.
+
+Expected durable outcomes return process status `0`: disabled/no work,
+item/runtime bounds, successful drain, cancellation, quarantine, database retry
+scheduling, and safe signal shutdown. Fixed `run_status` and `stop_reason`
+fields distinguish them. Process status `1` is reserved for startup,
+composition, invariant, undurable-transition, and lease/fence failures. The
+database is the retry authority: a retrying item is in `retry_wait` and cannot
+be claimed before `next_attempt_at`. Configure the dedicated Cloud Run task
+with zero platform retries; do not turn a durable application retry into an
+immediate task retry.
+
 GET is a provider-free bounded `(created_at,id)` keyset page of persisted selections, including locally removed history. DELETE is provider-free and idempotently changes the exact tenant/connector-owned scope to `removed`; it does not revoke GitHub access, hard-delete history, or delete content. Neither operation requires GitHub configuration. No selection route enqueues a job, creates a schedule, retrieves content, or writes source/document/index rows. Synchronization is requested separately through the provider-neutral operational API.
 
 ## Internal repository content reader

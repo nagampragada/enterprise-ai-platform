@@ -15,6 +15,7 @@ from infrastructure.repositories.connector_sync_work_ledger_repository import (
 )
 import infrastructure.workers.github_sync_work_item_worker as worker_module
 from infrastructure.workers.github_sync_work_item_worker import (
+    FileWorkGracefulShutdownExpired,
     GitHubSyncWorkItemWorker,
 )
 
@@ -88,7 +89,9 @@ def test_one_claimed_item_is_prepared_and_completed(monkeypatch):
     prepared = Mock()
     service.load_context.return_value = context
     service.persist.return_value = SimpleNamespace(
-        work_item=SimpleNamespace(status=FileWorkStatus.SUCCEEDED)
+        work_item=SimpleNamespace(
+            status=FileWorkStatus.SUCCEEDED, counters=worker_module.FileWorkCounters()
+        )
     )
     preparation.prepare_file.return_value = prepared
     worker = _worker(preparation)
@@ -99,6 +102,96 @@ def test_one_claimed_item_is_prepared_and_completed(monkeypatch):
     preparation.prepare_file.assert_called_once()
     service.persist.assert_called_once()
     assert service.persist.call_args.args[:3] == (lease, context, prepared)
+
+
+def test_heartbeat_remains_active_until_atomic_completion_returns(monkeypatch):
+    events = []
+
+    class RecordingHeartbeat:
+        def __init__(self, *args, **kwargs):
+            self.raise_if_failed = Mock()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            events.append("heartbeat_stopped")
+
+    monkeypatch.setattr(worker_module, "FileWorkLeaseHeartbeat", RecordingHeartbeat)
+    preparation = Mock()
+    service = Mock()
+    lease = _lease()
+    service.load_context.return_value = SimpleNamespace(
+        authorization=Mock(), snapshot=Mock(), entry=Mock(), item_snapshot=Mock()
+    )
+
+    def persist(*_args, **_kwargs):
+        events.append("completion_committed")
+        return SimpleNamespace(
+            work_item=SimpleNamespace(
+                status=FileWorkStatus.SUCCEEDED,
+                counters=worker_module.FileWorkCounters(),
+            )
+        )
+
+    service.persist.side_effect = persist
+    preparation.prepare_file.return_value = Mock()
+    worker = _worker(preparation)
+    worker._recover_and_claim = Mock(return_value=lease)
+    worker._transaction = lambda operation: operation(service)
+
+    assert worker.execute_one() == "completed"
+    assert events == ["completion_committed", "heartbeat_stopped"]
+
+
+def test_detailed_result_reports_only_safe_identity_attempt_and_counters(monkeypatch):
+    monkeypatch.setattr(worker_module, "FileWorkLeaseHeartbeat", _Heartbeat)
+    preparation = Mock()
+    service = Mock()
+    lease = _lease()
+    context = SimpleNamespace(
+        authorization=Mock(),
+        snapshot=Mock(),
+        entry=Mock(),
+        item_snapshot=Mock(),
+    )
+    counters = worker_module.FileWorkCounters(86, 86, 1, 1)
+    service.load_context.return_value = context
+    service.persist.return_value = SimpleNamespace(
+        work_item=SimpleNamespace(
+            status=FileWorkStatus.SUCCEEDED, counters=counters
+        )
+    )
+    preparation.prepare_file.return_value = Mock()
+    worker = _worker(preparation)
+    worker._recover_and_claim = Mock(return_value=lease)
+    worker._transaction = lambda operation: operation(service)
+
+    result = worker.execute_one_result(claim_allowed=lambda: True)
+
+    assert result.outcome == "completed"
+    assert result.work_item_id == lease.work_item_id
+    assert result.attempt_number == lease.attempt_number
+    assert result.counters == counters
+
+
+def test_claim_gate_is_rechecked_inside_claim_transaction(monkeypatch):
+    repository = Mock()
+    monkeypatch.setattr(
+        worker_module,
+        "ConnectorSyncWorkLedgerRepository",
+        Mock(return_value=repository),
+    )
+    session = Mock()
+    worker = _worker()
+    worker._sessions = lambda: session
+
+    assert worker._recover_and_claim(lambda: False) is None
+
+    repository.recover_expired_available.assert_called_once()
+    repository.claim_next_available.assert_not_called()
+    session.commit.assert_called_once()
+    session.close.assert_called_once()
 
 
 def test_cancellation_before_provider_work_is_acknowledged(monkeypatch):
@@ -138,6 +231,42 @@ def test_retryable_provider_failure_uses_existing_failure_transition(monkeypatch
     assert worker.execute_one() == "retry_scheduled"
     worker._fail.assert_called_once()
     service.persist.assert_not_called()
+
+
+def test_shutdown_grace_is_checked_after_context_before_provider_work(monkeypatch):
+    monkeypatch.setattr(worker_module, "FileWorkLeaseHeartbeat", _Heartbeat)
+    preparation = Mock()
+    service = Mock()
+    lease = _lease()
+    service.load_context.return_value = SimpleNamespace(
+        authorization=Mock(), snapshot=Mock(), entry=Mock(), item_snapshot=Mock()
+    )
+    worker = GitHubSyncWorkItemWorker(
+        Mock(),
+        Mock(),
+        preparation,
+        ConnectorSyncRetryPolicy(random_uniform=lambda low, high: low),
+        worker_id="worker-1",
+        lease_duration=timedelta(minutes=15),
+        heartbeat_interval=timedelta(minutes=1),
+        heartbeat_shutdown_timeout=timedelta(seconds=2),
+        recovery_limit=10,
+        clock=lambda: NOW,
+        progress_check=lambda: (_ for _ in ()).throw(
+            FileWorkGracefulShutdownExpired("safe")
+        ),
+    )
+    worker._recover_and_claim = Mock(return_value=lease)
+    worker._transaction = lambda operation: operation(service)
+    worker._fail = Mock(return_value="retry_scheduled")
+
+    result = worker.execute_one_result()
+
+    assert result.outcome == "retry_scheduled"
+    assert result.reason_code == "shutdown_grace_expired"
+    preparation.prepare_file.assert_not_called()
+    worker._fail.assert_called_once()
+    assert isinstance(worker._fail.call_args.args[1], FileWorkGracefulShutdownExpired)
 
 
 def test_transaction_rolls_back_and_closes_on_persistence_failure():
@@ -188,6 +317,47 @@ def test_retryable_failure_records_only_existing_safe_classification(monkeypatch
     assert "unsafe provider detail" not in repr(kwargs)
 
 
+def test_retry_transition_failure_rolls_back_closes_and_propagates(monkeypatch):
+    repository = Mock()
+    repository.record_failure.return_value = SimpleNamespace(
+        status=SimpleNamespace(value="retry_wait")
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "ConnectorSyncWorkLedgerRepository",
+        Mock(return_value=repository),
+    )
+    session = Mock()
+    session.commit.side_effect = RuntimeError("commit failed")
+    worker = _worker()
+    worker._sessions = lambda: session
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        worker._fail(_lease(), TimeoutError("unsafe provider detail"))
+
+    session.rollback.assert_called_once()
+    session.close.assert_called_once()
+
+
+def test_cancellation_transition_failure_rolls_back_closes_and_propagates(monkeypatch):
+    repository = Mock()
+    monkeypatch.setattr(
+        worker_module,
+        "ConnectorSyncWorkLedgerRepository",
+        Mock(return_value=repository),
+    )
+    session = Mock()
+    session.commit.side_effect = RuntimeError("commit failed")
+    worker = _worker()
+    worker._sessions = lambda: session
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        worker._cancel(_lease())
+
+    session.rollback.assert_called_once()
+    session.close.assert_called_once()
+
+
 def test_permanent_validation_failure_is_quarantined_with_safe_code(monkeypatch):
     repository = Mock()
     repository.record_failure.return_value = SimpleNamespace(
@@ -212,3 +382,34 @@ def test_permanent_validation_failure_is_quarantined_with_safe_code(monkeypatch)
     assert kwargs["retry_at"] is None
     assert kwargs["quarantine_reason_code"] == "request_invalid"
     assert "unsafe detail" not in repr(kwargs)
+
+
+def test_expired_shutdown_grace_uses_bounded_internal_retry_transition(monkeypatch):
+    repository = Mock()
+    repository.record_failure.return_value = SimpleNamespace(
+        status=SimpleNamespace(value="retry_wait")
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "ConnectorSyncWorkLedgerRepository",
+        Mock(return_value=repository),
+    )
+    session = Mock()
+    worker = _worker()
+    worker._sessions = lambda: session
+
+    assert worker._fail(
+        _lease(), FileWorkGracefulShutdownExpired("unsafe detail")
+    ) == "retry_scheduled"
+
+    kwargs = repository.record_failure.call_args.kwargs
+    assert kwargs["error_category"] == "internal"
+    assert kwargs["error_code"] == "shutdown_grace_expired"
+    assert kwargs["retry_at"] == NOW + timedelta(seconds=15)
+    assert "unsafe detail" not in repr(kwargs)
+
+
+def test_shutdown_retry_does_not_extend_shared_failure_kind_taxonomy():
+    from application.services.connector_sync_retry_policy import SyncFailureKind
+
+    assert "graceful_shutdown" not in {kind.value for kind in SyncFailureKind}
