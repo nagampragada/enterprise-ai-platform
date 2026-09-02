@@ -1,16 +1,90 @@
 # Database Architecture
 
-## Retrieval-isolated file-work materialization (`20260831_000021`)
+## Organization-fair ledger claims (`20260902_000022`)
 
 The Phase 3 expand-migration rollout uses an explicit schema compatibility
-window. The application head remains `20260831_000021`, while readiness accepts
-exactly `20260828_000020` and `20260831_000021`. At the predecessor revision it
+window. The application head is `20260902_000022`, while readiness accepts
+exactly `20260831_000021` and `20260902_000022`. At the predecessor revision it
 reports compatible but not current with migration required; at the application
 head it reports compatible and current. There is no lexical ordering, prefix,
 timestamp, minimum-version, or range comparison, and multiple or unknown heads
-fail closed. Compatibility with `20260828_000020` is temporary rollout policy
+fail closed. Compatibility with `20260831_000021` is temporary rollout policy
 and must be removed in a later cleanup only after every environment reaches
-`20260831_000021`.
+`20260902_000022`.
+
+Migration `20260902_000022` adds only
+`connector_sync_organization_claim_schedules` and the monotonic
+`connector_sync_org_fair_claim_seq`. One organization-scoped row records the
+last committed fair-claim sequence, total committed claims, and safe timestamps.
+No row is required before an organization's first claim; absence means never
+served and receives priority. A never-served candidate is selected by an
+indexed correlated eligibility probe and locked through its `organizations`
+row. Served candidates are selected through the schedule ordering index and
+the same eligibility probe. This avoids grouping or materializing the complete
+claimable file backlog on every claim. The table contains no provider content,
+credentials, retrieval data, or paid-tier weighting. The additive partial
+`ix_sync_file_work_fair_eligible` index supports profile/organization-specific
+existence and item probes over currently pending/retry work; the existing claim
+indexes continue to support generation-scoped legacy operations.
+
+The dedicated GitHub ledger host intrinsically uses least-recently-served
+organization scheduling. It derives only organizations with currently eligible
+GitHub/profile work, orders never-served organizations first and then committed
+claim sequence, and uses organization UUID as the deterministic tie-breaker.
+It locks a never-served `organizations` row or a previously served schedule row
+with `FOR UPDATE SKIP LOCKED`, then locks that organization's existing
+deterministic generation/item candidate. If a selected tenant has no unlocked
+candidate, the transaction excludes it and probes another tenant, bounded to
+500 candidates; a later poll reconsiders every skipped tenant.
+Item lease/fence creation and schedule advancement are flushed and committed in
+the same caller-owned transaction. A missing candidate, failure, or rollback
+does not durably consume the turn. PostgreSQL `nextval` is deliberately not
+transactional, so a failed transaction may leave a sequence gap. Gaps are not
+claims and are never interpreted as counters: only a schedule value committed
+with its item lease is a completed scheduling turn. Sequence values are used
+only for ordering and are never reset or rewound by recovery. Separate workers
+can lock separate organizations; they cannot claim the same item or concurrently
+advance the same schedule row.
+
+The fairness guarantee is scheduling-turn based: for a fixed continuously
+eligible population, subject to database transactions making progress and no
+organization remaining perpetually locked, every organization eventually gets
+a committed claim turn and one large backlog cannot indefinitely bypass a
+smaller one. Never-served arrivals are prioritized, so the guarantee assumes
+there is not an unbounded stream of newcomers permanently ahead of the fixed
+population. This is not a wall-clock latency SLA. It is not an active-processing
+cap: after one claim transaction commits, another worker may claim another item
+for that organization while its first item is still running. Worker concurrency
+and provider processing duration are therefore separate from equal turn order.
+Retry-wait work re-enters only at
+`next_attempt_at`; cancelled, quarantined, terminal, incomplete-discovery,
+incompatible-profile, and otherwise unsupported work earns no turn. Recovery
+does not erase a turn already consumed by the original lease, and a replacement
+claim receives a new normal fair turn and fencing token.
+
+Schedule rows are retained while their organization exists, including when it
+temporarily has no eligible work; later generations resume from the retained
+least-recently-served position. Organization deletion cascades only its schedule
+row. Ledger and materialization foreign-key lifecycles are unchanged. Any broader
+retention or cleanup policy remains a future Phase 4 concern.
+
+Migration `20260902_000022` creates `ix_sync_file_work_fair_eligible` with an
+ordinary transactional `CREATE INDEX`. PostgreSQL can hold a table-level lock
+that blocks concurrent writes while this index is built. This repository has no
+established concurrent-index/Alembic autocommit convention, and the revision also
+creates transactional table and sequence state, so the migration does not claim
+zero-lock rollout. Operators must preflight ledger size and active writers and
+apply it in a bounded migration window; a later dedicated migration may adopt a
+tested concurrent-index convention if production volume requires one.
+
+The API does not query the schedule table during startup or readiness, so the
+compatible predecessor remains safe during the expand migration. The legacy
+synchronization queue and legacy-first optional ledger path retain their
+existing ordering. Fairness is limited to the dedicated host; promotion,
+reconciliation, deletion, staging publication, cleanup, and retrieval switching
+remain future work.
+
+## Retrieval-isolated file-work materialization (`20260831_000021`)
 
 Migration `20260828_000020` adds the feature-gated `connector_sync_generations`
 and `connector_sync_file_work_items` control-plane tables. When the optional
@@ -78,8 +152,8 @@ without a configured minimum runtime runway. Real PostgreSQL contention tests
 prove disjoint claims, one materialization per work item, stale-fence rejection,
 expired-lease recovery, independent worker progress, and no generation
 promotion. The global ordering is deterministic, but it is not a durable
-tenant-fair scheduling mechanism; tenant fairness remains a later Phase 3
-requirement.
+tenant-fair scheduling mechanism. Slice 3 replaces that ordering only in the
+dedicated path with the durable organization-fair transaction above.
 
 Retry timing is database-authoritative. A committed `retry_wait` transition
 stores `next_attempt_at`; claim predicates exclude it until that UTC instant.

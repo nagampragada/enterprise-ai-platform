@@ -48,8 +48,24 @@ terminal transition, or lease/fence correctness loss. A retryable failure stops
 the execution only after database backoff is durable; `next_attempt_at` remains
 the claim authority and the future Cloud Run Job must use task retries `0` so a
 platform retry cannot compete with application backoff. Quarantined and
-cancelled items are terminal and allow the drain to continue. Tenant fairness
-is not implemented in this slice.
+cancelled items are terminal and allow the drain to continue.
+
+Phase 3 Slice 3 makes organization fairness intrinsic to the dedicated host;
+there is no bypass flag or weight configuration. Never-served eligible
+organizations precede served organizations, then the least committed claim
+sequence and organization UUID determine selection. Indexed correlated probes
+avoid grouping the full claimable backlog. The never-served organization row or
+served schedule row, item lease/fence, and durable scheduling-state advancement
+share one database transaction. Retry-wait and ineligible work receive no turn;
+rollback leaves no durable turn but may leave an expected PostgreSQL sequence
+gap, and expired-lease recovery never rewinds the original turn. This is equal
+committed scheduling-turn order, not a wall-clock SLA or per-organization active
+processing cap: later committed claims for the same organization may overlap in
+processing. Safe item
+telemetry adds only organization UUID and committed fairness sequence;
+summaries add the distinct organizations whose committed claims were processed.
+No tenant name, content, provider payload, URL,
+credential, or vector is logged.
 
 ## Connector synchronization operations
 
@@ -83,6 +99,6 @@ python -m infrastructure.bootstrap.sandbox
 
 The API launcher runs one Uvicorn process on `0.0.0.0` with a validated `PORT`; reload and debug behavior are absent. `APP_ENVIRONMENT` accepts only `development`, `test`, `sandbox`, and `production`. Its deliberate missing-value default is `development`, never production. Sandbox and production require a non-development PostgreSQL URL plus distinct strong JWT and refresh-token secrets. Validation is process-specific so provider credentials are not required by operations that do not consume them.
 
-`GET /health` is dependency-free liveness. `GET /api/v1/health` is readiness: it returns 200 only when configuration is valid, bounded database checks succeed, the schema is in the exact transition allowlist, and required GitHub/Secret Manager composition is available in a strict runtime. The Phase 3 application explicitly accepts only `20260828_000020` and `20260831_000021`; it reports compatibility, currentness, and migration requirement separately. Revision `20260828_000020` remains ready but is not represented as current. Unknown, missing, malformed, newer, older, or multiple heads fail closed. The endpoint uses only fixed values and never retrieves provider secrets.
+`GET /health` is dependency-free liveness. `GET /api/v1/health` is readiness: it returns 200 only when configuration is valid, bounded database checks succeed, the schema is in the exact transition allowlist, and required GitHub/Secret Manager composition is available in a strict runtime. The Phase 3 Slice 3 application explicitly accepts only `20260831_000021` and `20260902_000022`; it reports compatibility, currentness, and migration requirement separately. Revision `20260831_000021` remains ready but is not represented as current. Unknown, missing, malformed, newer, older, or multiple heads fail closed. The endpoint uses only fixed values and never retrieves provider secrets.
 
 The image and runbook are implemented and statically tested, but no image or cloud resource has been built or deployed. See `GCP_GITHUB_SANDBOX_RUNBOOK.md`.

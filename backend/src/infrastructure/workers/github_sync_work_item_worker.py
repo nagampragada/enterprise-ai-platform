@@ -62,6 +62,8 @@ class GitHubFileWorkExecution:
     attempt_number: int | None = None
     counters: FileWorkCounters = FileWorkCounters()
     reason_code: str | None = None
+    organization_id: UUID | None = None
+    fairness_claim_sequence: int | None = None
 
 
 class FileWorkGracefulShutdownExpired(RuntimeError):
@@ -83,6 +85,7 @@ class GitHubSyncWorkItemWorker:
         heartbeat_interval: timedelta,
         heartbeat_shutdown_timeout: timedelta,
         recovery_limit: int,
+        organization_fair_claims: bool = False,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         progress_check: Callable[[], None] = lambda: None,
     ) -> None:
@@ -95,6 +98,7 @@ class GitHubSyncWorkItemWorker:
         self._heartbeat_interval = heartbeat_interval
         self._heartbeat_shutdown_timeout = heartbeat_shutdown_timeout
         self._recovery_limit = recovery_limit
+        self._organization_fair_claims = organization_fair_claims
         self._clock = clock
         self._progress_check = progress_check
 
@@ -162,24 +166,34 @@ class GitHubSyncWorkItemWorker:
                 lease.work_item_id,
                 lease.attempt_number,
                 result.work_item.counters,
+                organization_id=lease.organization_id,
+                fairness_claim_sequence=lease.fairness_claim_sequence,
             )
         except FileWorkCancellationConflict:
             return GitHubFileWorkExecution(
-                self._cancel(lease), lease.work_item_id, lease.attempt_number
+                self._cancel(lease), lease.work_item_id, lease.attempt_number,
+                organization_id=lease.organization_id,
+                fairness_claim_sequence=lease.fairness_claim_sequence,
             )
         except (LostFileWorkLease, StaleFileWorkFence):
             return GitHubFileWorkExecution(
-                "lost_lease", lease.work_item_id, lease.attempt_number
+                "lost_lease", lease.work_item_id, lease.attempt_number,
+                organization_id=lease.organization_id,
+                fairness_claim_sequence=lease.fairness_claim_sequence,
             )
         except LeaseHeartbeatFailure as error:
             cause = error.__cause__
             if isinstance(cause, FileWorkCancellationConflict):
                 return GitHubFileWorkExecution(
-                    self._cancel(lease), lease.work_item_id, lease.attempt_number
+                    self._cancel(lease), lease.work_item_id, lease.attempt_number,
+                    organization_id=lease.organization_id,
+                    fairness_claim_sequence=lease.fairness_claim_sequence,
                 )
             if isinstance(cause, (LostFileWorkLease, StaleFileWorkFence)):
                 return GitHubFileWorkExecution(
-                    "lost_lease", lease.work_item_id, lease.attempt_number
+                    "lost_lease", lease.work_item_id, lease.attempt_number,
+                    organization_id=lease.organization_id,
+                    fairness_claim_sequence=lease.fairness_claim_sequence,
                 )
             return self._failure_execution(lease, error)
         except Exception as error:
@@ -200,6 +214,8 @@ class GitHubSyncWorkItemWorker:
             lease.work_item_id,
             lease.attempt_number,
             reason_code=reason_code,
+            organization_id=lease.organization_id,
+            fairness_claim_sequence=lease.fairness_claim_sequence,
         )
 
     def _recover_and_claim(
@@ -216,7 +232,12 @@ class GitHubSyncWorkItemWorker:
             )
             lease = None
             if claim_allowed():
-                lease = repository.claim_next_available(
+                claim = (
+                    repository.claim_next_available_fair
+                    if self._organization_fair_claims
+                    else repository.claim_next_available
+                )
+                lease = claim(
                     provider_key="github",
                     profile_fingerprint=self._preparation.profile.fingerprint,
                     worker_id=self._worker_id,

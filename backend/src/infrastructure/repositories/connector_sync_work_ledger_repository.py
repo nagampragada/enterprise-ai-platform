@@ -9,7 +9,9 @@ from datetime import datetime, timedelta
 from typing import Callable
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, select, tuple_
+from sqlalchemy import BigInteger
+from sqlalchemy import Sequence as SqlSequence
+from sqlalchemy import exists, func, select, tuple_
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -37,11 +39,17 @@ from infrastructure.db.models import (
     ConnectorSyncFileWorkItem,
     ConnectorSyncGeneration,
     ConnectorSyncJob,
+    ConnectorSyncOrganizationClaimSchedule,
+    Organization,
 )
 
 
 MAX_CLAIM_LIMIT = 500
 MAX_LEASE_SECONDS = 3600
+MAX_FAIR_SELECTION_ATTEMPTS = 500
+FAIR_CLAIM_SEQUENCE = SqlSequence(
+    "connector_sync_org_fair_claim_seq", data_type=BigInteger()
+)
 FAILURE_CATEGORIES = frozenset(
     {
         "configuration",
@@ -483,6 +491,222 @@ class ConnectorSyncWorkLedgerRepository:
             .limit(1)
         )
         return self._claim_one(statement, worker_id=worker_id, now=now, lease_duration=lease_duration)
+
+    def claim_next_available_fair(
+        self,
+        *,
+        provider_key: str,
+        profile_fingerprint: str,
+        worker_id: str,
+        now: datetime,
+        lease_duration: timedelta,
+    ) -> FileWorkLease | None:
+        """Atomically claim from the least-recently-served eligible organization."""
+        provider_key = _code("provider_key", provider_key, 64)
+        profile_fingerprint = _identifier(
+            "profile_fingerprint", profile_fingerprint, 255
+        )
+        worker_id = _worker_id(worker_id)
+        now = _aware("now", now)
+        lease_duration = _lease_duration(lease_duration)
+
+        attempted_organizations: set[UUID] = set()
+        for _ in range(MAX_FAIR_SELECTION_ATTEMPTS):
+            selected = self._select_fair_organization(
+                provider_key=provider_key,
+                profile_fingerprint=profile_fingerprint,
+                now=now,
+                excluded=attempted_organizations,
+            )
+            if selected is None:
+                return None
+            organization_id, schedule = selected
+            lease = self._claim_fair_organization_item(
+                organization_id=organization_id,
+                provider_key=provider_key,
+                profile_fingerprint=profile_fingerprint,
+                worker_id=worker_id,
+                now=now,
+                lease_duration=lease_duration,
+            )
+            if lease is None:
+                attempted_organizations.add(organization_id)
+                continue
+
+            try:
+                claim_sequence = self._session.scalar(
+                    select(FAIR_CLAIM_SEQUENCE.next_value())
+                )
+            except SQLAlchemyError as exc:
+                raise SyncWorkLedgerPersistenceError(
+                    "fair organization sequence allocation failed"
+                ) from exc
+            if not isinstance(claim_sequence, int) or claim_sequence < 1:
+                raise SyncWorkLedgerPersistenceError(
+                    "fair organization sequence allocation was invalid"
+                )
+            if schedule is None:
+                schedule = ConnectorSyncOrganizationClaimSchedule(
+                    organization_id=organization_id,
+                    last_claim_sequence=claim_sequence,
+                    claim_count=1,
+                    last_claimed_at=now,
+                    created_at=now,
+                    updated_at=now,
+                )
+                self._session.add(schedule)
+            else:
+                schedule.last_claim_sequence = claim_sequence
+                schedule.claim_count += 1
+                schedule.last_claimed_at = now
+                schedule.updated_at = now
+            self._flush("fair organization claim could not be advanced")
+            return FileWorkLease(
+                lease.organization_id,
+                lease.connector_id,
+                lease.connector_scope_id,
+                lease.generation_id,
+                lease.work_item_id,
+                lease.worker_id,
+                lease.lease_id,
+                lease.fencing_token,
+                lease.attempt_number,
+                lease.max_attempts,
+                lease.lease_expires_at,
+                fairness_claim_sequence=claim_sequence,
+            )
+        return None
+
+    def _select_fair_organization(
+        self,
+        *,
+        provider_key: str,
+        profile_fingerprint: str,
+        now: datetime,
+        excluded: set[UUID],
+    ) -> tuple[UUID, ConnectorSyncOrganizationClaimSchedule | None] | None:
+        excluded_ids = tuple(sorted(excluded))
+        eligible_without_schedule = select(Organization.id).where(
+            ~exists(
+                select(1).where(
+                    ConnectorSyncOrganizationClaimSchedule.organization_id
+                    == Organization.id
+                )
+            ),
+            _eligible_file_work_candidate(
+                organization_id=Organization.id,
+                provider_key=provider_key,
+                profile_fingerprint=profile_fingerprint,
+                now=now,
+            ).is_not(None),
+        )
+        if excluded_ids:
+            eligible_without_schedule = eligible_without_schedule.where(
+                Organization.id.not_in(excluded_ids)
+            )
+        organization_id = self._scalar(
+            eligible_without_schedule.order_by(Organization.id)
+            .with_for_update(of=Organization, skip_locked=True)
+            .limit(1),
+            "never-served fair organization selection failed",
+        )
+        if organization_id is not None:
+            return organization_id, None
+
+        served = select(ConnectorSyncOrganizationClaimSchedule).where(
+            _eligible_file_work_candidate(
+                organization_id=ConnectorSyncOrganizationClaimSchedule.organization_id,
+                provider_key=provider_key,
+                profile_fingerprint=profile_fingerprint,
+                now=now,
+            ).is_not(None)
+        )
+        if excluded_ids:
+            served = served.where(
+                ConnectorSyncOrganizationClaimSchedule.organization_id.not_in(
+                    excluded_ids
+                )
+            )
+        schedule = self._one(
+            served.order_by(
+                ConnectorSyncOrganizationClaimSchedule.last_claim_sequence,
+                ConnectorSyncOrganizationClaimSchedule.organization_id,
+            )
+            .with_for_update(
+                of=ConnectorSyncOrganizationClaimSchedule,
+                skip_locked=True,
+            )
+            .limit(1),
+            "served fair organization selection failed",
+        )
+        if schedule is None:
+            return None
+        return schedule.organization_id, schedule
+
+    def _claim_fair_organization_item(
+        self,
+        *,
+        organization_id: UUID,
+        provider_key: str,
+        profile_fingerprint: str,
+        worker_id: str,
+        now: datetime,
+        lease_duration: timedelta,
+    ) -> FileWorkLease | None:
+        statement = (
+            select(ConnectorSyncFileWorkItem)
+            .join(
+                ConnectorSyncGeneration,
+                (ConnectorSyncGeneration.organization_id == ConnectorSyncFileWorkItem.organization_id)
+                & (ConnectorSyncGeneration.connector_id == ConnectorSyncFileWorkItem.connector_id)
+                & (
+                    ConnectorSyncGeneration.connector_scope_id
+                    == ConnectorSyncFileWorkItem.connector_scope_id
+                )
+                & (ConnectorSyncGeneration.id == ConnectorSyncFileWorkItem.generation_id)
+                & (
+                    ConnectorSyncGeneration.profile_fingerprint
+                    == ConnectorSyncFileWorkItem.profile_fingerprint
+                ),
+            )
+            .join(
+                ConnectorSyncJob,
+                (ConnectorSyncJob.organization_id == ConnectorSyncGeneration.organization_id)
+                & (ConnectorSyncJob.connector_id == ConnectorSyncGeneration.connector_id)
+                & (ConnectorSyncJob.connector_scope_id == ConnectorSyncGeneration.connector_scope_id)
+                & (ConnectorSyncJob.id == ConnectorSyncGeneration.sync_job_id),
+            )
+            .where(
+                ConnectorSyncFileWorkItem.organization_id == organization_id,
+                ConnectorSyncGeneration.provider_key == provider_key,
+                ConnectorSyncGeneration.profile_fingerprint == profile_fingerprint,
+                ConnectorSyncFileWorkItem.profile_fingerprint == profile_fingerprint,
+                ConnectorSyncGeneration.status == RepositoryGenerationStatus.PROCESSING.value,
+                ConnectorSyncGeneration.discovery_complete.is_(True),
+                ConnectorSyncJob.status != "cancelled",
+                ConnectorSyncJob.cancel_requested_at.is_(None),
+                ConnectorSyncFileWorkItem.status.in_(
+                    (FileWorkStatus.PENDING.value, FileWorkStatus.RETRY_WAIT.value)
+                ),
+                ConnectorSyncFileWorkItem.next_attempt_at <= now,
+                ConnectorSyncFileWorkItem.cancel_requested_at.is_(None),
+                ConnectorSyncFileWorkItem.attempt_count < ConnectorSyncFileWorkItem.max_attempts,
+            )
+            .order_by(
+                ConnectorSyncGeneration.created_at,
+                ConnectorSyncGeneration.id,
+                ConnectorSyncFileWorkItem.next_attempt_at,
+                ConnectorSyncFileWorkItem.id,
+            )
+            .with_for_update(of=ConnectorSyncFileWorkItem, skip_locked=True)
+            .limit(1)
+        )
+        return self._claim_one(
+            statement,
+            worker_id=worker_id,
+            now=now,
+            lease_duration=lease_duration,
+        )
 
     def _claim_one(
         self,
@@ -1060,6 +1284,12 @@ class ConnectorSyncWorkLedgerRepository:
         except SQLAlchemyError as exc:
             raise SyncWorkLedgerPersistenceError(message) from exc
 
+    def _scalar(self, statement, message: str):
+        try:
+            return self._session.execute(statement).scalar_one_or_none()
+        except SQLAlchemyError as exc:
+            raise SyncWorkLedgerPersistenceError(message) from exc
+
     def _all(self, statement, message: str):
         try:
             return list(self._session.execute(statement).scalars().all())
@@ -1073,6 +1303,72 @@ class ConnectorSyncWorkLedgerRepository:
             raise SyncWorkLedgerConflict(message) from exc
         except SQLAlchemyError as exc:
             raise SyncWorkLedgerPersistenceError(message) from exc
+
+
+def _eligible_file_work_candidate(
+    *,
+    organization_id,
+    provider_key: str,
+    profile_fingerprint: str,
+    now: datetime,
+):
+    return (
+        select(ConnectorSyncFileWorkItem.id)
+        .select_from(ConnectorSyncFileWorkItem)
+        .join(
+            ConnectorSyncGeneration,
+            (
+                ConnectorSyncGeneration.organization_id
+                == ConnectorSyncFileWorkItem.organization_id
+            )
+            & (
+                ConnectorSyncGeneration.connector_id
+                == ConnectorSyncFileWorkItem.connector_id
+            )
+            & (
+                ConnectorSyncGeneration.connector_scope_id
+                == ConnectorSyncFileWorkItem.connector_scope_id
+            )
+            & (
+                ConnectorSyncGeneration.id
+                == ConnectorSyncFileWorkItem.generation_id
+            )
+            & (
+                ConnectorSyncGeneration.profile_fingerprint
+                == ConnectorSyncFileWorkItem.profile_fingerprint
+            ),
+        )
+        .join(
+            ConnectorSyncJob,
+            (ConnectorSyncJob.organization_id == ConnectorSyncGeneration.organization_id)
+            & (ConnectorSyncJob.connector_id == ConnectorSyncGeneration.connector_id)
+            & (
+                ConnectorSyncJob.connector_scope_id
+                == ConnectorSyncGeneration.connector_scope_id
+            )
+            & (ConnectorSyncJob.id == ConnectorSyncGeneration.sync_job_id),
+        )
+        .where(
+            ConnectorSyncFileWorkItem.organization_id == organization_id,
+            ConnectorSyncGeneration.provider_key == provider_key,
+            ConnectorSyncGeneration.profile_fingerprint == profile_fingerprint,
+            ConnectorSyncFileWorkItem.profile_fingerprint == profile_fingerprint,
+            ConnectorSyncGeneration.status
+            == RepositoryGenerationStatus.PROCESSING.value,
+            ConnectorSyncGeneration.discovery_complete.is_(True),
+            ConnectorSyncJob.status != "cancelled",
+            ConnectorSyncJob.cancel_requested_at.is_(None),
+            ConnectorSyncFileWorkItem.status.in_(
+                (FileWorkStatus.PENDING.value, FileWorkStatus.RETRY_WAIT.value)
+            ),
+            ConnectorSyncFileWorkItem.next_attempt_at <= now,
+            ConnectorSyncFileWorkItem.cancel_requested_at.is_(None),
+            ConnectorSyncFileWorkItem.attempt_count
+            < ConnectorSyncFileWorkItem.max_attempts,
+        )
+        .limit(1)
+        .scalar_subquery()
+    )
 
 
 def _generation_matches(row, request: RepositoryGenerationRegistration) -> bool:

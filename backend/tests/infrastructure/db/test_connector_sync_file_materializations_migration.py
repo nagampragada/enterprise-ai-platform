@@ -21,7 +21,7 @@ PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
 INI = ROOT / "alembic.ini"
 TEST_URL = "TEST_DATABASE_URL"
 DEV_URL = "DATABASE_URL"
-REVISION = "20260831_000021"
+REVISION = "20260902_000022"
 PRIOR_REVISION = "20260828_000020"
 
 
@@ -32,6 +32,7 @@ def _identity(url: str) -> tuple[object, ...]:
 
 def _config(url: str) -> Config:
     value = Config(str(INI))
+    value.set_main_option("script_location", str(ROOT / "alembic"))
     value.set_main_option("sqlalchemy.url", url)
     return value
 
@@ -150,9 +151,9 @@ def test_materialization_revision_downgrades_without_removing_phase1_ledger(
         monkeypatch.setattr(db_health, "engine", downgraded)
         compatibility = db_health.check_database_connection()
         assert compatibility.healthy is True
-        assert compatibility.schema_compatible is True
+        assert compatibility.schema_compatible is False
         assert compatibility.schema_current is False
-        assert compatibility.migration_required is True
+        assert compatibility.migration_required is False
     finally:
         downgraded.dispose()
     command.upgrade(_config(url), REVISION)

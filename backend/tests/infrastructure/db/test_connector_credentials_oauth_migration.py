@@ -77,7 +77,7 @@ def _setup(engine):
 
 def test_schema_matches_orm_and_removes_legacy_connector_source(engine):
     inspector = inspect(engine)
-    assert len(Base.metadata.tables) == 46
+    assert len(Base.metadata.tables) == 47
     assert {"connector_credentials", "oauth_authorization_transactions"}.issubset(
         inspector.get_table_names(schema="public")
     )
@@ -181,6 +181,7 @@ def test_downgrade_guard_and_reupgrade(engine):
         "connector_sync_file_work_items",
         "connector_sync_file_materializations",
         "connector_sync_file_materialization_chunks",
+        "connector_sync_organization_claim_schedules",
     }
     connector_columns = {item["name"] for item in inspect(engine).get_columns("connectors")}
     assert {"secret_reference", "credential_status", "credential_expires_at"}.issubset(connector_columns)

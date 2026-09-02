@@ -263,6 +263,14 @@ class FileWorkLease:
     attempt_number: int
     max_attempts: int
     lease_expires_at: datetime
+    fairness_claim_sequence: int | None = None
+
+    def __post_init__(self) -> None:
+        value = self.fairness_claim_sequence
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+        ):
+            raise ValueError("fairness_claim_sequence must be a positive integer")
 
 
 @dataclass(frozen=True)

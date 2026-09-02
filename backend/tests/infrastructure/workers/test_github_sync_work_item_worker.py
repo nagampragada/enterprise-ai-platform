@@ -194,6 +194,27 @@ def test_claim_gate_is_rechecked_inside_claim_transaction(monkeypatch):
     session.close.assert_called_once()
 
 
+def test_dedicated_fair_claim_uses_only_fair_repository_path(monkeypatch):
+    repository = Mock()
+    repository.claim_next_available_fair.return_value = None
+    monkeypatch.setattr(
+        worker_module,
+        "ConnectorSyncWorkLedgerRepository",
+        Mock(return_value=repository),
+    )
+    session = Mock()
+    worker = _worker()
+    worker._sessions = lambda: session
+    worker._organization_fair_claims = True
+
+    assert worker._recover_and_claim() is None
+
+    repository.claim_next_available_fair.assert_called_once()
+    repository.claim_next_available.assert_not_called()
+    session.commit.assert_called_once()
+    session.close.assert_called_once()
+
+
 def test_cancellation_before_provider_work_is_acknowledged(monkeypatch):
     monkeypatch.setattr(worker_module, "FileWorkLeaseHeartbeat", _Heartbeat)
     preparation = Mock()

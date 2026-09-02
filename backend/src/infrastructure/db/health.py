@@ -12,10 +12,10 @@ from infrastructure.db.engine import engine
 
 
 logger = logging.getLogger(__name__)
-EXPECTED_ALEMBIC_REVISION = "20260831_000021"
+EXPECTED_ALEMBIC_REVISION = "20260902_000022"
 COMPATIBLE_ALEMBIC_REVISIONS = frozenset(
     {
-        "20260828_000020",
+        "20260831_000021",
         EXPECTED_ALEMBIC_REVISION,
     }
 )

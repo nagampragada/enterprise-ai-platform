@@ -23,7 +23,7 @@ from infrastructure.db.models import (
 )
 
 
-EXPECTED_REVISION = "20260831_000021"
+EXPECTED_REVISION = "20260902_000022"
 VALIDATED_DATABASE_SETTING = (
     "postgresql+psycopg://bootstrap:Safe-Test-Value-123!"
     "@database.internal:5432/platform"

@@ -37,6 +37,7 @@ class ScriptedWorker:
         advance=0.0,
         on_execute=None,
         reason_code=None,
+        organization_id=None,
     ):
         self.outcomes = list(outcomes)
         self.calls = 0
@@ -44,6 +45,7 @@ class ScriptedWorker:
         self.advance = advance
         self.on_execute = on_execute
         self.reason_code = reason_code
+        self.organization_id = organization_id
 
     def execute_one_result(self, *, claim_allowed):
         self.calls += 1
@@ -67,6 +69,8 @@ class ScriptedWorker:
             1,
             counters,
             self.reason_code,
+            self.organization_id,
+            7 if self.organization_id is not None else None,
         )
 
 
@@ -453,7 +457,8 @@ def test_terminal_quarantine_and_cancellation_do_not_block_other_items():
 
 def test_summary_and_item_logs_are_structured_and_do_not_include_payloads():
     logger = Mock()
-    worker = ScriptedWorker(["completed"])
+    organization_id = uuid4()
+    worker = ScriptedWorker(["completed"], organization_id=organization_id)
     host = GitHubSyncLedgerWorkerHost(
         worker,
         _settings(max_items_per_execution=1),
@@ -473,6 +478,9 @@ def test_summary_and_item_logs_are_structured_and_do_not_include_payloads():
     assert "run_status=partial" in rendered
     assert "graceful_shutdown=false" in rendered
     assert "partial_drain=true" in rendered
+    assert f"organization_id={organization_id}" in rendered
+    assert "fairness_claim_sequence=7" in rendered
+    assert "organizations_served=1" in rendered
     for forbidden in (
         "DATABASE_URL",
         "postgresql://",
@@ -532,6 +540,12 @@ def test_dedicated_composition_builds_only_file_work_processor_when_enabled(
 
     assert isinstance(host, GitHubSyncLedgerWorkerHost)
     host_module.GitHubSyncWorkItemWorker.assert_called_once()
+    assert (
+        host_module.GitHubSyncWorkItemWorker.call_args.kwargs[
+            "organization_fair_claims"
+        ]
+        is True
+    )
     host_module.OpenAI.assert_called_once_with(timeout=600.0, max_retries=0)
     assert "ConnectorSyncJobRepository" not in vars(host_module)
     assert "GitHubSyncWorker" not in vars(host_module)

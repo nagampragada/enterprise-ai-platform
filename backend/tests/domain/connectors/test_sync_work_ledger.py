@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
@@ -9,6 +9,7 @@ import pytest
 from domain.connectors.sync_work_ledger import (
     FileWorkCounters,
     FileWorkManifestEntry,
+    FileWorkLease,
     FileWorkMaterialization,
     FileWorkMaterializationChunk,
     RepositoryGenerationRegistration,
@@ -161,3 +162,14 @@ def test_safe_counters_enforce_hard_bounds() -> None:
         FileWorkCounters(downloaded_bytes=1_073_741_825)
     with pytest.raises(ValueError):
         FileWorkCounters(chunk_count=100_001)
+
+
+def test_file_work_lease_requires_positive_fairness_sequence() -> None:
+    values = (
+        uuid4(), uuid4(), uuid4(), uuid4(), uuid4(), "worker", uuid4(),
+        1, 1, 3, NOW + timedelta(minutes=5),
+    )
+    fair = FileWorkLease(*values, fairness_claim_sequence=9)
+    assert fair.fairness_claim_sequence == 9
+    with pytest.raises(ValueError, match="positive"):
+        FileWorkLease(*values, fairness_claim_sequence=0)

@@ -129,8 +129,8 @@ gcloud run jobs create $MIGRATION_JOB --image=$IMAGE --region=$REGION --project=
 
 The worker receives no OAuth client secret. Scheduler and migration receive no GitHub, GCP application-secret, or OpenAI settings. Successful work and legitimate no-work both exit zero; fatal startup/database/processing failures remain nonzero.
 
-The dedicated Phase 3 Slice 2 ledger host is implemented locally but is not
-deployed by this runbook. Its future private Cloud Run Job command is
+The dedicated Phase 3 ledger host is not deployed by this runbook. Its private
+Cloud Run Job command is
 `python -m infrastructure.workers.github_sync_ledger_worker_host`; it requires
 the same database, OpenAI, GitHub private-key reference, and nonsecret GitHub/
 Secret Manager settings as the connector worker, plus an explicitly authorized
@@ -141,8 +141,10 @@ graceful shutdown bounds, and set Cloud Run task retries to `0`. Disabled,
 empty, bounded drain, safe signal shutdown, and a durably database-scheduled
 retry all exit `0`; inspect `run_status` and `stop_reason` rather than treating
 those expected outcomes as task failures. The database `next_attempt_at` gate,
-not Cloud Run retry timing, controls another claim. The host does not discover, promote, reconcile, or
-activate retrieval, and tenant fairness remains unimplemented.
+not Cloud Run retry timing, controls another claim. The host does not discover,
+promote, reconcile, or activate retrieval. Slice 3 organization fairness is an
+intrinsic claim property with no additional environment flag; deploy it only
+after migration `20260902_000022` and a separate controlled authorization.
 
 Create the bootstrap job with no command-line bootstrap values:
 
@@ -158,10 +160,10 @@ each operation's nonsecret status before continuing:
 1. deploy the transition-compatible API image before changing the database;
 2. require readiness HTTP 200 with `schema_compatible=true`,
    `schema_current=false`, and `migration_required=true` at revision
-   `20260828_000020`;
+   `20260831_000021`;
 3. update only the established migration job to the same immutable image;
 4. execute the migration job exactly once and verify revision
-   `20260831_000021`;
+   `20260902_000022`;
 5. require readiness HTTP 200 with `schema_compatible=true`,
    `schema_current=true`, and `migration_required=false`;
 6. update the worker image with both ledger flags explicitly false;
@@ -169,7 +171,7 @@ each operation's nonsecret status before continuing:
 
 The predecessor compatibility entry is deliberate temporary expand-migration
 policy. Remove it in a later cleanup only after all environments are confirmed
-at `20260831_000021`. Do not broaden it into revision ordering or a range.
+at `20260902_000022`. Do not broaden it into revision ordering or a range.
 
 For initial provisioning after the compatible API is deployed:
 

@@ -15,7 +15,7 @@ import signal
 import threading
 import time
 from types import FrameType
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from openai import OpenAI
 from sqlalchemy.orm import Session
@@ -279,6 +279,7 @@ class GitHubLedgerExecutionSummary:
     extracted_characters: int
     chunks: int
     embedding_batches: int
+    organizations_served: int
     duration_seconds: float
     stop_reason: str
     run_status: str
@@ -331,13 +332,20 @@ class GitHubSyncLedgerWorkerHost:
             "chunks": 0,
             "embedding_batches": 0,
         }
+        organizations_served: set[UUID] = set()
         empty_polls = 0
         stop_reason = "disabled"
         exit_code = GitHubLedgerHostExitCode.DISABLED
         try:
             if not self._settings.processing_enabled:
                 return self._finish(
-                    run_id, started, counts, False, stop_reason, exit_code
+                    run_id,
+                    started,
+                    counts,
+                    organizations_served,
+                    False,
+                    stop_reason,
+                    exit_code,
                 )
             if self._worker is None:
                 raise RuntimeError("GitHub ledger worker is unavailable")
@@ -410,13 +418,18 @@ class GitHubSyncLedgerWorkerHost:
                 empty_polls = 0
                 counts["items_claimed"] += 1
                 self._record(result, counts)
+                if result.organization_id is not None:
+                    organizations_served.add(result.organization_id)
                 self._logger.info(
                     "event=github_ledger_item_finished run_id=%s work_item_id=%s "
-                    "attempt=%s outcome=%s duration_seconds=%.3f",
+                    "attempt=%s outcome=%s organization_id=%s fairness_claim_sequence=%s "
+                    "duration_seconds=%.3f",
                     run_id,
                     result.work_item_id,
                     result.attempt_number,
                     result.outcome,
+                    result.organization_id,
+                    result.fairness_claim_sequence,
                     max(0.0, self._monotonic() - item_started),
                 )
                 if result.outcome == "retry_scheduled":
@@ -447,6 +460,7 @@ class GitHubSyncLedgerWorkerHost:
             run_id,
             started,
             counts,
+            organizations_served,
             stop_reason == "empty_queue",
             stop_reason,
             exit_code,
@@ -490,6 +504,7 @@ class GitHubSyncLedgerWorkerHost:
         run_id: str,
         started: float,
         counts: dict[str, int],
+        organizations_served: set[UUID],
         empty_queue: bool,
         stop_reason: str,
         exit_code: GitHubLedgerHostExitCode,
@@ -509,6 +524,7 @@ class GitHubSyncLedgerWorkerHost:
             extracted_characters=counts["extracted_characters"],
             chunks=counts["chunks"],
             embedding_batches=counts["embedding_batches"],
+            organizations_served=len(organizations_served),
             duration_seconds=max(0.0, self._monotonic() - started),
             stop_reason=stop_reason,
             run_status=_run_status(stop_reason),
@@ -534,7 +550,8 @@ class GitHubSyncLedgerWorkerHost:
             "items_claimed=%d succeeded=%d retry_scheduled=%d quarantined=%d "
             "cancelled=%d failed=%d lease_or_fence_lost=%d empty_queue=%s "
             "downloaded_bytes=%d extracted_characters=%d chunks=%d "
-            "embedding_batches=%d duration_seconds=%.3f stop_reason=%s "
+            "embedding_batches=%d organizations_served=%d duration_seconds=%.3f "
+            "stop_reason=%s "
             "run_status=%s graceful_shutdown=%s partial_drain=%s exit_code=%d",
             summary.run_id,
             summary.items_examined,
@@ -550,6 +567,7 @@ class GitHubSyncLedgerWorkerHost:
             summary.extracted_characters,
             summary.chunks,
             summary.embedding_batches,
+            summary.organizations_served,
             summary.duration_seconds,
             summary.stop_reason,
             summary.run_status,
@@ -605,6 +623,7 @@ def compose_github_sync_ledger_worker_host(
         heartbeat_interval=settings.heartbeat_interval,
         heartbeat_shutdown_timeout=settings.shutdown_timeout,
         recovery_limit=settings.recovery_limit,
+        organization_fair_claims=True,
         progress_check=getattr(
             shutdown_event, "raise_if_grace_expired", lambda: None
         ),

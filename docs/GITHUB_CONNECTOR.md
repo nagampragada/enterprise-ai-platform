@@ -85,8 +85,42 @@ character/chunk/embedding totals, duration, outcome, and stop reason. Content,
 vectors, provider payloads, URLs, tokens, and credentials are never logged.
 PostgreSQL multi-host tests prove `SKIP LOCKED` disjointness, safe expired
 recovery, stale-fence rejection, convergence without duplicate staging, and
-worker independence. Durable tenant fairness remains unimplemented and is not
-claimed. The dedicated host has not been built or deployed.
+worker independence. Slice 2 has completed controlled production verification.
+
+Phase 3 Slice 3 adds durable equal fairness at the organization boundary only
+for this dedicated host. A claim considers only eligible GitHub work for the
+exact processing profile. Never-served organizations sort first; otherwise the
+least committed scheduling sequence sorts first, with organization UUID as the
+deterministic tie-breaker. Indexed correlated existence probes avoid grouping
+the complete claimable backlog. Selection locks a never-served organization row
+or a served schedule row using `FOR UPDATE SKIP LOCKED`; the next item retains the established generation,
+availability, and UUID order. Its lease/fence and the organization's new
+scheduling sequence commit atomically. A failed or rolled-back claim leaves no
+durable turn, although PostgreSQL sequence allocation may leave a harmless gap.
+Only committed schedule values establish order; recovery never rewinds them.
+Retry-wait work earns no credit before `next_attempt_at`; cancellation,
+quarantine, terminal state, incomplete discovery, and profile mismatch are
+excluded. Expired recovery preserves the consumed turn and the recovered item
+re-enters ordinary fair selection. The guarantee bounds eligible scheduling
+turns for a fixed eligible population under transaction progress and the
+absence of perpetual locks; it does not promise wall-clock latency or progress
+through an unbounded stream of never-served arrivals.
+
+The algorithm has no environment switch, priority, weight, paid tier, or
+service class. The processing gate remains strict and default-off, and planning
+remains absent from the dedicated host. Structured logs may identify the
+selected organization UUID, committed scheduling sequence, and distinct
+organizations whose committed claims were processed, but never names, content,
+vectors, provider payloads, URLs, credentials, or tokens. Slice 3 is
+implemented locally and has not been built or deployed. It does not implement
+promotion, reconciliation, retrieval activation, or staging cleanup.
+
+Turn serialization is not an active-processing concurrency limit. Once a claim
+commits, another transaction may claim another item for the same organization
+while the earlier item is still running; host concurrency and provider duration
+are separate operational dimensions. Schedule rows remain dormant when no work
+is eligible and are reused by later generations. They are deleted only with the
+organization; broader cleanup remains future Phase 4 policy.
 
 Expected durable outcomes return process status `0`: disabled/no work,
 item/runtime bounds, successful drain, cancellation, quarantine, database retry

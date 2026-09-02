@@ -8,7 +8,7 @@
 | Snapshot branch | `main` |
 | Snapshot commit | `6352fa2c09cf09bddd6428d04c67cd88caee6460` (clean implementation baseline) |
 | Snapshot date | 2026-08-21 |
-| Alembic head | `20260831_000021` |
+| Alembic head | `20260902_000022` |
 | Purpose | Authoritative, code-evidenced inventory of implemented, exposed, partial, planned, deferred, and excluded capabilities |
 | Audiences | Product owners, backend/data/security/connector/operations/UI/QA engineers, and future repository agents |
 
@@ -125,7 +125,7 @@ Evidence: `backend/pyproject.toml`, `infra/docker/docker-compose.postgres.yml`, 
 
 ## 6. Database architecture
 
-SQLAlchemy metadata contains **46 live tables**. Alembic head is `20260831_000021`; migrations are forward-ordered, tested against real PostgreSQL, and generally provide narrow downgrades. The pgvector extension downgrade is intentionally conservative because extensions can be shared infrastructure.
+SQLAlchemy metadata contains **47 live tables**. Alembic head is `20260902_000022`; migrations are forward-ordered, tested against real PostgreSQL, and generally provide narrow downgrades. The pgvector extension downgrade is intentionally conservative because extensions can be shared infrastructure.
 
 ### Organizations, users, authentication, and structure
 
@@ -178,8 +178,9 @@ SQLAlchemy metadata contains **46 live tables**. Alembic head is `20260831_00002
 | `connector_sync_file_work_items` | Independently leased generation file work | UUID PK; immutable logical identity; unique lease | Retry/fence/cancellation/quarantine counters |
 | `connector_sync_file_materializations` | Retrieval-isolated Phase 3 file output | UUID PK; one per generation work item; immutable logical identity | Exact repository/blob/commit/profile attribution; no legacy document FK |
 | `connector_sync_file_materialization_chunks` | Ordered staged text and vectors | UUID PK; unique materialization/index; `Vector(1536)` | Generation-owned and excluded from retrieval SQL |
+| `connector_sync_organization_claim_schedules` | Durable dedicated-worker organization fairness | Organization UUID PK/FK; globally unique last claim sequence | Equal least-recently-served turns; no provider or retrieval data |
 
-Phase 3 Slice 1 is production verified. Phase 3 Slice 2 is local-only: a
+Phase 3 Slice 1 and Slice 2 are production verified. Slice 2 provides a
 dedicated default-off GitHub ledger host provides bounded multi-item draining,
 safe claim runway, interruptible empty polling, signal-aware stop-before-claim,
 existing independent lease heartbeat/fencing/retry/cancellation behavior, and
@@ -187,9 +188,16 @@ fixed nonsecret summaries. Expected durable outcomes exit zero and retain their
 meaning in structured status fields; only true host/invariant failures exit
 nonzero. Database `next_attempt_at` controls retry and the future task must use
 zero Cloud Run retries. Real PostgreSQL multi-host tests cover disjoint
-claims and duplicate-free staging. It has not been built or deployed. Tenant
-fairness is still open; generation promotion, deletion reconciliation, cleanup,
-and retrieval switching remain Phase 4.
+claims and duplicate-free staging. Slice 3 is implemented locally but not
+deployed: durable organization-scoped least-recently-served state and
+never-served organization-row/served schedule-row `SKIP LOCKED` selection
+prevent one backlog from monopolizing
+eligible scheduling turns across concurrent workers. Claim/fence and fairness
+advancement are atomic; rollback leaves no durable turn but can leave a harmless
+PostgreSQL sequence gap, and retry/recovery retains the established semantics.
+Fair scheduling does not impose a per-organization active-processing cap.
+Generation promotion, deletion reconciliation,
+cleanup, and retrieval switching remain Phase 4.
 
 ### Immutable versions and indexing
 
@@ -457,12 +465,27 @@ the legacy cursor still caps one run at 100,000 examined entries and 10,000
 observed files, so true million-file repository discovery remains future work.
 
 Phase 3 API readiness supports the zero-downtime expand-migration sequence with
-an exact immutable compatibility set containing only `20260828_000020` and
-`20260831_000021`. The predecessor is compatible but not current and reports
+an exact immutable compatibility set containing only `20260831_000021` and
+`20260902_000022`. The predecessor is compatible but not current and reports
 migration required; the application head is compatible and current. Unknown,
 missing, malformed, older, newer, and multiple heads fail closed. The
 predecessor allowance is temporary and must be removed after every environment
-has reached `20260831_000021`.
+has reached `20260902_000022`.
+
+Migration `20260902_000022` adds one isolated organization scheduling-state
+table and one monotonic sequence. Indexed correlated eligibility probes avoid a
+full claimable-backlog grouping. The dedicated Slice 3 claim transaction locks
+a never-served organization row or the least-recently-served schedule row with
+deterministic UUID tie-breaking, claims that organization's existing deterministic next item, and
+advances fairness only when the lease/fence also succeeds. Concurrent workers
+use database locks rather than process memory; rollback and candidate loss do
+not durably consume a turn, although sequence gaps are permitted, while an
+expired lease keeps its original consumed turn.
+Retry-wait, cancelled, quarantined, terminal, incomplete-discovery, and
+profile-incompatible work is excluded until or unless it becomes eligible.
+Legacy synchronization ordering and retrieval SQL are unchanged. Slice 3 is
+local-only; promotion, reconciliation, staging cleanup, and retrieval activation
+remain future slices.
 
 ### GitHub App operator configuration
 
@@ -885,7 +908,7 @@ Known output at snapshot:
 | Local PostgreSQL | Docker Compose uses `pgvector/pgvector:pg16`, localhost port, health check, named volume; development credentials only |
 | pgvector | Extension migration and vector column complete |
 | Local configuration | Environment-driven database/JWT/OpenAI settings; no secrets are documented here |
-| Migrations | 21 revisions, head `20260831_000021`, real PostgreSQL lifecycle tests |
+| Migrations | 22 revisions, head `20260902_000022`, real PostgreSQL lifecycle tests |
 | Worker runner | Bounded staged callable class implemented |
 | Continuous worker host | Direct module with continuous and one-shot modes implemented |
 | Scheduler/automatic recovery | Continuous/one-shot interval scheduler and worker expired recovery implemented |

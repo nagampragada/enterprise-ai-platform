@@ -37,6 +37,8 @@ from infrastructure.db.models import (
     ConnectorSyncFileMaterialization,
     ConnectorSyncFileMaterializationChunk,
     ConnectorSyncFileWorkItem,
+    ConnectorSyncOrganizationClaimSchedule,
+    Organization,
 )
 from infrastructure.repositories.connector_sync_work_ledger_repository import (
     ConnectorSyncWorkLedgerRepository,
@@ -408,6 +410,796 @@ def test_cross_tenant_provider_claim_is_single_bounded_and_requires_completed_di
             lease_duration=LEASE,
         ) is None
         session.rollback()
+
+
+def _make_fair_generation(session: Session, label: str, item_count: int):
+    context, generation = _generation(session, label)
+    _register(
+        session,
+        context[0],
+        generation.generation_id,
+        tuple(_entry(index) for index in range(item_count)),
+    )
+    ConnectorSyncWorkLedgerRepository(session).mark_discovery_complete(
+        context[0], generation.generation_id, now=NOW
+    )
+    session.commit()
+    return context, generation
+
+
+def _fair_claim(session: Session, worker_id: str, *, now: datetime = NOW):
+    lease = ConnectorSyncWorkLedgerRepository(session).claim_next_available_fair(
+        provider_key="github",
+        profile_fingerprint=PROFILE,
+        worker_id=worker_id,
+        now=now,
+        lease_duration=LEASE,
+    )
+    session.commit()
+    return lease
+
+
+def _fair_schedule_state(session: Session, organization_id: UUID):
+    row = session.get(ConnectorSyncOrganizationClaimSchedule, organization_id)
+    if row is None:
+        return None
+    return (
+        row.last_claim_sequence,
+        row.claim_count,
+        row.last_claimed_at,
+        row.created_at,
+        row.updated_at,
+    )
+
+
+def _fair_work_states(session: Session, generation_id: UUID):
+    return tuple(
+        session.execute(
+            select(
+                ConnectorSyncFileWorkItem.id,
+                ConnectorSyncFileWorkItem.status,
+                ConnectorSyncFileWorkItem.attempt_count,
+                ConnectorSyncFileWorkItem.fencing_token,
+                ConnectorSyncFileWorkItem.lease_id,
+            )
+            .where(ConnectorSyncFileWorkItem.generation_id == generation_id)
+            .order_by(ConnectorSyncFileWorkItem.id)
+        ).all()
+    )
+
+
+def test_fair_claim_preserves_single_organization_item_order(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation = _make_fair_generation(session, "FairSingle", 3)
+        expected = tuple(
+            session.scalars(
+                select(ConnectorSyncFileWorkItem.id)
+                .where(
+                    ConnectorSyncFileWorkItem.organization_id == context[0],
+                    ConnectorSyncFileWorkItem.generation_id == generation.generation_id,
+                )
+                .order_by(
+                    ConnectorSyncFileWorkItem.next_attempt_at,
+                    ConnectorSyncFileWorkItem.id,
+                )
+            ).all()
+        )
+        leases = tuple(_fair_claim(session, f"fair-single-{index}") for index in range(3))
+
+        assert all(lease is not None for lease in leases)
+        assert tuple(lease.work_item_id for lease in leases) == expected
+        assert tuple(lease.fairness_claim_sequence for lease in leases) == tuple(
+            sorted(lease.fairness_claim_sequence for lease in leases)
+        )
+        assert all(lease.organization_id == context[0] for lease in leases)
+        schedule = session.get(ConnectorSyncOrganizationClaimSchedule, context[0])
+        assert schedule is not None
+        assert schedule.claim_count == 3
+
+
+def test_two_organizations_alternate_and_small_backlog_does_not_starve(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        first = _generation(session, "FairBacklogA")
+        second = _generation(session, "FairBacklogB")
+        ordered = sorted((first, second), key=lambda value: value[0][0])
+        large, small = ordered
+        _register(
+            session,
+            large[0][0],
+            large[1].generation_id,
+            tuple(_entry(index) for index in range(8)),
+        )
+        _register(session, small[0][0], small[1].generation_id, (_entry(100),))
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        for context, generation in (large, small):
+            repository.mark_discovery_complete(
+                context[0], generation.generation_id, now=NOW
+            )
+        session.commit()
+
+        claims = tuple(_fair_claim(session, f"fair-skew-{index}") for index in range(4))
+
+        assert [lease.organization_id for lease in claims] == [
+            large[0][0],
+            small[0][0],
+            large[0][0],
+            large[0][0],
+        ]
+        assert len({lease.work_item_id for lease in claims}) == 4
+
+
+@pytest.mark.parametrize(
+    ("counts", "expected_prefix"),
+    (
+        ((100, 1, 1), "ABC"),
+        ((100, 5, 3), "ABCABCABCABAB"),
+    ),
+)
+def test_sequential_sustained_backlog_has_exact_committed_turn_history(
+    engine, counts, expected_prefix
+) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        created = tuple(_generation(session, f"FairHistory{index}") for index in range(3))
+        ordered = tuple(sorted(created, key=lambda value: value[0][0]))
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        for (context, generation), count in zip(ordered, counts, strict=True):
+            _register(
+                session,
+                context[0],
+                generation.generation_id,
+                tuple(_entry(index) for index in range(count)),
+            )
+            repository.mark_discovery_complete(
+                context[0], generation.generation_id, now=NOW
+            )
+        session.commit()
+        labels = {value[0][0]: chr(ord("A") + index) for index, value in enumerate(ordered)}
+
+        leases = tuple(
+            _fair_claim(session, f"fair-history-{index}")
+            for index in range(sum(counts))
+        )
+        history = "".join(labels[lease.organization_id] for lease in leases)
+
+        assert history.startswith(expected_prefix)
+        if counts == (100, 1, 1):
+            assert history == "ABC" + ("A" * 99)
+        else:
+            assert history == "ABCABCABCABAB" + ("A" * 95)
+        assert len({lease.work_item_id for lease in leases}) == len(leases)
+        assert tuple(lease.fairness_claim_sequence for lease in leases) == tuple(
+            sorted(lease.fairness_claim_sequence for lease in leases)
+        )
+
+
+def test_committed_claims_do_not_impose_an_active_per_organization_cap(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation = _make_fair_generation(session, "FairNoActiveCap", 2)
+
+        first = _fair_claim(session, "fair-active-1")
+        second = _fair_claim(session, "fair-active-2")
+
+        assert first.organization_id == second.organization_id == context[0]
+        assert first.work_item_id != second.work_item_id
+        assert _fair_work_states(session, generation.generation_id) == tuple(
+            sorted(
+                _fair_work_states(session, generation.generation_id),
+                key=lambda value: value[0],
+            )
+        )
+        assert all(row.status == FileWorkStatus.RUNNING.value for row in session.scalars(
+            select(ConnectorSyncFileWorkItem).where(
+                ConnectorSyncFileWorkItem.generation_id == generation.generation_id
+            )
+        ))
+
+
+def test_locked_never_served_item_is_skipped_and_reconsidered(engine) -> None:
+    with Session(engine, expire_on_commit=False) as setup:
+        candidates = tuple(
+            _make_fair_generation(setup, f"FairItemLock{index}", 1)
+            for index in range(2)
+        )
+        first, second = sorted(candidates, key=lambda value: value[0][0])
+
+    with Session(engine, expire_on_commit=False) as blocker:
+        blocker.execute(text("SET LOCAL lock_timeout = '5s'"))
+        blocker.execute(text("SET LOCAL statement_timeout = '5s'"))
+        blocker.scalar(
+            select(ConnectorSyncFileWorkItem)
+            .where(
+                ConnectorSyncFileWorkItem.generation_id == first[1].generation_id
+            )
+            .with_for_update()
+        )
+        with Session(engine, expire_on_commit=False) as worker:
+            worker.execute(text("SET LOCAL lock_timeout = '5s'"))
+            worker.execute(text("SET LOCAL statement_timeout = '5s'"))
+            lease = _fair_claim(worker, "fair-item-lock")
+            assert lease.organization_id == second[0][0]
+        blocker.rollback()
+
+    with Session(engine, expire_on_commit=False) as worker:
+        reconsidered = _fair_claim(worker, "fair-item-reconsidered")
+        assert reconsidered.organization_id == first[0][0]
+
+
+def test_locked_served_schedule_is_skipped_and_reconsidered(engine) -> None:
+    with Session(engine, expire_on_commit=False) as setup:
+        candidates = tuple(
+            _make_fair_generation(setup, f"FairScheduleLock{index}", 2)
+            for index in range(2)
+        )
+        first, second = sorted(candidates, key=lambda value: value[0][0])
+        assert _fair_claim(setup, "fair-schedule-initialize-1").organization_id == first[0][0]
+        assert _fair_claim(setup, "fair-schedule-initialize-2").organization_id == second[0][0]
+
+    with Session(engine, expire_on_commit=False) as blocker:
+        blocker.execute(text("SET LOCAL lock_timeout = '5s'"))
+        blocker.execute(text("SET LOCAL statement_timeout = '5s'"))
+        blocker.scalar(
+            select(ConnectorSyncOrganizationClaimSchedule)
+            .where(
+                ConnectorSyncOrganizationClaimSchedule.organization_id == first[0][0]
+            )
+            .with_for_update()
+        )
+        with Session(engine, expire_on_commit=False) as worker:
+            worker.execute(text("SET LOCAL lock_timeout = '5s'"))
+            worker.execute(text("SET LOCAL statement_timeout = '5s'"))
+            lease = _fair_claim(worker, "fair-schedule-lock")
+            assert lease.organization_id == second[0][0]
+        blocker.rollback()
+
+    with Session(engine, expire_on_commit=False) as worker:
+        reconsidered = _fair_claim(worker, "fair-schedule-reconsidered")
+        assert reconsidered.organization_id == first[0][0]
+
+
+def test_workers_committing_at_different_speeds_preserve_durable_turn_order(
+    engine,
+) -> None:
+    with Session(engine, expire_on_commit=False) as setup:
+        candidates = tuple(
+            _make_fair_generation(setup, f"FairCommitSpeed{index}", 2)
+            for index in range(2)
+        )
+        first, second = sorted(candidates, key=lambda value: value[0][0])
+
+    first_claimed = threading.Event()
+    allow_first_commit = threading.Event()
+    committed: list[UUID] = []
+    errors: list[BaseException] = []
+    result_lock = threading.Lock()
+
+    def slow_first() -> None:
+        with Session(engine, expire_on_commit=False) as worker:
+            try:
+                worker.execute(text("SET LOCAL lock_timeout = '5s'"))
+                worker.execute(text("SET LOCAL statement_timeout = '5s'"))
+                lease = ConnectorSyncWorkLedgerRepository(
+                    worker
+                ).claim_next_available_fair(
+                    provider_key="github",
+                    profile_fingerprint=PROFILE,
+                    worker_id="fair-slow-commit",
+                    now=NOW,
+                    lease_duration=LEASE,
+                )
+                assert lease.organization_id == first[0][0]
+                first_claimed.set()
+                assert allow_first_commit.wait(timeout=10)
+                worker.commit()
+                with result_lock:
+                    committed.append(lease.organization_id)
+            except BaseException as exc:  # pragma: no cover - asserted below
+                worker.rollback()
+                first_claimed.set()
+                with result_lock:
+                    errors.append(exc)
+
+    thread = threading.Thread(target=slow_first)
+    thread.start()
+    assert first_claimed.wait(timeout=10)
+    with Session(engine, expire_on_commit=False) as fast_worker:
+        lease = _fair_claim(fast_worker, "fair-fast-commit")
+        assert lease.organization_id == second[0][0]
+        committed.append(lease.organization_id)
+    allow_first_commit.set()
+    thread.join(15)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert committed == [second[0][0], first[0][0]]
+    with Session(engine, expire_on_commit=False) as later:
+        next_lease = _fair_claim(later, "fair-after-slow-commit")
+        assert next_lease.organization_id == first[0][0]
+        first_schedule = _fair_schedule_state(later, first[0][0])
+        second_schedule = _fair_schedule_state(later, second[0][0])
+        assert first_schedule[0] > second_schedule[0]
+
+
+def test_retry_wait_and_expired_recovery_reenter_normal_fair_order(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        one = _make_fair_generation(session, "FairRetryA", 1)
+        two = _make_fair_generation(session, "FairRetryB", 1)
+        expected_first, expected_second = sorted((one, two), key=lambda value: value[0][0])
+        first = _fair_claim(session, "fair-retry-first")
+        assert first.organization_id == expected_first[0][0]
+        ConnectorSyncWorkLedgerRepository(session).record_failure(
+            first,
+            worker_id=first.worker_id,
+            error_category="rate_limit",
+            error_code="provider_throttled",
+            now=NOW,
+            retry_at=NOW + timedelta(minutes=10),
+        )
+        session.commit()
+
+        second = _fair_claim(session, "fair-retry-second", now=NOW)
+        assert second.organization_id == expected_second[0][0]
+        assert _fair_claim(session, "fair-retry-early", now=NOW) is None
+        retried = _fair_claim(
+            session, "fair-retry-ready", now=NOW + timedelta(minutes=10)
+        )
+        assert retried.organization_id == expected_first[0][0]
+        assert retried.fencing_token == first.fencing_token + 1
+        schedule = session.get(
+            ConnectorSyncOrganizationClaimSchedule, expected_first[0][0]
+        )
+        assert schedule.claim_count == 2
+
+
+def test_newly_eligible_organization_enters_before_previously_served_backlogs(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        first = _make_fair_generation(session, "FairExistingA", 3)
+        second = _make_fair_generation(session, "FairExistingB", 3)
+        existing_claims = (
+            _fair_claim(session, "fair-existing-0"),
+            _fair_claim(session, "fair-existing-1"),
+        )
+        assert {lease.organization_id for lease in existing_claims} == {
+            first[0][0], second[0][0]
+        }
+
+        newcomer = _make_fair_generation(session, "FairNewcomer", 1)
+        next_lease = _fair_claim(session, "fair-newcomer")
+
+        assert next_lease.organization_id == newcomer[0][0]
+
+
+def test_fairness_state_rolls_back_with_uncommitted_item_claim(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation = _make_fair_generation(session, "FairRollback", 1)
+        lease = ConnectorSyncWorkLedgerRepository(session).claim_next_available_fair(
+            provider_key="github",
+            profile_fingerprint=PROFILE,
+            worker_id="fair-rollback",
+            now=NOW,
+            lease_duration=LEASE,
+        )
+        assert lease is not None
+        session.rollback()
+
+        assert session.get(ConnectorSyncOrganizationClaimSchedule, context[0]) is None
+        item = session.scalar(
+            select(ConnectorSyncFileWorkItem).where(
+                ConnectorSyncFileWorkItem.generation_id == generation.generation_id
+            )
+        )
+        assert item.status == FileWorkStatus.PENDING.value
+        assert item.attempt_count == 0
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    (
+        "after_organization_selection",
+        "after_schedule_initialization",
+        "after_schedule_lock",
+        "after_work_item_lock",
+        "after_lease_fence_mutation",
+        "after_fairness_mutation",
+        "immediately_before_commit",
+    ),
+)
+def test_forced_failure_at_each_fair_claim_boundary_rolls_back_all_durable_state(
+    engine, monkeypatch, boundary
+) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation = _make_fair_generation(
+            session,
+            f"FairBoundary{boundary}",
+            2 if boundary == "after_schedule_lock" else 1,
+        )
+        if boundary == "after_schedule_lock":
+            assert _fair_claim(session, "fair-boundary-initial") is not None
+        before_schedule = _fair_schedule_state(session, context[0])
+        before_work = _fair_work_states(session, generation.generation_id)
+        repository = ConnectorSyncWorkLedgerRepository(session)
+
+        if boundary in {"after_organization_selection", "after_schedule_lock"}:
+            original = repository._select_fair_organization
+
+            def fail_after_selection(**kwargs):
+                selected = original(**kwargs)
+                assert selected is not None
+                if boundary == "after_schedule_lock":
+                    assert selected[1] is not None
+                raise RuntimeError(boundary)
+
+            monkeypatch.setattr(repository, "_select_fair_organization", fail_after_selection)
+        elif boundary == "after_schedule_initialization":
+            original_add = session.add
+
+            def fail_after_add(instance, *args, **kwargs):
+                original_add(instance, *args, **kwargs)
+                if isinstance(instance, ConnectorSyncOrganizationClaimSchedule):
+                    raise RuntimeError(boundary)
+
+            monkeypatch.setattr(session, "add", fail_after_add)
+        elif boundary == "after_work_item_lock":
+            def fail_after_item_lock(statement, **kwargs):
+                assert repository._one(statement, "forced item lock") is not None
+                raise RuntimeError(boundary)
+
+            monkeypatch.setattr(repository, "_claim_one", fail_after_item_lock)
+        elif boundary == "after_lease_fence_mutation":
+            original_claim = repository._claim_fair_organization_item
+
+            def fail_after_claim(**kwargs):
+                assert original_claim(**kwargs) is not None
+                raise RuntimeError(boundary)
+
+            monkeypatch.setattr(repository, "_claim_fair_organization_item", fail_after_claim)
+        elif boundary == "after_fairness_mutation":
+            original_flush = repository._flush
+
+            def fail_before_fair_flush(message):
+                if message == "fair organization claim could not be advanced":
+                    raise RuntimeError(boundary)
+                original_flush(message)
+
+            monkeypatch.setattr(repository, "_flush", fail_before_fair_flush)
+
+        try:
+            lease = repository.claim_next_available_fair(
+                provider_key="github",
+                profile_fingerprint=PROFILE,
+                worker_id=f"fair-boundary-{boundary}",
+                now=NOW,
+                lease_duration=LEASE,
+            )
+            if boundary == "immediately_before_commit":
+                assert lease is not None
+                raise RuntimeError(boundary)
+        except RuntimeError as exc:
+            assert str(exc) == boundary
+            session.rollback()
+        else:  # pragma: no cover - every injected boundary must fail closed
+            pytest.fail(f"{boundary} did not fail")
+
+        assert _fair_schedule_state(session, context[0]) == before_schedule
+        assert _fair_work_states(session, generation.generation_id) == before_work
+
+
+def test_rolled_back_sequence_value_leaves_gap_but_no_committed_turn(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation = _make_fair_generation(session, "FairSequenceGap", 1)
+        rolled_back = ConnectorSyncWorkLedgerRepository(
+            session
+        ).claim_next_available_fair(
+            provider_key="github",
+            profile_fingerprint=PROFILE,
+            worker_id="fair-gap-rollback",
+            now=NOW,
+            lease_duration=LEASE,
+        )
+        assert rolled_back is not None
+        session.rollback()
+        assert _fair_schedule_state(session, context[0]) is None
+        assert _fair_work_states(session, generation.generation_id)[0][1:] == (
+            FileWorkStatus.PENDING.value,
+            0,
+            0,
+            None,
+        )
+
+        committed = _fair_claim(session, "fair-gap-commit")
+        assert committed.fairness_claim_sequence > rolled_back.fairness_claim_sequence
+        schedule = session.get(ConnectorSyncOrganizationClaimSchedule, context[0])
+        assert schedule.claim_count == 1
+        assert schedule.last_claim_sequence == committed.fairness_claim_sequence
+
+
+def test_repeated_rollback_for_one_organization_does_not_corrupt_other_schedules(
+    engine,
+) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        candidates = tuple(
+            _make_fair_generation(session, f"FairRepeatedRollback{index}", 1)
+            for index in range(2)
+        )
+        first, second = sorted(candidates, key=lambda value: value[0][0])
+        rolled_back_sequences = []
+        for index in range(3):
+            lease = ConnectorSyncWorkLedgerRepository(
+                session
+            ).claim_next_available_fair(
+                provider_key="github",
+                profile_fingerprint=PROFILE,
+                worker_id=f"fair-repeat-rollback-{index}",
+                now=NOW,
+                lease_duration=LEASE,
+            )
+            rolled_back_sequences.append(lease.fairness_claim_sequence)
+            session.rollback()
+        assert rolled_back_sequences == sorted(rolled_back_sequences)
+        assert _fair_schedule_state(session, first[0][0]) is None
+        assert _fair_schedule_state(session, second[0][0]) is None
+
+    with Session(engine, expire_on_commit=False) as blocker:
+        blocker.execute(text("SET LOCAL lock_timeout = '5s'"))
+        blocker.execute(text("SET LOCAL statement_timeout = '5s'"))
+        blocker.scalar(
+            select(Organization)
+            .where(Organization.id == first[0][0])
+            .with_for_update()
+        )
+        with Session(engine, expire_on_commit=False) as worker:
+            lease = _fair_claim(worker, "fair-repeat-other")
+            assert lease.organization_id == second[0][0]
+        blocker.rollback()
+
+    with Session(engine, expire_on_commit=False) as verification:
+        assert _fair_schedule_state(verification, first[0][0]) is None
+        assert _fair_schedule_state(verification, second[0][0])[1] == 1
+        first_committed = _fair_claim(verification, "fair-repeat-first")
+        assert first_committed.organization_id == first[0][0]
+        assert first_committed.fairness_claim_sequence > max(rolled_back_sequences)
+
+
+def test_fair_claim_excludes_ineligible_generation_and_work_states(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        eligible = _make_fair_generation(session, "FairEligible", 1)
+
+        empty = _generation(session, "FairEmpty")
+        ConnectorSyncWorkLedgerRepository(session).mark_discovery_complete(
+            empty[0][0], empty[1].generation_id, now=NOW
+        )
+        session.commit()
+
+        incomplete = _generation(session, "FairIncomplete")
+        _register(
+            session, incomplete[0][0], incomplete[1].generation_id, (_entry(20),)
+        )
+
+        incompatible_context = _setup(session, "FairIncompatible")
+        incompatible_request = replace(
+            _generation_request(incompatible_context),
+            profile_fingerprint="github:incompatible-profile",
+        )
+        incompatible_generation, _ = ConnectorSyncWorkLedgerRepository(
+            session
+        ).register_generation(incompatible_request)
+        ConnectorSyncWorkLedgerRepository(session).register_manifest(
+            incompatible_context[0],
+            incompatible_generation.generation_id,
+            (
+                replace(
+                    _entry(21), profile_fingerprint="github:incompatible-profile"
+                ),
+            ),
+            now=NOW,
+        )
+        ConnectorSyncWorkLedgerRepository(session).mark_discovery_complete(
+            incompatible_context[0], incompatible_generation.generation_id, now=NOW
+        )
+        session.commit()
+
+        cancelled = _make_fair_generation(session, "FairCancelled", 1)
+        cancelled_item = session.scalar(
+            select(ConnectorSyncFileWorkItem).where(
+                ConnectorSyncFileWorkItem.generation_id
+                == cancelled[1].generation_id
+            )
+        )
+        ConnectorSyncWorkLedgerRepository(session).request_cancellation(
+            cancelled[0][0],
+            cancelled[1].generation_id,
+            cancelled_item.id,
+            reason_code="operator_cancelled",
+            now=NOW,
+        )
+        session.commit()
+
+        quarantined = _make_fair_generation(session, "FairQuarantined", 1)
+        quarantine_lease = ConnectorSyncWorkLedgerRepository(session).claim_next(
+            quarantined[0][0],
+            quarantined[1].generation_id,
+            worker_id="quarantine-setup",
+            now=NOW,
+            lease_duration=LEASE,
+        )
+        ConnectorSyncWorkLedgerRepository(session).record_failure(
+            quarantine_lease,
+            worker_id="quarantine-setup",
+            error_category="extraction",
+            error_code="unsupported_payload",
+            quarantine_reason_code="unsupported_payload",
+            now=NOW,
+        )
+        session.commit()
+
+        terminal = _make_fair_generation(session, "FairTerminal", 1)
+        terminal_lease = ConnectorSyncWorkLedgerRepository(session).claim_next(
+            terminal[0][0],
+            terminal[1].generation_id,
+            worker_id="terminal-setup",
+            now=NOW,
+            lease_duration=LEASE,
+        )
+        ConnectorSyncWorkLedgerRepository(session).complete(
+            terminal_lease,
+            worker_id="terminal-setup",
+            outcome=FileWorkStatus.SUCCEEDED,
+            counters=FileWorkCounters(),
+            now=NOW,
+        )
+        session.commit()
+
+        lease = _fair_claim(session, "fair-only-eligible")
+        assert lease.organization_id == eligible[0][0]
+        assert _fair_claim(session, "fair-no-more") is None
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncOrganizationClaimSchedule)
+        ) == 1
+
+
+def test_expired_lease_recovery_does_not_rewind_consumed_fair_turn(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        one = _make_fair_generation(session, "FairExpiryA", 1)
+        two = _make_fair_generation(session, "FairExpiryB", 1)
+        expected_first, expected_second = sorted((one, two), key=lambda value: value[0][0])
+        first = _fair_claim(session, "fair-expired-first")
+        first_schedule = session.get(
+            ConnectorSyncOrganizationClaimSchedule, expected_first[0][0]
+        )
+        consumed_sequence = first_schedule.last_claim_sequence
+
+        recovered = ConnectorSyncWorkLedgerRepository(session).recover_expired_available(
+            provider_key="github",
+            profile_fingerprint=PROFILE,
+            now=NOW + LEASE,
+            limit=10,
+        )
+        session.commit()
+        assert len(recovered) == 1
+        assert session.get(
+            ConnectorSyncOrganizationClaimSchedule, expected_first[0][0]
+        ).last_claim_sequence == consumed_sequence
+
+        second = _fair_claim(session, "fair-expired-second", now=NOW + LEASE)
+        assert second.organization_id == expected_second[0][0]
+        replacement = _fair_claim(
+            session, "fair-expired-replacement", now=NOW + LEASE
+        )
+        assert replacement.organization_id == expected_first[0][0]
+        assert replacement.fencing_token == first.fencing_token + 1
+
+
+def test_concurrent_fair_claims_drain_sustained_skew_without_starvation(engine) -> None:
+    with Session(engine, expire_on_commit=False) as setup:
+        tenants = tuple(
+            _make_fair_generation(setup, f"FairConcurrent{index}", 12 if index == 0 else 2)
+            for index in range(3)
+        )
+    start = threading.Barrier(4)
+    leases: list[object] = []
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+
+    def claim(index: int) -> None:
+        with Session(engine, expire_on_commit=False) as worker:
+            try:
+                start.wait(timeout=20)
+                while True:
+                    lease = ConnectorSyncWorkLedgerRepository(
+                        worker
+                    ).claim_next_available_fair(
+                        provider_key="github",
+                        profile_fingerprint=PROFILE,
+                        worker_id=f"fair-concurrent-{index}",
+                        now=NOW,
+                        lease_duration=LEASE,
+                    )
+                    worker.commit()
+                    if lease is None:
+                        break
+                    with lock:
+                        leases.append(lease)
+            except BaseException as exc:  # pragma: no cover - asserted below
+                worker.rollback()
+                with lock:
+                    errors.append(exc)
+
+    threads = [threading.Thread(target=claim, args=(index,)) for index in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len(leases) == 16
+    assert len({lease.work_item_id for lease in leases}) == len(leases)
+    assert len({lease.lease_id for lease in leases}) == len(leases)
+    assert {lease.organization_id for lease in leases} == {
+        tenant[0][0] for tenant in tenants
+    }
+    assert len({lease.fairness_claim_sequence for lease in leases}) == len(leases)
+    with Session(engine) as verification:
+        schedules = {
+            row.organization_id: row.claim_count
+            for row in verification.scalars(
+                select(ConnectorSyncOrganizationClaimSchedule)
+            )
+        }
+        assert schedules == {
+            tenants[0][0][0]: 12,
+            tenants[1][0][0]: 2,
+            tenants[2][0][0]: 2,
+        }
+
+
+def test_fewer_workers_converge_across_more_eligible_organizations(engine) -> None:
+    with Session(engine, expire_on_commit=False) as setup:
+        tenants = tuple(
+            _make_fair_generation(setup, f"FairManyTenants{index}", 1)
+            for index in range(5)
+        )
+    start = threading.Barrier(2)
+    leases: list[object] = []
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+
+    def drain(index: int) -> None:
+        with Session(engine, expire_on_commit=False) as worker:
+            try:
+                start.wait(timeout=20)
+                while True:
+                    lease = ConnectorSyncWorkLedgerRepository(
+                        worker
+                    ).claim_next_available_fair(
+                        provider_key="github",
+                        profile_fingerprint=PROFILE,
+                        worker_id=f"fair-fewer-workers-{index}",
+                        now=NOW,
+                        lease_duration=LEASE,
+                    )
+                    worker.commit()
+                    if lease is None:
+                        return
+                    with lock:
+                        leases.append(lease)
+            except BaseException as exc:  # pragma: no cover - asserted below
+                worker.rollback()
+                with lock:
+                    errors.append(exc)
+
+    threads = [threading.Thread(target=drain, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len(leases) == 5
+    assert len({lease.work_item_id for lease in leases}) == 5
+    assert {lease.organization_id for lease in leases} == {
+        tenant[0][0] for tenant in tenants
+    }
 
 
 def test_generation_scoped_materialization_and_completion_are_atomic(engine) -> None:
@@ -1103,9 +1895,20 @@ def test_discovery_empty_barrier_and_durable_follow_up_intent(engine) -> None:
 def test_claim_and_barrier_queries_use_dedicated_indexes(engine) -> None:
     with Session(engine, expire_on_commit=False) as session:
         context, generation = _generation(session, "Plans")
-        _register(session, context[0], generation.generation_id, [_entry(1), _entry(2)])
+        _register(
+            session,
+            context[0],
+            generation.generation_id,
+            tuple(_entry(index) for index in range(500)),
+        )
+        ConnectorSyncWorkLedgerRepository(session).mark_discovery_complete(
+            context[0], generation.generation_id, now=NOW
+        )
+        session.commit()
+        assert _fair_claim(session, "fair-plan-seed") is not None
         session.execute(text("SET LOCAL enable_seqscan = off"))
         session.execute(text("SET LOCAL enable_sort = off"))
+        session.execute(text("SET LOCAL enable_bitmapscan = off"))
         claim_plan = "\n".join(
             row[0]
             for row in session.execute(
@@ -1117,6 +1920,65 @@ def test_claim_and_barrier_queries_use_dedicated_indexes(engine) -> None:
                        ORDER BY next_attempt_at,id LIMIT 1 FOR UPDATE SKIP LOCKED"""
                 ),
                 {"org": context[0], "generation": generation.generation_id, "now": NOW},
+            )
+        )
+        fairness_plan = "\n".join(
+            row[0]
+            for row in session.execute(
+                text(
+                    """EXPLAIN (COSTS OFF)
+                       SELECT schedule.organization_id
+                       FROM connector_sync_organization_claim_schedules AS schedule
+                       WHERE (
+                         SELECT work.id
+                         FROM connector_sync_file_work_items AS work
+                         JOIN connector_sync_generations AS generation
+                           ON generation.organization_id = work.organization_id
+                          AND generation.connector_id = work.connector_id
+                          AND generation.connector_scope_id = work.connector_scope_id
+                          AND generation.id = work.generation_id
+                          AND generation.profile_fingerprint = work.profile_fingerprint
+                         JOIN connector_sync_jobs AS job
+                           ON job.organization_id = generation.organization_id
+                          AND job.connector_id = generation.connector_id
+                          AND job.connector_scope_id = generation.connector_scope_id
+                          AND job.id = generation.sync_job_id
+                         WHERE work.organization_id = schedule.organization_id
+                           AND generation.provider_key = 'github'
+                           AND generation.profile_fingerprint = :profile
+                           AND work.profile_fingerprint = :profile
+                           AND generation.status = 'processing'
+                           AND generation.discovery_complete IS TRUE
+                           AND job.status != 'cancelled'
+                           AND job.cancel_requested_at IS NULL
+                           AND work.status IN ('pending','retry_wait')
+                           AND work.next_attempt_at <= :now
+                           AND work.cancel_requested_at IS NULL
+                           AND work.attempt_count < work.max_attempts
+                         LIMIT 1
+                       ) IS NOT NULL
+                       ORDER BY schedule.last_claim_sequence, schedule.organization_id
+                       LIMIT 1 FOR UPDATE OF schedule SKIP LOCKED"""
+                ),
+                {"profile": PROFILE, "now": NOW},
+            )
+        )
+        fair_probe_plan = "\n".join(
+            row[0]
+            for row in session.execute(
+                text(
+                    """EXPLAIN (COSTS OFF)
+                       SELECT id FROM connector_sync_file_work_items
+                       WHERE organization_id=:org
+                         AND profile_fingerprint=:profile
+                         AND status IN ('pending','retry_wait')
+                         AND next_attempt_at <= :now
+                         AND cancel_requested_at IS NULL
+                         AND attempt_count < max_attempts
+                       ORDER BY next_attempt_at,generation_id,id
+                       LIMIT 1"""
+                ),
+                {"org": context[0], "profile": PROFILE, "now": NOW},
             )
         )
         barrier_plan = "\n".join(
@@ -1132,6 +1994,9 @@ def test_claim_and_barrier_queries_use_dedicated_indexes(engine) -> None:
             )
         )
         assert "ix_sync_file_work_claimable" in claim_plan
+        assert "ix_sync_org_claim_schedules_fair_order" in fairness_plan
+        assert "Seq Scan on connector_sync_file_work_items" not in fairness_plan
+        assert "ix_sync_file_work_fair_eligible" in fair_probe_plan
         assert "ix_sync_file_work_generation_barrier" in barrier_plan
 
 

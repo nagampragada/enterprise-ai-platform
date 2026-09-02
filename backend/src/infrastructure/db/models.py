@@ -1312,6 +1312,52 @@ class ConnectorSyncGeneration(Base):
     terminal_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class ConnectorSyncOrganizationClaimSchedule(Base):
+    """Durable least-recently-served state for dedicated ledger claims."""
+
+    __tablename__ = "connector_sync_organization_claim_schedules"
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "organization_id", name="pk_connector_sync_org_claim_schedules"
+        ),
+        ForeignKeyConstraint(
+            ["organization_id"],
+            ["organizations.id"],
+            name="fk_sync_org_claim_schedules_organization",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "last_claim_sequence", name="uq_sync_org_claim_schedules_sequence"
+        ),
+        CheckConstraint("claim_count > 0", name="claim_count_positive"),
+        CheckConstraint("last_claim_sequence > 0", name="sequence_positive"),
+        CheckConstraint(
+            "last_claimed_at >= created_at", name="last_claim_after_created"
+        ),
+        CheckConstraint("updated_at >= created_at", name="updated_after_created"),
+        Index(
+            "ix_sync_org_claim_schedules_fair_order",
+            "last_claim_sequence",
+            "organization_id",
+        ),
+    )
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, nullable=False
+    )
+    last_claim_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    claim_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    last_claimed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
 class ConnectorSyncFileWorkItem(Base):
     """Feature-gated independently leased control-plane work for one source file."""
 
@@ -1442,6 +1488,15 @@ class ConnectorSyncFileWorkItem(Base):
             "ix_sync_file_work_claimable",
             "organization_id", "generation_id", "next_attempt_at", "id",
             postgresql_where=text("status IN ('pending', 'retry_wait')"),
+        ),
+        Index(
+            "ix_sync_file_work_fair_eligible",
+            "organization_id", "profile_fingerprint", "next_attempt_at", "generation_id", "id",
+            postgresql_where=text(
+                "status IN ('pending', 'retry_wait') "
+                "AND cancel_requested_at IS NULL "
+                "AND attempt_count < max_attempts"
+            ),
         ),
         Index(
             "ix_sync_file_work_expired",
