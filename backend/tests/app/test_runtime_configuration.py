@@ -110,6 +110,7 @@ def test_safe_sandbox_api_and_worker_composition_passes_without_provider_calls()
     assert worker.github.private_key_reference.value.endswith("/versions/2")
     assert worker.github_sync_ledger_planning_enabled is False
     assert worker.github_sync_ledger_processing_enabled is False
+    assert worker.github_sync_ledger_promotion_enabled is False
 
 
 @pytest.mark.parametrize(("value", "expected"), (("true", True), ("false", False)))
@@ -151,6 +152,25 @@ def test_worker_ledger_processing_flag_rejects_noncanonical_values(value: str) -
         validate_worker_process_environment(values)
 
 
+@pytest.mark.parametrize(("value", "expected"), (("true", True), ("false", False)))
+def test_worker_ledger_promotion_flag_uses_strict_boolean_values(
+    value: str, expected: bool
+) -> None:
+    values = _sandbox()
+    values["GITHUB_SYNC_LEDGER_PROMOTION_ENABLED"] = value
+    worker = validate_worker_process_environment(values)
+    assert worker.github_sync_ledger_promotion_enabled is expected
+    assert worker.github_sync_ledger_processing_enabled is False
+
+
+@pytest.mark.parametrize("value", ("1", "TRUE", "False", " yes", "", "on"))
+def test_worker_ledger_promotion_flag_rejects_noncanonical_values(value: str) -> None:
+    values = _sandbox()
+    values["GITHUB_SYNC_LEDGER_PROMOTION_ENABLED"] = value
+    with pytest.raises(InvalidRuntimeConfiguration, match="Runtime configuration is invalid"):
+        validate_worker_process_environment(values)
+
+
 def test_api_and_worker_require_only_their_relevant_sandbox_inputs() -> None:
     values = _sandbox()
     values.pop("GITHUB_APP_CLIENT_SECRET_REFERENCE")
@@ -175,6 +195,7 @@ def test_worker_only_ledger_flag_is_ignored_by_other_process_validators() -> Non
     api_values = _sandbox()
     api_values["GITHUB_SYNC_LEDGER_PLANNING_ENABLED"] = "not-a-worker-boolean"
     api_values["GITHUB_SYNC_LEDGER_PROCESSING_ENABLED"] = "not-a-worker-boolean"
+    api_values["GITHUB_SYNC_LEDGER_PROMOTION_ENABLED"] = "not-a-worker-boolean"
     assert validate_api_process_environment(api_values).port == 8080
 
     database_values = {
@@ -182,6 +203,7 @@ def test_worker_only_ledger_flag_is_ignored_by_other_process_validators() -> Non
         "DATABASE_URL": SAFE_DATABASE,
         "GITHUB_SYNC_LEDGER_PLANNING_ENABLED": "not-a-worker-boolean",
         "GITHUB_SYNC_LEDGER_PROCESSING_ENABLED": "not-a-worker-boolean",
+        "GITHUB_SYNC_LEDGER_PROMOTION_ENABLED": "not-a-worker-boolean",
     }
     assert (
         validate_scheduler_process_environment(database_values).database_url

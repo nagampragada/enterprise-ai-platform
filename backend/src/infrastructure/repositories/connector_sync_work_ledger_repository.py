@@ -11,7 +11,7 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import BigInteger
 from sqlalchemy import Sequence as SqlSequence
-from sqlalchemy import exists, func, select, tuple_
+from sqlalchemy import and_, exists, func, or_, select, tuple_
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -24,7 +24,11 @@ from domain.connectors.sync_work_ledger import (
     FileWorkMaterializationView,
     FileWorkManifestEntry,
     FileWorkStatus,
+    GenerationActivationStatus,
+    GenerationActivationView,
     GenerationBarrierSummary,
+    GenerationPromotionRequest,
+    GenerationPromotionResult,
     ManifestRegistrationResult,
     MAX_MANIFEST_BATCH_SIZE,
     RepositoryGenerationRegistration,
@@ -38,9 +42,17 @@ from infrastructure.db.models import (
     ConnectorSyncFileMaterializationChunk,
     ConnectorSyncFileWorkItem,
     ConnectorSyncGeneration,
+    ConnectorSyncGenerationActivation,
     ConnectorSyncJob,
     ConnectorSyncOrganizationClaimSchedule,
+    ConnectorScope,
+    Document,
+    DocumentIndexingState,
+    DocumentVersion,
+    DocumentVersionDocument,
     Organization,
+    SourceItem,
+    SourceItemScopeMembership,
 )
 
 
@@ -106,6 +118,7 @@ class ConnectorSyncWorkLedgerRepository:
         lease_id_factory: Callable[[], UUID] = uuid4,
         materialization_id_factory: Callable[[], UUID] = uuid4,
         materialization_chunk_id_factory: Callable[[], UUID] = uuid4,
+        activation_id_factory: Callable[[], UUID] = uuid4,
     ) -> None:
         self._session = session
         self._generation_id_factory = generation_id_factory
@@ -113,12 +126,25 @@ class ConnectorSyncWorkLedgerRepository:
         self._lease_id_factory = lease_id_factory
         self._materialization_id_factory = materialization_id_factory
         self._materialization_chunk_id_factory = materialization_chunk_id_factory
+        self._activation_id_factory = activation_id_factory
 
     def register_generation(
         self, request: RepositoryGenerationRegistration
     ) -> tuple[RepositoryGenerationView, bool]:
         if not isinstance(request, RepositoryGenerationRegistration):
             raise InvalidSyncWorkLedgerRequest("generation registration is invalid")
+        scope = self._one(
+            select(ConnectorScope.id)
+            .where(
+                ConnectorScope.organization_id == request.organization_id,
+                ConnectorScope.connector_id == request.connector_id,
+                ConnectorScope.id == request.connector_scope_id,
+            )
+            .with_for_update(),
+            "generation scope lock failed",
+        )
+        if scope is None:
+            raise SyncWorkLedgerNotFound("generation scope context was not found")
         job = self._one(
             select(ConnectorSyncJob)
             .where(
@@ -1009,6 +1035,346 @@ class ConnectorSyncWorkLedgerRepository:
             open_barrier,
         )
 
+    def promote_generation(
+        self,
+        request: GenerationPromotionRequest,
+        *,
+        now: datetime,
+    ) -> GenerationPromotionResult:
+        """Atomically validate, activate, and retire generation retrieval state."""
+        if not isinstance(request, GenerationPromotionRequest):
+            raise InvalidSyncWorkLedgerRequest("generation promotion request is invalid")
+        now = _aware("now", now)
+
+        scope = self._one(
+            select(ConnectorScope)
+            .where(
+                ConnectorScope.organization_id == request.organization_id,
+                ConnectorScope.connector_id == request.connector_id,
+                ConnectorScope.id == request.connector_scope_id,
+            )
+            .with_for_update(),
+            "generation promotion scope lock failed",
+        )
+        generation = self._locked_generation(
+            request.organization_id, request.generation_id
+        )
+        if scope is None or generation is None:
+            raise SyncWorkLedgerNotFound("generation promotion context was not found")
+        if (
+            scope.status != "active"
+            or scope.scope_type != "repository"
+            or scope.external_scope_key != request.repository_identity
+            or not _generation_promotion_matches(generation, request)
+        ):
+            raise SyncWorkLedgerConflict("generation promotion attribution changed")
+
+        job = self._one(
+            select(ConnectorSyncJob)
+            .where(
+                ConnectorSyncJob.organization_id == request.organization_id,
+                ConnectorSyncJob.connector_id == request.connector_id,
+                ConnectorSyncJob.connector_scope_id == request.connector_scope_id,
+                ConnectorSyncJob.id == request.sync_job_id,
+            )
+            .with_for_update(),
+            "generation promotion job lock failed",
+        )
+        if (
+            job is None
+            or job.status != "succeeded"
+            or job.cancel_requested_at is not None
+        ):
+            raise SyncWorkLedgerConflict("generation promotion job is not successful")
+
+        activations = self._all(
+            select(ConnectorSyncGenerationActivation)
+            .where(
+                ConnectorSyncGenerationActivation.organization_id
+                == request.organization_id,
+                ConnectorSyncGenerationActivation.connector_id
+                == request.connector_id,
+                ConnectorSyncGenerationActivation.connector_scope_id
+                == request.connector_scope_id,
+            )
+            .order_by(
+                ConnectorSyncGenerationActivation.activated_at,
+                ConnectorSyncGenerationActivation.id,
+            )
+            .with_for_update(),
+            "generation activation lock failed",
+        )
+        existing = next(
+            (row for row in activations if row.generation_id == request.generation_id),
+            None,
+        )
+        active = next(
+            (
+                row
+                for row in activations
+                if row.status == GenerationActivationStatus.ACTIVE.value
+            ),
+            None,
+        )
+        if existing is not None and existing.status != GenerationActivationStatus.ACTIVE.value:
+            raise SyncWorkLedgerConflict("retired generation cannot be promoted")
+        if active is not None and active is not existing:
+            active_generation = self._locked_generation(
+                request.organization_id, active.generation_id
+            )
+            if active_generation is None:
+                raise SyncWorkLedgerConflict("active generation is unavailable")
+
+        materialization_count, chunk_count = self._validate_promotion_projection(
+            generation, allow_completed=existing is not None
+        )
+        if existing is not None:
+            if not _activation_matches(existing, request):
+                raise SyncWorkLedgerConflict("active generation attribution changed")
+            return GenerationPromotionResult(
+                _activation_view(existing),
+                False,
+                None,
+                materialization_count,
+                chunk_count,
+            )
+
+        newer = self._one(
+            select(func.count(ConnectorSyncGeneration.id)).where(
+                ConnectorSyncGeneration.organization_id == request.organization_id,
+                ConnectorSyncGeneration.connector_id == request.connector_id,
+                ConnectorSyncGeneration.connector_scope_id
+                == request.connector_scope_id,
+                ConnectorSyncGeneration.id != request.generation_id,
+                or_(
+                    ConnectorSyncGeneration.created_at > generation.created_at,
+                    and_(
+                        ConnectorSyncGeneration.created_at == generation.created_at,
+                        ConnectorSyncGeneration.id > generation.id,
+                    ),
+                ),
+            ),
+            "newer generation lookup failed",
+        )
+        if newer:
+            raise SyncWorkLedgerConflict("stale generation cannot be promoted")
+
+        retired_generation_id = None
+        if active is not None:
+            active.status = GenerationActivationStatus.RETIRED.value
+            active.retired_at = now
+            active.updated_at = now
+            retired_generation_id = active.generation_id
+
+        activation = ConnectorSyncGenerationActivation(
+            id=self._new_uuid("activation_id", self._activation_id_factory),
+            organization_id=request.organization_id,
+            connector_id=request.connector_id,
+            connector_scope_id=request.connector_scope_id,
+            generation_id=request.generation_id,
+            repository_identity=request.repository_identity,
+            commit_object_id=request.commit_object_id,
+            profile_fingerprint=request.profile_fingerprint,
+            status=GenerationActivationStatus.ACTIVE.value,
+            activated_at=now,
+            retired_at=None,
+            created_at=now,
+            updated_at=now,
+        )
+        self._session.add(activation)
+        generation.status = RepositoryGenerationStatus.COMPLETED.value
+        generation.terminal_at = now
+        generation.updated_at = now
+        self._flush("generation promotion failed")
+        return GenerationPromotionResult(
+            _activation_view(activation),
+            True,
+            retired_generation_id,
+            materialization_count,
+            chunk_count,
+        )
+
+    def _validate_promotion_projection(
+        self, generation: ConnectorSyncGeneration, *, allow_completed: bool
+    ) -> tuple[int, int]:
+        allowed_statuses = {RepositoryGenerationStatus.PROCESSING.value}
+        if allow_completed:
+            allowed_statuses.add(RepositoryGenerationStatus.COMPLETED.value)
+        if not generation.discovery_complete or generation.status not in allowed_statuses:
+            raise SyncWorkLedgerConflict("generation is not promotion eligible")
+
+        work_rows = self._all(
+            select(ConnectorSyncFileWorkItem)
+            .where(
+                ConnectorSyncFileWorkItem.organization_id == generation.organization_id,
+                ConnectorSyncFileWorkItem.generation_id == generation.id,
+            )
+            .order_by(ConnectorSyncFileWorkItem.id)
+            .with_for_update(),
+            "generation work validation failed",
+        )
+        if (
+            len(work_rows) != generation.items_registered
+            or any(row.status != FileWorkStatus.SUCCEEDED.value for row in work_rows)
+            or len({row.source_key_hash for row in work_rows}) != len(work_rows)
+            or len({row.repository_path for row in work_rows}) != len(work_rows)
+        ):
+            raise SyncWorkLedgerConflict("generation work is not completely successful")
+
+        materializations = self._all(
+            select(ConnectorSyncFileMaterialization)
+            .where(
+                ConnectorSyncFileMaterialization.organization_id
+                == generation.organization_id,
+                ConnectorSyncFileMaterialization.generation_id == generation.id,
+            )
+            .order_by(ConnectorSyncFileMaterialization.id)
+            .with_for_update(),
+            "generation materialization validation failed",
+        )
+        work_by_id = {row.id: row for row in work_rows}
+        if len(materializations) != len(work_rows):
+            raise SyncWorkLedgerConflict("generation materializations are incomplete")
+        for materialization in materializations:
+            work = work_by_id.get(materialization.work_item_id)
+            if work is None or not _persisted_promotion_materialization_matches(
+                materialization, generation, work
+            ):
+                raise SyncWorkLedgerConflict("generation materialization attribution changed")
+
+        chunk_rows = self._all(
+            select(ConnectorSyncFileMaterializationChunk)
+            .where(
+                ConnectorSyncFileMaterializationChunk.organization_id
+                == generation.organization_id,
+                ConnectorSyncFileMaterializationChunk.generation_id == generation.id,
+            )
+            .order_by(
+                ConnectorSyncFileMaterializationChunk.materialization_id,
+                ConnectorSyncFileMaterializationChunk.chunk_index,
+            )
+            .with_for_update(),
+            "generation materialization chunk validation failed",
+        )
+        chunks_by_materialization: dict[UUID, list[ConnectorSyncFileMaterializationChunk]] = {}
+        for chunk in chunk_rows:
+            chunks_by_materialization.setdefault(chunk.materialization_id, []).append(chunk)
+        if any(
+            len(chunks_by_materialization.get(materialization.id, ()))
+            != materialization.chunk_count
+            or any(
+                chunk.chunk_index != index
+                or chunk.embedding_model != materialization.embedding_model
+                for index, chunk in enumerate(
+                    chunks_by_materialization.get(materialization.id, ())
+                )
+            )
+            for materialization in materializations
+        ):
+            raise SyncWorkLedgerConflict("generation materialization chunks are incomplete")
+
+        projection_count = self._one(
+            select(func.count(func.distinct(ConnectorSyncFileMaterialization.id)))
+            .select_from(ConnectorSyncFileMaterialization)
+            .join(
+                SourceItem,
+                and_(
+                    SourceItem.organization_id
+                    == ConnectorSyncFileMaterialization.organization_id,
+                    SourceItem.connector_id
+                    == ConnectorSyncFileMaterialization.connector_id,
+                    SourceItem.source_item_key
+                    == ConnectorSyncFileMaterialization.source_item_key,
+                ),
+            )
+            .join(
+                SourceItemScopeMembership,
+                and_(
+                    SourceItemScopeMembership.organization_id
+                    == SourceItem.organization_id,
+                    SourceItemScopeMembership.connector_id == SourceItem.connector_id,
+                    SourceItemScopeMembership.source_item_id == SourceItem.id,
+                    SourceItemScopeMembership.connector_scope_id
+                    == ConnectorSyncFileMaterialization.connector_scope_id,
+                ),
+            )
+            .join(
+                DocumentVersion,
+                and_(
+                    DocumentVersion.organization_id == SourceItem.organization_id,
+                    DocumentVersion.connector_id == SourceItem.connector_id,
+                    DocumentVersion.source_item_id == SourceItem.id,
+                ),
+            )
+            .join(
+                DocumentVersionDocument,
+                and_(
+                    DocumentVersionDocument.organization_id
+                    == DocumentVersion.organization_id,
+                    DocumentVersionDocument.document_version_id == DocumentVersion.id,
+                ),
+            )
+            .join(
+                Document,
+                and_(
+                    Document.organization_id == DocumentVersionDocument.organization_id,
+                    Document.id == DocumentVersionDocument.document_id,
+                ),
+            )
+            .join(
+                DocumentIndexingState,
+                and_(
+                    DocumentIndexingState.organization_id
+                    == DocumentVersion.organization_id,
+                    DocumentIndexingState.document_version_id == DocumentVersion.id,
+                    DocumentIndexingState.profile_fingerprint
+                    == ConnectorSyncFileMaterialization.profile_fingerprint,
+                ),
+            )
+            .where(
+                ConnectorSyncFileMaterialization.organization_id
+                == generation.organization_id,
+                ConnectorSyncFileMaterialization.generation_id == generation.id,
+                SourceItem.status == "active",
+                SourceItem.deleted_at.is_(None),
+                SourceItem.source_version
+                == ConnectorSyncFileMaterialization.provider_blob_id,
+                SourceItem.source_checksum
+                == ConnectorSyncFileMaterialization.content_checksum,
+                SourceItem.source_metadata["repository_identity"].as_string()
+                == generation.repository_identity,
+                SourceItem.source_metadata["repository_path"].as_string()
+                == ConnectorSyncFileMaterialization.repository_path,
+                SourceItem.source_metadata["blob_object_id"].as_string()
+                == ConnectorSyncFileMaterialization.provider_blob_id,
+                SourceItem.source_metadata["snapshot_commit_id"].as_string()
+                == generation.commit_object_id,
+                SourceItemScopeMembership.status == "active",
+                SourceItemScopeMembership.removed_at.is_(None),
+                DocumentVersion.is_current.is_(True),
+                DocumentVersion.lifecycle == "available",
+                DocumentVersion.provider_version_id
+                == ConnectorSyncFileMaterialization.provider_blob_id,
+                DocumentVersion.content_checksum
+                == ConnectorSyncFileMaterialization.content_checksum,
+                Document.status == "ready",
+                Document.deleted_at.is_(None),
+                Document.source_type == "github",
+                Document.source_document_key
+                == ConnectorSyncFileMaterialization.source_item_key,
+                DocumentIndexingState.status == "indexed",
+                DocumentIndexingState.indexed_generation
+                == DocumentIndexingState.desired_generation,
+                DocumentIndexingState.embedding_model
+                == ConnectorSyncFileMaterialization.embedding_model,
+                DocumentIndexingState.embedding_dimensions == 1536,
+            ),
+            "generation citation projection validation failed",
+        )
+        if projection_count != len(materializations):
+            raise SyncWorkLedgerConflict("generation citation projection is incomplete")
+        return len(materializations), len(chunk_rows)
+
     def get_work_item(
         self, organization_id: UUID, generation_id: UUID, work_item_id: UUID
     ) -> FileWorkItemView | None:
@@ -1386,6 +1752,88 @@ def _generation_matches(row, request: RepositoryGenerationRegistration) -> bool:
             "root_tree_object_id",
             "profile_fingerprint",
         )
+    )
+
+
+def _generation_promotion_matches(
+    row: ConnectorSyncGeneration, request: GenerationPromotionRequest
+) -> bool:
+    return row.id == request.generation_id and all(
+        getattr(row, field) == getattr(request, field)
+        for field in (
+            "organization_id",
+            "connector_id",
+            "connector_scope_id",
+            "sync_job_id",
+            "provider_key",
+            "repository_identity",
+            "branch_name",
+            "commit_object_id",
+            "root_tree_object_id",
+            "profile_fingerprint",
+        )
+    )
+
+
+def _persisted_promotion_materialization_matches(
+    materialization: ConnectorSyncFileMaterialization,
+    generation: ConnectorSyncGeneration,
+    work: ConnectorSyncFileWorkItem,
+) -> bool:
+    return (
+        materialization.organization_id == generation.organization_id
+        and materialization.connector_id == generation.connector_id
+        and materialization.connector_scope_id == generation.connector_scope_id
+        and materialization.generation_id == generation.id
+        and materialization.work_item_id == work.id
+        and materialization.repository_identity == generation.repository_identity
+        and materialization.branch_name == generation.branch_name
+        and materialization.root_tree_object_id == generation.root_tree_object_id
+        and materialization.source_item_key == work.source_item_key
+        and materialization.source_key_hash == work.source_key_hash
+        and materialization.repository_path == work.repository_path
+        and materialization.provider_blob_id == work.provider_blob_id
+        and materialization.provider_revision_id == generation.commit_object_id
+        and materialization.provider_revision_id == work.provider_revision_id
+        and materialization.profile_fingerprint == generation.profile_fingerprint
+        and materialization.profile_fingerprint == work.profile_fingerprint
+        and materialization.chunk_count > 0
+    )
+
+
+def _activation_matches(
+    row: ConnectorSyncGenerationActivation, request: GenerationPromotionRequest
+) -> bool:
+    return (
+        row.organization_id == request.organization_id
+        and row.connector_id == request.connector_id
+        and row.connector_scope_id == request.connector_scope_id
+        and row.generation_id == request.generation_id
+        and row.repository_identity == request.repository_identity
+        and row.commit_object_id == request.commit_object_id
+        and row.profile_fingerprint == request.profile_fingerprint
+        and row.status == GenerationActivationStatus.ACTIVE.value
+        and row.retired_at is None
+    )
+
+
+def _activation_view(
+    row: ConnectorSyncGenerationActivation,
+) -> GenerationActivationView:
+    return GenerationActivationView(
+        row.id,
+        row.organization_id,
+        row.connector_id,
+        row.connector_scope_id,
+        row.generation_id,
+        row.repository_identity,
+        row.commit_object_id,
+        row.profile_fingerprint,
+        GenerationActivationStatus(row.status),
+        row.activated_at,
+        row.retired_at,
+        row.created_at,
+        row.updated_at,
     )
 
 

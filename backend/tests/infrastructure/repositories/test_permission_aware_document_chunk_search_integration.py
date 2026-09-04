@@ -159,6 +159,93 @@ def _search(session: Session, org: UUID, user: UUID, vector=None, limit=10):
     return PermissionAwareDocumentChunkSearchRepository(session).search(org, user, vector or _vector(1.0), MODEL, limit)
 
 
+def _activate_staged_generation(session: Session, org: UUID, path: dict[str, UUID]):
+    job, generation, work, materialization, chunk, activation = (
+        uuid.uuid4() for _ in range(6)
+    )
+    commit, tree, blob, checksum = "a" * 40, "b" * 40, "c" * 40, "d" * 64
+    profile = session.execute(
+        text("SELECT profile_fingerprint FROM document_indexing_states WHERE document_version_id=:version"),
+        {"version": path["version"]},
+    ).scalar_one()
+    source_key = session.execute(
+        text("SELECT source_item_key FROM source_items WHERE id=:source"),
+        {"source": path["source"]},
+    ).scalar_one()
+    session.execute(text("UPDATE connectors SET connector_type='github' WHERE id=:id"), {"id": path["connector"]})
+    session.execute(text("UPDATE documents SET source_type='github',source_document_key=:key WHERE id=:id"), {"id": path["document"], "key": source_key})
+    session.execute(text("UPDATE document_versions SET provider_version_id=:blob,content_checksum=:checksum,checksum_algorithm='sha256' WHERE id=:id"), {"id": path["version"], "blob": blob, "checksum": checksum})
+    session.execute(text("UPDATE connector_scopes SET external_scope_key='github:repository:123' WHERE id=:id"), {"id": path["scope"]})
+    session.execute(text("""UPDATE source_items
+        SET source_version=:blob,source_checksum=:checksum,
+            metadata=jsonb_build_object(
+                'provider','github','repository_identity','github:repository:123',
+                'repository_path','file.md','blob_object_id',
+                CAST(:blob_metadata AS varchar),
+                'snapshot_commit_id',CAST(:commit_metadata AS varchar))
+        WHERE id=:id"""), {
+            "id": path["source"], "blob": blob, "checksum": checksum,
+            "blob_metadata": blob, "commit_metadata": commit,
+        })
+    session.execute(text("""INSERT INTO connector_sync_jobs
+        (id,organization_id,connector_id,connector_scope_id,mode,trigger_type,status,
+         attempt_count,fencing_token,next_attempt_at,completed_at,created_at,updated_at)
+        VALUES (:id,:org,:connector,:scope,'incremental','manual','succeeded',1,1,NULL,
+                :now,:now,:now)"""),
+        {"id": job, "org": org, "connector": path["connector"], "scope": path["scope"], "now": NOW})
+    session.execute(text("""INSERT INTO connector_sync_generations
+        (id,organization_id,connector_id,connector_scope_id,sync_job_id,provider_key,
+         repository_identity,branch_name,commit_object_id,root_tree_object_id,
+         profile_fingerprint,status,discovery_complete,discovery_completed_at,
+         reconciliation_eligible,resync_required,items_discovered,items_registered,
+         declared_bytes,created_at,updated_at,terminal_at)
+        VALUES (:id,:org,:connector,:scope,:job,'github','github:repository:123','main',
+                :commit,:tree,:profile,'completed',true,:now,false,false,1,1,10,:now,:now,:now)"""),
+        {"id": generation, "org": org, "connector": path["connector"], "scope": path["scope"],
+         "job": job, "commit": commit, "tree": tree, "profile": profile, "now": NOW})
+    session.execute(text("""INSERT INTO connector_sync_file_work_items
+        (id,organization_id,connector_id,connector_scope_id,generation_id,source_item_key,
+         source_key_hash,repository_path,provider_blob_id,provider_revision_id,
+         profile_fingerprint,status,attempt_count,max_attempts,fencing_token,
+         downloaded_bytes,extracted_characters,chunk_count,embedding_batch_count,
+         created_at,updated_at,terminal_at)
+        VALUES (:id,:org,:connector,:scope,:generation,:key,:hash,'file.md',:blob,:commit,
+                :profile,'succeeded',1,3,1,10,10,1,1,:now,:now,:now)"""),
+        {"id": work, "org": org, "connector": path["connector"], "scope": path["scope"],
+         "generation": generation, "key": source_key, "hash": "e" * 64,
+         "blob": blob, "commit": commit, "profile": profile, "now": NOW})
+    session.execute(text("""INSERT INTO connector_sync_file_materializations
+        (id,organization_id,connector_id,connector_scope_id,generation_id,work_item_id,
+         repository_identity,branch_name,root_tree_object_id,source_item_key,source_key_hash,
+         repository_path,provider_blob_id,provider_revision_id,profile_fingerprint,
+         content_checksum,title,mime_type,embedding_model,chunk_count,created_at)
+        VALUES (:id,:org,:connector,:scope,:generation,:work,'github:repository:123','main',
+                :tree,:key,:hash,'file.md',:blob,:commit,:profile,:checksum,'Staged',
+                'text/markdown',:model,1,:now)"""),
+        {"id": materialization, "org": org, "connector": path["connector"], "scope": path["scope"],
+         "generation": generation, "work": work, "tree": tree, "key": source_key,
+         "hash": "e" * 64, "blob": blob, "commit": commit, "profile": profile,
+         "checksum": checksum, "model": MODEL, "now": NOW})
+    session.execute(text("""INSERT INTO connector_sync_file_materialization_chunks
+        (id,organization_id,generation_id,materialization_id,chunk_index,chunk_text,
+         content_hash,embedding,embedding_model,created_at)
+        VALUES (:id,:org,:generation,:materialization,0,'activated-ledger-chunk',:hash,
+                CAST(:embedding AS vector),:model,:now)"""),
+        {"id": chunk, "org": org, "generation": generation, "materialization": materialization,
+         "hash": "f" * 64, "embedding": "[" + ",".join(str(v) for v in _vector(1.0)) + "]",
+         "model": MODEL, "now": NOW})
+    session.execute(text("""INSERT INTO connector_sync_generation_activations
+        (id,organization_id,connector_id,connector_scope_id,generation_id,
+         repository_identity,commit_object_id,profile_fingerprint,status,
+         activated_at,created_at,updated_at)
+        VALUES (:id,:org,:connector,:scope,:generation,'github:repository:123',:commit,
+                :profile,'active',:now,:now,:now)"""),
+        {"id": activation, "org": org, "connector": path["connector"], "scope": path["scope"],
+         "generation": generation, "commit": commit, "profile": profile, "now": NOW})
+    session.flush()
+    return chunk, generation, activation
+
+
 @pytest.mark.parametrize("grant_kind", ["organization", "department", "team", "user"])
 def test_platform_grant_paths_allow_without_role_bypass(session: Session, grant_kind: str):
     org, user = _tenant(session, f"Platform-{grant_kind}")
@@ -323,6 +410,51 @@ def test_authorization_precedes_ranking_limit_dedup_and_ties(session: Session):
     assert unauthorized["chunk"] not in {r.chunk_id for r in results}
     assert [r.chunk_id for r in results]==sorted([r.chunk_id for r in results])
     assert all(not hasattr(r,"embedding") and not hasattr(r,"external_principal_id") for r in results)
+
+
+def test_atomic_activation_switches_one_scope_without_mixing_legacy_chunks(session: Session):
+    org, user = _tenant(session, "LedgerActivation")
+    activated = _content_path(session, org, mode="platform_managed", chunk_vector=_vector(1.0))
+    unaffected = _content_path(session, org, mode="platform_managed", chunk_vector=_vector(0.8, 0.2))
+    _grant(session, org, user, activated["space"])
+    _grant(session, org, user, unaffected["space"])
+    session.flush()
+    before = _search(session, org, user)
+    assert activated["chunk"] in {row.chunk_id for row in before}
+    staged_chunk, _generation, _activation = _activate_staged_generation(
+        session, org, activated
+    )
+    after = _search(session, org, user)
+    ids = {row.chunk_id for row in after}
+    assert staged_chunk in ids
+    assert activated["chunk"] not in ids
+    assert unaffected["chunk"] in ids
+    assert len([row for row in after if row.connector_scope_id == activated["scope"]]) == 1
+    denied_user = _user_without_grant(session, org)
+    assert _search(session, org, denied_user) == ()
+
+
+def test_activation_attribution_drift_fails_closed_without_legacy_fallback(
+    session: Session,
+):
+    org, user = _tenant(session, "LedgerActivationDrift")
+    path = _content_path(
+        session, org, mode="platform_managed", chunk_vector=_vector(1.0)
+    )
+    _grant(session, org, user, path["space"])
+    _staged_chunk, _generation, activation = _activate_staged_generation(
+        session, org, path
+    )
+    assert len(_search(session, org, user)) == 1
+    session.execute(
+        text(
+            "UPDATE connector_sync_generation_activations "
+            "SET commit_object_id=:commit WHERE id=:id"
+        ),
+        {"commit": "9" * 40, "id": activation},
+    )
+    session.flush()
+    assert _search(session, org, user) == ()
 
 
 def test_generated_plan_contains_authorization_relations(session: Session):

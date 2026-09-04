@@ -12,6 +12,7 @@ from domain.connectors.sync_work_ledger import (
     FileWorkLease,
     FileWorkMaterialization,
     FileWorkMaterializationChunk,
+    GenerationPromotionRequest,
     RepositoryGenerationRegistration,
 )
 
@@ -173,3 +174,36 @@ def test_file_work_lease_requires_positive_fairness_sequence() -> None:
     assert fair.fairness_claim_sequence == 9
     with pytest.raises(ValueError, match="positive"):
         FileWorkLease(*values, fairness_claim_sequence=0)
+
+
+def test_generation_promotion_request_is_immutable_and_strict() -> None:
+    registration = _generation()
+    request = GenerationPromotionRequest(
+        registration.organization_id,
+        registration.connector_id,
+        registration.connector_scope_id,
+        uuid4(),
+        registration.sync_job_id,
+        registration.provider_key,
+        registration.repository_identity,
+        registration.branch_name,
+        registration.commit_object_id,
+        registration.root_tree_object_id,
+        registration.profile_fingerprint,
+    )
+    with pytest.raises(FrozenInstanceError):
+        request.commit_object_id = "c" * 40  # type: ignore[misc]
+    with pytest.raises(ValueError):
+        GenerationPromotionRequest(
+            request.organization_id,
+            request.connector_id,
+            request.connector_scope_id,
+            request.generation_id,
+            request.sync_job_id,
+            "GitHub",
+            request.repository_identity,
+            request.branch_name,
+            request.commit_object_id,
+            request.root_tree_object_id,
+            request.profile_fingerprint,
+        )

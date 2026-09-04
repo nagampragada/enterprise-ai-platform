@@ -111,9 +111,22 @@ service class. The processing gate remains strict and default-off, and planning
 remains absent from the dedicated host. Structured logs may identify the
 selected organization UUID, committed scheduling sequence, and distinct
 organizations whose committed claims were processed, but never names, content,
-vectors, provider payloads, URLs, credentials, or tokens. Slice 3 is
-implemented locally and has not been built or deployed. It does not implement
-promotion, reconciliation, retrieval activation, or staging cleanup.
+vectors, provider payloads, URLs, credentials, or tokens.
+
+Phase 3 Slice 4 adds an internal atomic promotion contract. It remains
+default-off and is not invoked by an API, scheduler, legacy worker, or dedicated
+processing host. Promotion locks the exact active repository scope and rejects
+incomplete, unsuccessful, stale, mismatched, or cross-tenant state. One
+transaction retires the previous activation and activates the complete staged
+generation. Permission-aware retrieval preserves organization, knowledge-space,
+scope, membership, and ACL checks; it excludes legacy chunks for an activated
+scope and ranks only the single active generation. Failure rolls back to the
+previous authority and replay is idempotent. Telemetry is limited to UUIDs,
+counts, and fixed outcomes.
+
+Slice 5 retains deletion reconciliation and durable legacy lifecycle changes.
+Slice 6 retains staging cleanup/retention, automatic orchestration, and rollout
+hardening.
 
 Turn serialization is not an active-processing concurrency limit. Once a claim
 commits, another transaction may claim another item for the same organization

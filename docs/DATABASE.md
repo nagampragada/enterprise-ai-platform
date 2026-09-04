@@ -2,15 +2,12 @@
 
 ## Organization-fair ledger claims (`20260902_000022`)
 
-The Phase 3 expand-migration rollout uses an explicit schema compatibility
-window. The application head is `20260902_000022`, while readiness accepts
-exactly `20260831_000021` and `20260902_000022`. At the predecessor revision it
-reports compatible but not current with migration required; at the application
-head it reports compatible and current. There is no lexical ordering, prefix,
-timestamp, minimum-version, or range comparison, and multiple or unknown heads
-fail closed. Compatibility with `20260831_000021` is temporary rollout policy
-and must be removed in a later cleanup only after every environment reaches
-`20260902_000022`.
+The Slice 3 fairness rollout used an explicit compatibility window containing
+only `20260831_000021` and `20260902_000022`. That historical window is
+superseded by the Slice 4 compatibility policy documented below. Compatibility
+is always an exact allowlist: there is no lexical ordering, prefix, timestamp,
+minimum-version, or range comparison, and multiple or unknown heads fail
+closed.
 
 Migration `20260902_000022` adds only
 `connector_sync_organization_claim_schedules` and the monotonic
@@ -66,7 +63,7 @@ Schedule rows are retained while their organization exists, including when it
 temporarily has no eligible work; later generations resume from the retained
 least-recently-served position. Organization deletion cascades only its schedule
 row. Ledger and materialization foreign-key lifecycles are unchanged. Any broader
-retention or cleanup policy remains a future Phase 4 concern.
+retention or cleanup policy remains a future Slice 6 concern.
 
 Migration `20260902_000022` creates `ix_sync_file_work_fair_eligible` with an
 ordinary transactional `CREATE INDEX`. PostgreSQL can hold a table-level lock
@@ -80,9 +77,43 @@ tested concurrent-index convention if production volume requires one.
 The API does not query the schedule table during startup or readiness, so the
 compatible predecessor remains safe during the expand migration. The legacy
 synchronization queue and legacy-first optional ledger path retain their
-existing ordering. Fairness is limited to the dedicated host; promotion,
-reconciliation, deletion, staging publication, cleanup, and retrieval switching
-remain future work.
+existing ordering. Fairness is limited to the dedicated host. Promotion is an
+explicit default-off application transaction; its orchestration, reconciliation,
+deletion, and staging cleanup remain future work.
+
+## Atomic generation retrieval activation (`20260904_000023`)
+
+Migration `20260904_000023` adds
+`connector_sync_generation_activations`, an activation history with exactly one
+partial-unique `active` row per tenant-qualified connector repository scope.
+Each row is foreign-key bound to the same organization, connector, scope,
+generation, and profile. A successful cutover retires the prior row and inserts
+the next active row in the same caller-owned transaction; rollback preserves the
+previous authority. Readiness accepts only predecessor `20260902_000022` and
+current `20260904_000023` during this additive transition.
+
+`GitHubSyncGenerationPromotionService` requires explicit
+`GITHUB_SYNC_LEDGER_PROMOTION_ENABLED=true`. The flag defaults to `false` and
+uses exact lowercase Boolean parsing. No current API, scheduler, legacy worker,
+or dedicated processing host invokes promotion automatically. Generation
+registration and promotion lock the tenant-qualified repository scope first,
+so creation of a newer generation cannot cross the stale-generation decision.
+Promotion then verifies the exact generation and successful source job,
+completed discovery, absence of a newer generation, all registered items
+in `succeeded`, one immutable materialization per item, complete ordered chunks,
+and matching active legacy citation/indexing identities. Pending, retrying,
+skipped, quarantined, failed, cancelled, missing, duplicate, stale, mismatched,
+and cross-tenant state fails closed.
+
+Permission-aware retrieval still authorizes tenant, knowledge space, scope,
+source membership, and ACLs before ranking. Without an activation it reads the
+legacy chunks. With an activation it excludes legacy chunks for that scope and
+reads only the single active generation's staged chunks; invalid activated state
+returns no rows rather than falling back. Stable citation IDs come from the
+validated current legacy projection, but promotion does not mutate legacy
+source, version, indexing, document, or chunk rows. Deletion reconciliation,
+physical legacy retirement, staging cleanup/retention, scheduling, and API/UI
+controls remain Slices 5 and 6.
 
 ## Retrieval-isolated file-work materialization (`20260831_000021`)
 
@@ -91,13 +122,12 @@ and `connector_sync_file_work_items` control-plane tables. When the optional
 worker flag `GITHUB_SYNC_LEDGER_PLANNING_ENABLED=true` is set, the existing
 GitHub traversal shadows each pinned snapshot into these tables in bounded
 transactions. The flag defaults to false and accepts only lowercase `true` or
-`false`. Local Folder synchronization, generation promotion, and retrieval do
-not consume the ledger. A separate strict worker-only
+`false`. Local Folder synchronization does not consume the ledger. A separate strict worker-only
 `GITHUB_SYNC_LEDGER_PROCESSING_ENABLED=true` gate enables one-at-a-time GitHub
 file-work claiming only after discovery is complete and only when the legacy
-job queue is empty. Its default is false. The first processing slice reuses the
-existing extraction/chunking/embedding/materialization pipeline but performs no
-generation promotion or distributed deletion reconciliation.
+job queue is empty. Its default is false. The processing slice reuses the
+existing extraction/chunking/embedding/materialization pipeline. Promotion is a
+separate explicit transaction; distributed deletion reconciliation is absent.
 
 `connector_sync_generations` pins one provider repository, branch, commit, root
 tree, and complete extraction/chunking/embedding profile to one originating
@@ -107,7 +137,7 @@ Discovery completion, reconciliation eligibility, and durable follow-up intent
 are separate state pairs. The repository supplied by this slice calculates
 eligibility read-only: the barrier opens only after discovery is complete and
 every registered item is terminal. It does not set the stored reconciliation
-flag, promote a generation, reconcile deletions, or make any generation current.
+flag or reconcile deletions; promotion applies the stricter all-success barrier.
 
 `connector_sync_file_work_items` stores independently claimable metadata only:
 tenant/scope/generation identity, source key and repository path, provider blob
@@ -130,9 +160,8 @@ hashes, embedding-model attribution, and `Vector(1536)` output exclusively by
 organization, connector, scope, generation, and work item. They deliberately
 have no foreign key or materialization link to `source_items`, `documents`,
 `document_versions`, `document_indexing_states`, or `document_chunks`, and the
-permission-aware retrieval SQL does not join them. Phase 3 output therefore
-cannot become visible or replace legacy-authoritative content before a future
-explicit generation-promotion transaction.
+permission-aware retrieval SQL reaches them only through one validated active
+generation. Unpromoted output remains retrieval-invisible.
 
 File-work provider preparation occurs without an open database transaction.
 The final transaction locks and revalidates the active lease and monotonic

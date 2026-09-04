@@ -57,7 +57,7 @@ class FakeEngine:
 @pytest.mark.parametrize(
     ("revision", "schema_current", "migration_required"),
     (
-        ("20260831_000021", False, True),
+        ("20260902_000022", False, True),
         (db_health.EXPECTED_ALEMBIC_REVISION, True, False),
     ),
 )
@@ -85,7 +85,7 @@ def test_known_transition_revisions_are_compatible(
         ("20260901_000022",),
         ("not-an-alembic-revision",),
         (),
-        ("20260831_000021", "20260902_000022"),
+        ("20260902_000022", "20260904_000023"),
     ),
 )
 def test_unknown_missing_malformed_or_branched_revisions_are_incompatible(

@@ -15,6 +15,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from application.services.github_repository_content_service import (
@@ -31,12 +32,15 @@ from domain.connectors.sync_work_ledger import (
     FileWorkMaterialization,
     FileWorkMaterializationChunk,
     FileWorkStatus,
+    GenerationPromotionRequest,
     RepositoryGenerationRegistration,
 )
 from infrastructure.db.models import (
     ConnectorSyncFileMaterialization,
     ConnectorSyncFileMaterializationChunk,
     ConnectorSyncFileWorkItem,
+    ConnectorSyncGeneration,
+    ConnectorSyncGenerationActivation,
     ConnectorSyncOrganizationClaimSchedule,
     Organization,
 )
@@ -320,6 +324,142 @@ def _materialization(generation, work, *, text_value="alpha"):
             ),
         ),
     )
+
+
+def _promotion_request(generation) -> GenerationPromotionRequest:
+    return GenerationPromotionRequest(
+        generation.organization_id,
+        generation.connector_id,
+        generation.connector_scope_id,
+        generation.generation_id,
+        generation.sync_job_id,
+        generation.provider_key,
+        generation.repository_identity,
+        generation.branch_name,
+        generation.commit_object_id,
+        generation.root_tree_object_id,
+        generation.profile_fingerprint,
+    )
+
+
+def _ready_promotion(session: Session, label: str = "Promotion"):
+    context, generation = _generation(session, label)
+    _register(session, context[0], generation.generation_id, (_entry(1),))
+    repository = ConnectorSyncWorkLedgerRepository(session)
+    repository.mark_discovery_complete(context[0], generation.generation_id, now=NOW)
+    session.commit()
+    lease = repository.claim_next(
+        context[0], generation.generation_id,
+        worker_id="promotion-worker", now=NOW, lease_duration=LEASE,
+    )
+    session.commit()
+    assert lease is not None
+    generation = repository.get_generation(context[0], generation.generation_id)
+    work = repository.get_work_item(context[0], generation.generation_id, lease.work_item_id)
+    assert generation is not None and work is not None
+    materialization = _materialization(generation, work)
+    repository.stage_materialization_and_complete(
+        lease,
+        worker_id="promotion-worker",
+        generation=generation,
+        work_item=work,
+        materialization=materialization,
+        counters=FileWorkCounters(5, 5, 1, 1),
+        now=NOW,
+    )
+    source_id, version_id, document_id = uuid4(), uuid4(), uuid4()
+    session.execute(
+        text("UPDATE connector_scopes SET external_scope_key=:key WHERE id=:scope"),
+        {"key": generation.repository_identity, "scope": context[2]},
+    )
+    session.execute(text("""INSERT INTO source_items
+        (id,organization_id,connector_id,source_item_key,source_item_type,title,
+         mime_type,source_checksum,source_version,size_bytes,first_seen_at,last_seen_at,
+         status,metadata)
+        VALUES (:id,:org,:connector,:key,'file','File',:mime,:checksum,:blob,101,
+                :now,:now,'active',CAST(:metadata AS jsonb))"""), {
+        "id": source_id, "org": context[0], "connector": context[1],
+        "key": work.source_item_key, "mime": work.mime_type,
+        "checksum": materialization.content_checksum, "blob": work.provider_blob_id,
+        "now": NOW, "metadata": json.dumps({
+            "provider": "github", "repository_identity": generation.repository_identity,
+            "repository_path": work.repository_path, "blob_object_id": work.provider_blob_id,
+            "snapshot_commit_id": generation.commit_object_id,
+        }),
+    })
+    session.execute(text("""INSERT INTO source_item_scope_memberships
+        (id,organization_id,connector_id,source_item_id,connector_scope_id,status,
+         first_discovered_at,last_seen_at)
+        VALUES (:id,:org,:connector,:source,:scope,'active',:now,:now)"""), {
+        "id": uuid4(), "org": context[0], "connector": context[1], "source": source_id,
+        "scope": context[2], "now": NOW,
+    })
+    session.execute(text("""INSERT INTO document_versions
+        (id,organization_id,connector_id,source_item_id,version_number,provider_version_id,
+         content_checksum,checksum_algorithm,source_size_bytes,content_type,file_extension,
+         version_cause,lifecycle,is_current,discovered_at)
+        VALUES (:id,:org,:connector,:source,1,:blob,:checksum,'sha256',101,:mime,'.md',
+                'discovered','available',true,:now)"""), {
+        "id": version_id, "org": context[0], "connector": context[1], "source": source_id,
+        "blob": work.provider_blob_id, "checksum": materialization.content_checksum,
+        "mime": work.mime_type, "now": NOW,
+    })
+    session.execute(text("""INSERT INTO documents
+        (id,organization_id,source_type,source_document_key,title,mime_type,checksum_latest,status)
+        VALUES (:id,:org,'github',:key,'File',:mime,:checksum,'ready')"""), {
+        "id": document_id, "org": context[0], "key": work.source_item_key,
+        "mime": work.mime_type, "checksum": materialization.content_checksum,
+    })
+    session.execute(text("""INSERT INTO document_version_documents
+        (id,organization_id,document_version_id,document_id)
+        VALUES (:id,:org,:version,:document)"""), {
+        "id": uuid4(), "org": context[0], "version": version_id, "document": document_id,
+    })
+    session.execute(text("""INSERT INTO document_indexing_states
+        (id,organization_id,document_version_id,extraction_profile,extraction_version,
+         chunking_profile,chunking_version,embedding_provider,embedding_model,
+         embedding_dimensions,profile_fingerprint,desired_generation,indexed_generation,
+         status,reason,attempt_count,requested_at,started_at,completed_at)
+        VALUES (:id,:org,:version,'github','v1','deterministic','v2','test',:model,1536,
+                :profile,1,1,'indexed','new_version',1,:now,:now,:now)"""), {
+        "id": uuid4(), "org": context[0], "version": version_id,
+        "model": materialization.embedding_model, "profile": generation.profile_fingerprint,
+        "now": NOW,
+    })
+    session.execute(text("""UPDATE connector_sync_jobs
+        SET status='succeeded',attempt_count=1,fencing_token=1,next_attempt_at=NULL,
+            completed_at=created_at WHERE id=:job"""), {"job": context[3]})
+    session.commit()
+    return context, generation, work, source_id, version_id, document_id
+
+
+def _new_generation_same_scope(session: Session, context, *, created_at, discovered=0):
+    job_id, generation_id = uuid4(), uuid4()
+    session.execute(text("""INSERT INTO connector_sync_jobs
+        (id,organization_id,connector_id,connector_scope_id,mode,trigger_type,status,
+         attempt_count,fencing_token,next_attempt_at,completed_at,created_at,updated_at)
+        VALUES (:id,:org,:connector,:scope,'incremental','manual','succeeded',1,1,NULL,
+                :now,:now,:now)"""), {
+        "id": job_id, "org": context[0], "connector": context[1],
+        "scope": context[2], "now": created_at,
+    })
+    session.execute(text("""INSERT INTO connector_sync_generations
+        (id,organization_id,connector_id,connector_scope_id,sync_job_id,provider_key,
+         repository_identity,branch_name,commit_object_id,root_tree_object_id,
+         profile_fingerprint,status,discovery_complete,discovery_completed_at,
+         reconciliation_eligible,resync_required,items_discovered,items_registered,
+         declared_bytes,created_at,updated_at)
+        VALUES (:id,:org,:connector,:scope,:job,'github','github:repository:123456',
+                'main',:commit,:tree,:profile,'processing',true,:now,false,false,
+                :count,:count,0,:now,:now)"""), {
+        "id": generation_id, "org": context[0], "connector": context[1],
+        "scope": context[2], "job": job_id, "commit": "f" * 40,
+        "tree": "e" * 40, "profile": PROFILE, "count": discovered, "now": created_at,
+    })
+    session.commit()
+    row = ConnectorSyncWorkLedgerRepository(session).get_generation(context[0], generation_id)
+    assert row is not None
+    return row
 
 
 def test_generation_and_duplicate_manifest_registration_are_idempotent(engine) -> None:
@@ -1433,6 +1573,386 @@ def test_materialization_rollback_preserves_running_work_and_no_staged_rows(engi
         assert session.scalar(
             select(func.count()).select_from(ConnectorSyncFileMaterializationChunk)
         ) == 0
+
+
+def test_complete_generation_promotion_is_atomic_and_idempotent(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation, _work, *_ = _ready_promotion(session)
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        request = _promotion_request(generation)
+        first = repository.promote_generation(request, now=NOW + timedelta(minutes=1))
+        session.commit()
+        replay = repository.promote_generation(request, now=NOW + timedelta(minutes=2))
+        session.commit()
+        assert first.promoted is True
+        assert replay.promoted is False
+        assert replay.activation.activation_id == first.activation.activation_id
+        assert (first.materialization_count, first.chunk_count) == (1, 1)
+        assert session.scalar(select(func.count()).select_from(ConnectorSyncGenerationActivation)) == 1
+        persisted = repository.get_generation(context[0], generation.generation_id)
+        assert persisted is not None
+        assert persisted.status.value == "completed"
+
+
+@pytest.mark.parametrize(
+    "status",
+    ("pending", "retry_wait", "failed", "cancelled", "quarantined"),
+)
+def test_promotion_rejects_every_unsuccessful_work_state(engine, status: str) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation, work, *_ = _ready_promotion(session, f"Reject-{status}")
+        values = {
+            "status": status,
+            "next": NOW if status in {"pending", "retry_wait"} else None,
+            "terminal": None if status in {"pending", "retry_wait"} else NOW,
+            "category": "internal" if status in {"failed", "quarantined"} else None,
+            "code": "forced_failure" if status in {"failed", "quarantined"} else None,
+            "quarantine": "forced_failure" if status == "quarantined" else None,
+            "cancel": NOW if status == "cancelled" else None,
+            "cancel_reason": "operator_cancelled" if status == "cancelled" else None,
+            "work": work.work_item_id,
+        }
+        session.execute(text("""UPDATE connector_sync_file_work_items SET
+            status=:status,next_attempt_at=:next,terminal_at=:terminal,
+            last_error_category=:category,last_error_code=:code,
+            quarantine_reason_code=:quarantine,cancel_requested_at=:cancel,
+            cancel_reason_code=:cancel_reason
+            WHERE id=:work"""), values)
+        session.commit()
+        with pytest.raises(SyncWorkLedgerConflict, match="completely successful"):
+            ConnectorSyncWorkLedgerRepository(session).promote_generation(
+                _promotion_request(generation), now=NOW + timedelta(minutes=1)
+            )
+        session.rollback()
+        assert session.scalar(select(func.count()).select_from(ConnectorSyncGenerationActivation)) == 0
+
+
+def test_promotion_rejects_missing_and_mismatched_staging(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        _context, generation, work, *_ = _ready_promotion(session, "MissingStaging")
+        session.execute(text("DELETE FROM connector_sync_file_materializations WHERE work_item_id=:id"), {"id": work.work_item_id})
+        session.commit()
+        with pytest.raises(SyncWorkLedgerConflict, match="incomplete"):
+            ConnectorSyncWorkLedgerRepository(session).promote_generation(
+                _promotion_request(generation), now=NOW + timedelta(minutes=1)
+            )
+        session.rollback()
+
+    with Session(engine, expire_on_commit=False) as session:
+        _context, generation, work, *_ = _ready_promotion(session, "MismatchedStaging")
+        session.execute(text("UPDATE connector_sync_file_materializations SET repository_identity='github:repository:999' WHERE work_item_id=:id"), {"id": work.work_item_id})
+        session.commit()
+        with pytest.raises(SyncWorkLedgerConflict, match="attribution"):
+            ConnectorSyncWorkLedgerRepository(session).promote_generation(
+                _promotion_request(generation), now=NOW + timedelta(minutes=1)
+            )
+        session.rollback()
+
+
+def test_duplicate_promotion_staging_is_rejected_by_database_identity(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        _context, _generation, work, *_ = _ready_promotion(
+            session, "DuplicateStaging"
+        )
+        with pytest.raises(IntegrityError):
+            with session.begin_nested():
+                session.execute(
+                    text(
+                        """INSERT INTO connector_sync_file_materializations
+                        SELECT :id,organization_id,connector_id,connector_scope_id,
+                               generation_id,work_item_id,repository_identity,branch_name,
+                               root_tree_object_id,source_item_key,source_key_hash,
+                               repository_path,provider_blob_id,provider_revision_id,
+                               profile_fingerprint,content_checksum,title,mime_type,
+                               embedding_model,chunk_count,created_at
+                        FROM connector_sync_file_materializations
+                        WHERE work_item_id=:work"""
+                    ),
+                    {"id": uuid4(), "work": work.work_item_id},
+                )
+
+
+def test_promotion_rollback_and_later_failure_preserve_previous_activation(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation, *_ = _ready_promotion(session, "RollbackPromotion")
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        repository.promote_generation(_promotion_request(generation), now=NOW + timedelta(minutes=1))
+        session.rollback()
+        assert session.scalar(select(func.count()).select_from(ConnectorSyncGenerationActivation)) == 0
+        assert repository.get_generation(context[0], generation.generation_id).status.value == "processing"
+
+        repository.promote_generation(_promotion_request(generation), now=NOW + timedelta(minutes=1))
+        session.commit()
+        newer = _new_generation_same_scope(
+            session, context, created_at=NOW + timedelta(hours=1), discovered=1
+        )
+        replay = repository.promote_generation(
+            _promotion_request(generation), now=NOW + timedelta(hours=2)
+        )
+        assert replay.promoted is False
+        with pytest.raises(SyncWorkLedgerConflict):
+            repository.promote_generation(
+                _promotion_request(newer), now=NOW + timedelta(hours=2)
+            )
+        session.rollback()
+        active = session.scalar(select(ConnectorSyncGenerationActivation).where(ConnectorSyncGenerationActivation.status == "active"))
+        assert active is not None and active.generation_id == generation.generation_id
+
+
+def test_successful_cutover_retires_previous_generation_atomically(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, first, work, source_id, version_id, _document_id = _ready_promotion(
+            session, "RetirePrevious"
+        )
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        repository.promote_generation(
+            _promotion_request(first), now=NOW + timedelta(minutes=1)
+        )
+        session.commit()
+        second = _new_generation_same_scope(
+            session, context, created_at=NOW + timedelta(hours=1), discovered=1
+        )
+        second_work, second_materialization = uuid4(), uuid4()
+        source_key = work.source_item_key
+        path = work.repository_path
+        blob, checksum = "f" * 40, "9" * 64
+        session.execute(text("""INSERT INTO connector_sync_file_work_items
+            (id,organization_id,connector_id,connector_scope_id,generation_id,
+             source_item_key,source_key_hash,repository_path,provider_blob_id,
+             provider_revision_id,profile_fingerprint,status,attempt_count,max_attempts,
+             fencing_token,downloaded_bytes,extracted_characters,chunk_count,
+             embedding_batch_count,created_at,updated_at,terminal_at)
+            VALUES (:id,:org,:connector,:scope,:generation,:key,:hash,:path,:blob,
+                    :revision,:profile,'succeeded',1,3,1,10,10,1,1,:now,:now,:now)"""), {
+            "id": second_work, "org": context[0], "connector": context[1],
+            "scope": context[2], "generation": second.generation_id, "key": source_key,
+            "hash": "8" * 64, "path": path, "blob": blob,
+            "revision": second.commit_object_id, "profile": PROFILE,
+            "now": NOW + timedelta(hours=1),
+        })
+        session.execute(text("""INSERT INTO connector_sync_file_materializations
+            (id,organization_id,connector_id,connector_scope_id,generation_id,work_item_id,
+             repository_identity,branch_name,root_tree_object_id,source_item_key,
+             source_key_hash,repository_path,provider_blob_id,provider_revision_id,
+             profile_fingerprint,content_checksum,title,mime_type,embedding_model,
+             chunk_count,created_at)
+            VALUES (:id,:org,:connector,:scope,:generation,:work,:repository,'main',:tree,
+                    :key,:hash,:path,:blob,:revision,:profile,:checksum,'File',
+                    'text/markdown','fake:model:1536',1,:now)"""), {
+            "id": second_materialization, "org": context[0], "connector": context[1],
+            "scope": context[2], "generation": second.generation_id, "work": second_work,
+            "repository": second.repository_identity, "tree": second.root_tree_object_id,
+            "key": source_key, "hash": "8" * 64, "path": path, "blob": blob,
+            "revision": second.commit_object_id, "profile": PROFILE, "checksum": checksum,
+            "now": NOW + timedelta(hours=1),
+        })
+        session.execute(text("""INSERT INTO connector_sync_file_materialization_chunks
+            (id,organization_id,generation_id,materialization_id,chunk_index,chunk_text,
+             content_hash,embedding,embedding_model,created_at)
+            VALUES (:id,:org,:generation,:materialization,0,'new content',:hash,
+                    CAST(:embedding AS vector),'fake:model:1536',:now)"""), {
+            "id": uuid4(), "org": context[0], "generation": second.generation_id,
+            "materialization": second_materialization, "hash": "7" * 64,
+            "embedding": "[" + ",".join("1" for _ in range(1536)) + "]",
+            "now": NOW + timedelta(hours=1),
+        })
+        metadata = json.dumps({
+            "provider": "github", "repository_identity": second.repository_identity,
+            "repository_path": path, "blob_object_id": blob,
+            "snapshot_commit_id": second.commit_object_id,
+        })
+        session.execute(text("UPDATE source_items SET source_version=:blob,source_checksum=:checksum,metadata=CAST(:metadata AS jsonb) WHERE id=:id"), {"blob": blob, "checksum": checksum, "metadata": metadata, "id": source_id})
+        session.execute(text("UPDATE document_versions SET provider_version_id=:blob,content_checksum=:checksum WHERE id=:id"), {"blob": blob, "checksum": checksum, "id": version_id})
+        session.commit()
+
+        result = repository.promote_generation(
+            _promotion_request(second), now=NOW + timedelta(hours=2)
+        )
+        session.commit()
+        rows = session.scalars(
+            select(ConnectorSyncGenerationActivation).order_by(
+                ConnectorSyncGenerationActivation.activated_at
+            )
+        ).all()
+        assert result.retired_generation_id == first.generation_id
+        assert [(row.generation_id, row.status) for row in rows] == [
+            (first.generation_id, "retired"),
+            (second.generation_id, "active"),
+        ]
+        assert rows[0].retired_at == NOW + timedelta(hours=2)
+
+
+def test_stale_and_cross_tenant_generation_promotion_fail_closed(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation, *_ = _ready_promotion(session, "StalePromotion")
+        _new_generation_same_scope(session, context, created_at=NOW + timedelta(hours=1))
+        with pytest.raises(SyncWorkLedgerConflict, match="stale"):
+            ConnectorSyncWorkLedgerRepository(session).promote_generation(
+                _promotion_request(generation), now=NOW + timedelta(hours=2)
+            )
+        session.rollback()
+        wrong = replace(_promotion_request(generation), organization_id=uuid4())
+        with pytest.raises(SyncWorkLedgerNotFound):
+            ConnectorSyncWorkLedgerRepository(session).promote_generation(
+                wrong, now=NOW + timedelta(hours=2)
+            )
+        session.rollback()
+        wrong_scope = replace(
+            _promotion_request(generation), connector_scope_id=uuid4()
+        )
+        with pytest.raises(SyncWorkLedgerNotFound):
+            ConnectorSyncWorkLedgerRepository(session).promote_generation(
+                wrong_scope, now=NOW + timedelta(hours=2)
+            )
+        session.rollback()
+
+
+def test_concurrent_duplicate_promotion_converges_to_one_activation(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        _context, generation, *_ = _ready_promotion(session, "ConcurrentPromotion")
+        request = _promotion_request(generation)
+    barrier = threading.Barrier(2)
+    outcomes: list[bool] = []
+    errors: list[BaseException] = []
+
+    def promote() -> None:
+        with Session(engine) as session:
+            try:
+                barrier.wait(timeout=10)
+                result = ConnectorSyncWorkLedgerRepository(session).promote_generation(
+                    request, now=NOW + timedelta(minutes=1)
+                )
+                session.commit()
+                outcomes.append(result.promoted)
+            except BaseException as exc:  # pragma: no cover - asserted below
+                session.rollback()
+                errors.append(exc)
+
+    threads = [threading.Thread(target=promote) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(20)
+        assert not thread.is_alive()
+    assert errors == []
+    assert sorted(outcomes) == [False, True]
+    with Session(engine) as session:
+        assert session.scalar(select(func.count()).select_from(ConnectorSyncGenerationActivation)) == 1
+
+
+def test_new_generation_registration_serializes_before_stale_promotion(engine) -> None:
+    with Session(engine, expire_on_commit=False) as setup:
+        context, generation, *_ = _ready_promotion(
+            setup, "RegistrationPromotionRace"
+        )
+        newer_job_id = uuid4()
+        setup.execute(
+            text(
+                """INSERT INTO connector_sync_jobs
+                (id,organization_id,connector_id,connector_scope_id,mode,
+                 trigger_type,status,created_at,updated_at)
+                VALUES (:id,:org,:connector,:scope,'incremental','manual',
+                        'queued',:now,:now)"""
+            ),
+            {
+                "id": newer_job_id,
+                "org": context[0],
+                "connector": context[1],
+                "scope": context[2],
+                "now": NOW + timedelta(hours=1),
+            },
+        )
+        setup.commit()
+
+    newer_request = replace(
+        _generation_request((context[0], context[1], context[2], newer_job_id)),
+        commit_object_id="f" * 40,
+        root_tree_object_id="e" * 40,
+        created_at=NOW + timedelta(hours=1),
+    )
+    registration_ready = threading.Event()
+    release_registration = threading.Event()
+    promotion_started = threading.Event()
+    registration_errors: list[BaseException] = []
+    promotion_errors: list[BaseException] = []
+
+    def register_newer() -> None:
+        with Session(engine, expire_on_commit=False) as session:
+            try:
+                ConnectorSyncWorkLedgerRepository(session).register_generation(
+                    newer_request
+                )
+                registration_ready.set()
+                if not release_registration.wait(10):
+                    raise TimeoutError("registration release timed out")
+                session.commit()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                session.rollback()
+                registration_errors.append(exc)
+                registration_ready.set()
+
+    def promote_older() -> None:
+        with Session(engine, expire_on_commit=False) as session:
+            try:
+                session.execute(
+                    text(
+                        "SET LOCAL application_name = "
+                        "'phase3-slice4-promotion-race'"
+                    )
+                )
+                promotion_started.set()
+                ConnectorSyncWorkLedgerRepository(session).promote_generation(
+                    _promotion_request(generation), now=NOW + timedelta(hours=2)
+                )
+                session.commit()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                session.rollback()
+                promotion_errors.append(exc)
+
+    registrar = threading.Thread(target=register_newer)
+    registrar.start()
+    assert registration_ready.wait(10)
+    assert registration_errors == []
+
+    promoter = threading.Thread(target=promote_older)
+    promoter.start()
+    assert promotion_started.wait(10)
+    blocked = False
+    with engine.connect() as observation:
+        for _ in range(100):
+            blocked = bool(
+                observation.scalar(
+                    text(
+                        "SELECT count(*) FROM pg_stat_activity "
+                        "WHERE application_name = "
+                        "'phase3-slice4-promotion-race' "
+                        "AND wait_event_type = 'Lock'"
+                    )
+                )
+            )
+            if blocked:
+                break
+            time.sleep(0.02)
+    assert blocked
+    release_registration.set()
+    registrar.join(10)
+    promoter.join(10)
+    assert not registrar.is_alive()
+    assert not promoter.is_alive()
+    assert registration_errors == []
+    assert len(promotion_errors) == 1
+    assert isinstance(promotion_errors[0], SyncWorkLedgerConflict)
+    assert str(promotion_errors[0]) == "stale generation cannot be promoted"
+
+    with Session(engine) as verification:
+        assert verification.scalar(
+            select(func.count()).select_from(ConnectorSyncGenerationActivation)
+        ) == 0
+        assert verification.scalar(
+            select(func.count())
+            .select_from(ConnectorSyncGeneration)
+            .where(ConnectorSyncGeneration.sync_job_id == newer_job_id)
+        ) == 1
 
 
 def test_global_claim_rejects_profile_mismatch_and_cancelled_job(engine) -> None:

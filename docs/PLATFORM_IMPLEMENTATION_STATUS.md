@@ -6,9 +6,9 @@
 |---|---|
 | Repository | `enterprise-ai-platform` |
 | Snapshot branch | `main` |
-| Snapshot commit | `6352fa2c09cf09bddd6428d04c67cd88caee6460` (clean implementation baseline) |
-| Snapshot date | 2026-08-21 |
-| Alembic head | `20260902_000022` |
+| Snapshot commit | `fd8e878bb11486041934be94793178e5207f5a7d8` (base of the unstaged Slice 4 implementation) |
+| Snapshot date | 2026-09-04 |
+| Alembic head | `20260904_000023` |
 | Purpose | Authoritative, code-evidenced inventory of implemented, exposed, partial, planned, deferred, and excluded capabilities |
 | Audiences | Product owners, backend/data/security/connector/operations/UI/QA engineers, and future repository agents |
 
@@ -125,7 +125,7 @@ Evidence: `backend/pyproject.toml`, `infra/docker/docker-compose.postgres.yml`, 
 
 ## 6. Database architecture
 
-SQLAlchemy metadata contains **47 live tables**. Alembic head is `20260902_000022`; migrations are forward-ordered, tested against real PostgreSQL, and generally provide narrow downgrades. The pgvector extension downgrade is intentionally conservative because extensions can be shared infrastructure.
+SQLAlchemy metadata contains **48 live tables**. Alembic head is `20260904_000023`; migrations are forward-ordered, tested against real PostgreSQL, and generally provide narrow downgrades. The pgvector extension downgrade is intentionally conservative because extensions can be shared infrastructure.
 
 ### Organizations, users, authentication, and structure
 
@@ -174,14 +174,15 @@ SQLAlchemy metadata contains **47 live tables**. Alembic head is `20260902_00002
 | `connector_sync_items` | Per-source work in a run | UUID PK; unique tenant run/source key | `pending/processing/succeeded/skipped/failed` |
 | `connector_sync_errors` | Append-oriented safe run/item errors | UUID PK; run CASCADE, optional item SET NULL | Controlled category/code, retry metadata |
 | `connector_sync_cursors` | Versioned scope continuation | UUID PK; unique scope/version and one active cursor | Active/superseded/invalid; safe JSON or secret reference |
-| `connector_sync_generations` | Immutable pinned repository generation | UUID PK; one per sync job; tenant/scope/profile candidate keys | Discovery/processing barrier; not retrieval-visible |
+| `connector_sync_generations` | Immutable pinned repository generation | UUID PK; one per sync job; tenant/scope/profile candidate keys | Discovery/processing barrier; visible only through active promotion |
 | `connector_sync_file_work_items` | Independently leased generation file work | UUID PK; immutable logical identity; unique lease | Retry/fence/cancellation/quarantine counters |
 | `connector_sync_file_materializations` | Retrieval-isolated Phase 3 file output | UUID PK; one per generation work item; immutable logical identity | Exact repository/blob/commit/profile attribution; no legacy document FK |
-| `connector_sync_file_materialization_chunks` | Ordered staged text and vectors | UUID PK; unique materialization/index; `Vector(1536)` | Generation-owned and excluded from retrieval SQL |
+| `connector_sync_file_materialization_chunks` | Ordered staged text and vectors | UUID PK; unique materialization/index; `Vector(1536)` | Generation-owned; visible only through active promotion |
 | `connector_sync_organization_claim_schedules` | Durable dedicated-worker organization fairness | Organization UUID PK/FK; globally unique last claim sequence | Equal least-recently-served turns; no provider or retrieval data |
+| `connector_sync_generation_activations` | Auditable retrieval authority | UUID PK; tenant/scope/generation FKs; one partial-unique active scope row | Active/retired; default-off atomic cutover |
 
 Phase 3 Slice 1 and Slice 2 are production verified. Slice 2 provides a
-dedicated default-off GitHub ledger host provides bounded multi-item draining,
+dedicated default-off GitHub ledger host with bounded multi-item draining,
 safe claim runway, interruptible empty polling, signal-aware stop-before-claim,
 existing independent lease heartbeat/fencing/retry/cancellation behavior, and
 fixed nonsecret summaries. Expected durable outcomes exit zero and retain their
@@ -196,8 +197,9 @@ eligible scheduling turns across concurrent workers. Claim/fence and fairness
 advancement are atomic; rollback leaves no durable turn but can leave a harmless
 PostgreSQL sequence gap, and retry/recovery retains the established semantics.
 Fair scheduling does not impose a per-organization active-processing cap.
-Generation promotion, deletion reconciliation,
-cleanup, and retrieval switching remain Phase 4.
+Slice 4 now provides a local, default-off atomic generation-promotion and
+retrieval-activation contract. Deletion reconciliation, cleanup, and automatic
+promotion orchestration remain later slices.
 
 ### Immutable versions and indexing
 
@@ -457,20 +459,22 @@ tables for the default-off Phase 3 processor. When
 `GITHUB_SYNC_LEDGER_PROCESSING_ENABLED=true` and the legacy queue is empty, one
 eligible GitHub file is claimed, fetched by its pinned blob, extracted, chunked,
 embedded, and atomically staged with fenced work completion. The staging schema
-has no legacy source/document/version/indexing/chunk relationship and is absent
-from permission-aware retrieval SQL. Generation promotion, deletion,
-reconciliation, cleanup, and retrieval switching remain unimplemented.
+has no mutable legacy source/document/version/indexing/chunk relationship.
+Slice 4 validates stable legacy citation identities and exposes staged chunks
+only through one active tenant/scope generation; unpromoted output remains
+absent from permission-aware results. Deletion reconciliation and cleanup remain
+unimplemented.
 Nonrecursive Git Trees remain limited to 1 MiB and 1,000 entries per tree, and
 the legacy cursor still caps one run at 100,000 examined entries and 10,000
 observed files, so true million-file repository discovery remains future work.
 
-Phase 3 API readiness supports the zero-downtime expand-migration sequence with
-an exact immutable compatibility set containing only `20260831_000021` and
-`20260902_000022`. The predecessor is compatible but not current and reports
+Phase 3 API readiness supports the Slice 4 zero-downtime expand-migration sequence with
+an exact immutable compatibility set containing only `20260902_000022` and
+`20260904_000023`. The predecessor is compatible but not current and reports
 migration required; the application head is compatible and current. Unknown,
 missing, malformed, older, newer, and multiple heads fail closed. The
 predecessor allowance is temporary and must be removed after every environment
-has reached `20260902_000022`.
+has reached `20260904_000023`.
 
 Migration `20260902_000022` adds one isolated organization scheduling-state
 table and one monotonic sequence. Indexed correlated eligibility probes avoid a
@@ -483,9 +487,9 @@ not durably consume a turn, although sequence gaps are permitted, while an
 expired lease keeps its original consumed turn.
 Retry-wait, cancelled, quarantined, terminal, incomplete-discovery, and
 profile-incompatible work is excluded until or unless it becomes eligible.
-Legacy synchronization ordering and retrieval SQL are unchanged. Slice 3 is
-local-only; promotion, reconciliation, staging cleanup, and retrieval activation
-remain future slices.
+Legacy synchronization ordering is unchanged. Slice 4 adds a local-only,
+default-off promotion transaction and generation-aware retrieval cutover.
+Reconciliation and staging cleanup remain future slices.
 
 ### GitHub App operator configuration
 
@@ -908,7 +912,7 @@ Known output at snapshot:
 | Local PostgreSQL | Docker Compose uses `pgvector/pgvector:pg16`, localhost port, health check, named volume; development credentials only |
 | pgvector | Extension migration and vector column complete |
 | Local configuration | Environment-driven database/JWT/OpenAI settings; no secrets are documented here |
-| Migrations | 22 revisions, head `20260902_000022`, real PostgreSQL lifecycle tests |
+| Migrations | 23 revisions, head `20260904_000023`, real PostgreSQL lifecycle tests |
 | Worker runner | Bounded staged callable class implemented |
 | Continuous worker host | Direct module with continuous and one-shot modes implemented |
 | Scheduler/automatic recovery | Continuous/one-shot interval scheduler and worker expired recovery implemented |

@@ -123,9 +123,15 @@ def test_ranked_sql_contains_authorization_before_vector_distance() -> None:
         "source_acl_entries", "connector_scopes", "source_item_scope_memberships",
         "document_versions", "document_version_documents", "document_indexing_states",
         "document_chunks",
+        "connector_sync_generation_activations",
+        "connector_sync_file_materializations",
+        "connector_sync_file_materialization_chunks",
     }
     lowered = SEARCH_SQL.lower()
     assert all(table in lowered for table in required_tables)
     assert lowered.index("authorized_paths as") < lowered.index("<=>") < lowered.index("order by distance")
     assert "not exists" in lowered
     assert "limit :result_limit" in lowered
+    assert "legacy_authorized_chunks" in lowered
+    assert "ledger_authorized_chunks" in lowered
+    assert "status = 'active'" in lowered

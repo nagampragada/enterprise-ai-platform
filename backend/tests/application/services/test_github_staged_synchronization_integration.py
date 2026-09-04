@@ -2629,9 +2629,12 @@ def test_phase3_only_file_is_not_retrieval_visible_before_promotion(engine):
         ) == 1
 
 
-def test_permission_aware_retrieval_sql_has_no_ledger_dependency():
+def test_permission_aware_retrieval_sql_uses_only_activated_ledger_materialization():
     normalized = SEARCH_SQL.casefold()
-    assert "connector_sync_generations" not in normalized
     assert "connector_sync_file_work_items" not in normalized
-    assert "connector_sync_file_materializations" not in normalized
-    assert "connector_sync_file_materialization_chunks" not in normalized
+    assert "connector_sync_generation_activations" in normalized
+    assert "connector_sync_generations" in normalized
+    assert "connector_sync_file_materializations" in normalized
+    assert "connector_sync_file_materialization_chunks" in normalized
+    assert "status = 'active'" in normalized
+    assert "status = 'completed'" in normalized

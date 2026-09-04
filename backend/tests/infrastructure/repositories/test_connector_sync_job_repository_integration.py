@@ -77,6 +77,13 @@ def session(engine):
         value.close()
 
 
+@pytest.fixture(autouse=True)
+def isolate_committed_test_state(engine):
+    """Keep global claim tests independent despite their intentional commits."""
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM organizations"))
+
+
 def _exec(session: Session, sql: str, **params):
     return session.execute(text(sql), params)
 

@@ -15,9 +15,19 @@ GitHub file-work item only after the legacy synchronization queue is empty. It
 uses the recorded commit/blob/path/profile, existing extraction/chunking/
 embedding pipeline, file-work lease and fence, and an atomic generation-scoped
 staging plus completion transaction. Staged text/vectors are stored outside the
-legacy source/document/version/chunk graph and are not retrieval-visible. It
-does not promote or reconcile a generation.
+legacy source/document/version/chunk graph and remain retrieval-invisible unless
+an independently validated Slice 4 activation exists. It does not promote or
+reconcile a generation.
 The API, scheduler, migration, and bootstrap processes do not consume the flag.
+
+`GITHUB_SYNC_LEDGER_PROMOTION_ENABLED` is the independent Slice 4 gate. It
+defaults to `false` and accepts only exact lowercase `true` or `false`. No
+existing host or API route invokes it: a future authorized orchestrator must
+explicitly compose `GitHubSyncGenerationPromotionService` and own its database
+commit. The service performs no provider call and stages activation, prior
+retirement, and generation completion in one transaction. Its structured
+event is explicitly `promotion_prepared`; it does not claim durability before
+the caller commits.
 
 Phase 3 Slice 2 adds a dedicated ledger-only host at
 `python -m infrastructure.workers.github_sync_ledger_worker_host`. It is
@@ -99,6 +109,6 @@ python -m infrastructure.bootstrap.sandbox
 
 The API launcher runs one Uvicorn process on `0.0.0.0` with a validated `PORT`; reload and debug behavior are absent. `APP_ENVIRONMENT` accepts only `development`, `test`, `sandbox`, and `production`. Its deliberate missing-value default is `development`, never production. Sandbox and production require a non-development PostgreSQL URL plus distinct strong JWT and refresh-token secrets. Validation is process-specific so provider credentials are not required by operations that do not consume them.
 
-`GET /health` is dependency-free liveness. `GET /api/v1/health` is readiness: it returns 200 only when configuration is valid, bounded database checks succeed, the schema is in the exact transition allowlist, and required GitHub/Secret Manager composition is available in a strict runtime. The Phase 3 Slice 3 application explicitly accepts only `20260831_000021` and `20260902_000022`; it reports compatibility, currentness, and migration requirement separately. Revision `20260831_000021` remains ready but is not represented as current. Unknown, missing, malformed, newer, older, or multiple heads fail closed. The endpoint uses only fixed values and never retrieves provider secrets.
+`GET /health` is dependency-free liveness. `GET /api/v1/health` is readiness: it returns 200 only when configuration is valid, bounded database checks succeed, the schema is in the exact transition allowlist, and required GitHub/Secret Manager composition is available in a strict runtime. The Slice 4 application explicitly accepts only `20260902_000022` and `20260904_000023`; it reports compatibility, currentness, and migration requirement separately. Revision `20260902_000022` remains ready but is not represented as current. Unknown, missing, malformed, newer, older, or multiple heads fail closed. The endpoint uses only fixed values and never retrieves provider secrets.
 
 The image and runbook are implemented and statically tested, but no image or cloud resource has been built or deployed. See `GCP_GITHUB_SANDBOX_RUNBOOK.md`.

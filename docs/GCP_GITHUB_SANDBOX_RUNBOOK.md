@@ -146,6 +146,14 @@ promote, reconcile, or activate retrieval. Slice 3 organization fairness is an
 intrinsic claim property with no additional environment flag; deploy it only
 after migration `20260902_000022` and a separate controlled authorization.
 
+Slice 4 adds `GITHUB_SYNC_LEDGER_PROMOTION_ENABLED`, defaulting to lowercase
+`false`. Do not add or enable it on an existing worker: no deployed host consumes
+the promotion contract yet. A later controlled promotion operator must use the
+same immutable application image, schema `20260904_000023`, one caller-owned
+transaction, and read-only before/after retrieval verification. Promotion makes
+no provider call. Slices 5 and 6 must separately address deletion reconciliation,
+staging retention, automation, and rollback operations.
+
 Create the bootstrap job with no command-line bootstrap values:
 
 ```powershell
@@ -162,8 +170,8 @@ each operation's nonsecret status before continuing:
    `schema_current=false`, and `migration_required=true` at revision
    `20260831_000021`;
 3. update only the established migration job to the same immutable image;
-4. execute the migration job exactly once and verify revision
-   `20260902_000022`;
+4. execute the migration job exactly once and verify the image's expected
+   revision (Slice 4: `20260904_000023`);
 5. require readiness HTTP 200 with `schema_compatible=true`,
    `schema_current=true`, and `migration_required=false`;
 6. update the worker image with both ledger flags explicitly false;
@@ -171,7 +179,7 @@ each operation's nonsecret status before continuing:
 
 The predecessor compatibility entry is deliberate temporary expand-migration
 policy. Remove it in a later cleanup only after all environments are confirmed
-at `20260902_000022`. Do not broaden it into revision ordering or a range.
+at `20260904_000023`. Do not broaden it into revision ordering or a range.
 
 For initial provisioning after the compatible API is deployed:
 

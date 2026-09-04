@@ -151,7 +151,9 @@ resolved_principals AS (
 ),
 eligible_scope_paths AS (
     SELECT sim.source_item_id, cs.id AS connector_scope_id, cs.knowledge_space_id,
-           cs.connector_id, cs.access_mode
+           cs.connector_id, cs.access_mode, cs.external_scope_key,
+           si.source_item_key, si.source_version, si.source_checksum,
+           si.metadata AS source_metadata
     FROM source_item_scope_memberships sim
     JOIN authenticated_user u ON u.organization_id = sim.organization_id
     JOIN connector_scopes cs ON cs.organization_id = sim.organization_id
@@ -211,11 +213,19 @@ authorized_paths AS (
        ))
 ),
 authorized_sources AS (
-    SELECT DISTINCT ON (source_item_id) source_item_id, connector_scope_id, knowledge_space_id
+    SELECT DISTINCT ON (source_item_id) source_item_id, connector_scope_id,
+           knowledge_space_id, connector_id, external_scope_key, source_item_key,
+           source_version, source_checksum, source_metadata
     FROM authorized_paths
     ORDER BY source_item_id, connector_scope_id
 ),
-authorized_chunks AS (
+active_ledger_scopes AS (
+    SELECT organization_id, connector_id, connector_scope_id, generation_id,
+           repository_identity, commit_object_id, profile_fingerprint
+    FROM connector_sync_generation_activations
+    WHERE organization_id = :organization_id AND status = 'active'
+),
+legacy_authorized_chunks AS (
     SELECT dc.id AS chunk_id, dc.document_id, dv.id AS document_version_id,
            dv.source_item_id, a.knowledge_space_id, a.connector_scope_id,
            dc.chunk_index, dc.chunk_text, d.title AS document_title,
@@ -230,7 +240,11 @@ authorized_chunks AS (
       AND d.status = 'ready' AND d.deleted_at IS NULL
     JOIN document_chunks dc ON dc.organization_id = d.organization_id AND dc.document_id = d.id
       AND dc.embedding IS NOT NULL AND dc.embedding_model = :embedding_model
-    WHERE EXISTS (
+    WHERE NOT EXISTS (
+        SELECT 1 FROM active_ledger_scopes als
+        WHERE als.connector_id = a.connector_id
+          AND als.connector_scope_id = a.connector_scope_id
+    ) AND EXISTS (
         SELECT 1 FROM document_indexing_states dis
         WHERE dis.organization_id = dv.organization_id
           AND dis.document_version_id = dv.id AND dis.status = 'indexed'
@@ -238,6 +252,70 @@ authorized_chunks AS (
           AND dis.embedding_model = :embedding_model
           AND dis.embedding_dimensions = :embedding_dimension
     )
+),
+ledger_authorized_chunks AS (
+    SELECT smc.id AS chunk_id, d.id AS document_id, dv.id AS document_version_id,
+           dv.source_item_id, a.knowledge_space_id, a.connector_scope_id,
+           smc.chunk_index, smc.chunk_text, d.title AS document_title,
+           d.source_type, d.source_document_key, smc.embedding_model,
+           smc.embedding <=> CAST(:query_embedding AS vector) AS distance
+    FROM authorized_sources a
+    JOIN active_ledger_scopes als ON als.connector_id = a.connector_id
+      AND als.connector_scope_id = a.connector_scope_id
+    JOIN connector_sync_generations sg ON sg.organization_id = :organization_id
+      AND sg.connector_id = als.connector_id
+      AND sg.connector_scope_id = als.connector_scope_id
+      AND sg.id = als.generation_id
+      AND sg.repository_identity = als.repository_identity
+      AND sg.repository_identity = a.external_scope_key
+      AND sg.commit_object_id = als.commit_object_id
+      AND sg.profile_fingerprint = als.profile_fingerprint
+      AND sg.status = 'completed' AND sg.discovery_complete
+    JOIN connector_sync_file_materializations sm ON sm.organization_id = sg.organization_id
+      AND sm.connector_id = sg.connector_id
+      AND sm.connector_scope_id = sg.connector_scope_id
+      AND sm.generation_id = sg.id
+      AND sm.profile_fingerprint = sg.profile_fingerprint
+      AND sm.repository_identity = sg.repository_identity
+      AND sm.provider_revision_id = sg.commit_object_id
+      AND sm.source_item_key = a.source_item_key
+      AND sm.provider_blob_id = a.source_version
+      AND sm.content_checksum = a.source_checksum
+      AND a.source_metadata->>'repository_identity' = sg.repository_identity
+      AND a.source_metadata->>'repository_path' = sm.repository_path
+      AND a.source_metadata->>'blob_object_id' = sm.provider_blob_id
+      AND a.source_metadata->>'snapshot_commit_id' = sg.commit_object_id
+    JOIN connector_sync_file_materialization_chunks smc
+      ON smc.organization_id = sm.organization_id
+      AND smc.generation_id = sm.generation_id
+      AND smc.materialization_id = sm.id
+      AND smc.embedding IS NOT NULL
+      AND smc.embedding_model = sm.embedding_model
+      AND smc.embedding_model = :embedding_model
+    JOIN document_versions dv ON dv.organization_id = :organization_id
+      AND dv.source_item_id = a.source_item_id
+      AND dv.provider_version_id = sm.provider_blob_id
+      AND dv.content_checksum = sm.content_checksum
+      AND dv.is_current AND dv.lifecycle = 'available'
+    JOIN document_version_documents dvd ON dvd.organization_id = dv.organization_id
+      AND dvd.document_version_id = dv.id
+    JOIN documents d ON d.organization_id = dvd.organization_id AND d.id = dvd.document_id
+      AND d.status = 'ready' AND d.deleted_at IS NULL
+      AND d.source_type = 'github' AND d.source_document_key = sm.source_item_key
+    WHERE EXISTS (
+        SELECT 1 FROM document_indexing_states dis
+        WHERE dis.organization_id = dv.organization_id
+          AND dis.document_version_id = dv.id AND dis.status = 'indexed'
+          AND dis.indexed_generation = dis.desired_generation
+          AND dis.profile_fingerprint = sg.profile_fingerprint
+          AND dis.embedding_model = :embedding_model
+          AND dis.embedding_dimensions = :embedding_dimension
+    )
+),
+authorized_chunks AS (
+    SELECT * FROM legacy_authorized_chunks
+    UNION ALL
+    SELECT * FROM ledger_authorized_chunks
 )
 SELECT chunk_id, document_id, document_version_id, source_item_id,
        knowledge_space_id, connector_scope_id, chunk_index, chunk_text,

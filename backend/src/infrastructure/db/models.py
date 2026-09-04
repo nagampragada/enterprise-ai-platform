@@ -1358,6 +1358,102 @@ class ConnectorSyncOrganizationClaimSchedule(Base):
     )
 
 
+class ConnectorSyncGenerationActivation(Base):
+    """Auditable retrieval activation for one immutable ledger generation."""
+
+    __tablename__ = "connector_sync_generation_activations"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_connector_sync_generation_activations"),
+        ForeignKeyConstraint(
+            ["organization_id", "connector_id", "connector_scope_id"],
+            [
+                "connector_scopes.organization_id",
+                "connector_scopes.connector_id",
+                "connector_scopes.id",
+            ],
+            name="fk_sync_generation_activations_scope_tenant",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            [
+                "organization_id",
+                "connector_id",
+                "connector_scope_id",
+                "generation_id",
+                "profile_fingerprint",
+            ],
+            [
+                "connector_sync_generations.organization_id",
+                "connector_sync_generations.connector_id",
+                "connector_sync_generations.connector_scope_id",
+                "connector_sync_generations.id",
+                "connector_sync_generations.profile_fingerprint",
+            ],
+            name="fk_sync_generation_activations_generation_tenant",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "organization_id",
+            "generation_id",
+            name="uq_sync_generation_activations_generation",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'retired')", name="status_valid"
+        ),
+        CheckConstraint(
+            "btrim(repository_identity) <> ''", name="repository_identity_not_blank"
+        ),
+        CheckConstraint(
+            "btrim(commit_object_id) <> ''", name="commit_object_id_not_blank"
+        ),
+        CheckConstraint(
+            "profile_fingerprint ~ '^[a-z0-9][a-z0-9._:/-]*$'",
+            name="profile_fingerprint_valid",
+        ),
+        CheckConstraint(
+            "(status = 'active' AND retired_at IS NULL) OR "
+            "(status = 'retired' AND retired_at IS NOT NULL)",
+            name="retirement_consistent",
+        ),
+        CheckConstraint(
+            "retired_at IS NULL OR retired_at >= activated_at",
+            name="retired_after_activation",
+        ),
+        CheckConstraint("updated_at >= created_at", name="updated_after_created"),
+        Index(
+            "uq_sync_generation_activations_active_scope",
+            "organization_id",
+            "connector_id",
+            "connector_scope_id",
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+        ),
+        Index(
+            "ix_sync_generation_activations_scope_history",
+            "organization_id",
+            "connector_scope_id",
+            "activated_at",
+            "id",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_scope_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    generation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    repository_identity: Mapped[str] = mapped_column(String(255), nullable=False)
+    commit_object_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    profile_fingerprint: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    activated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class ConnectorSyncFileWorkItem(Base):
     """Feature-gated independently leased control-plane work for one source file."""
 

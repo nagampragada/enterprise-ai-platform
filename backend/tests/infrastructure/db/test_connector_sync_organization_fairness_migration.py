@@ -24,6 +24,7 @@ TEST_URL = "TEST_DATABASE_URL"
 DEV_URL = "DATABASE_URL"
 REVISION = "20260902_000022"
 PRIOR_REVISION = "20260831_000021"
+HEAD_REVISION = "20260904_000023"
 TABLE = "connector_sync_organization_claim_schedules"
 SEQUENCE = "connector_sync_org_fair_claim_seq"
 
@@ -135,7 +136,7 @@ def test_fairness_schema_matches_models_and_is_the_single_head(engine) -> None:
     with engine.connect() as connection:
         assert connection.execute(
             text("SELECT version_num FROM alembic_version")
-        ).scalar_one() == REVISION
+        ).scalar_one() == HEAD_REVISION
         assert connection.execute(
             text("SELECT count(*) FROM alembic_version")
         ).scalar_one() == 1
@@ -202,9 +203,9 @@ def test_fairness_revision_downgrade_and_upgrade_are_isolated(engine, monkeypatc
         monkeypatch.setattr(db_health, "engine", downgraded)
         compatibility = db_health.check_database_connection()
         assert compatibility.healthy is True
-        assert compatibility.schema_compatible is True
+        assert compatibility.schema_compatible is False
         assert compatibility.schema_current is False
-        assert compatibility.migration_required is True
+        assert compatibility.migration_required is False
     finally:
         downgraded.dispose()
-    command.upgrade(_config(url), REVISION)
+    command.upgrade(_config(url), "head")

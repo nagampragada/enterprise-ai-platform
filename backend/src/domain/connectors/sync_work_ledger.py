@@ -355,6 +355,73 @@ class GenerationBarrierSummary:
     barrier_open: bool
 
 
+class GenerationActivationStatus(StrEnum):
+    ACTIVE = "active"
+    RETIRED = "retired"
+
+
+@dataclass(frozen=True)
+class GenerationPromotionRequest:
+    organization_id: UUID
+    connector_id: UUID
+    connector_scope_id: UUID
+    generation_id: UUID
+    sync_job_id: UUID
+    provider_key: str
+    repository_identity: str
+    branch_name: str
+    commit_object_id: str
+    root_tree_object_id: str
+    profile_fingerprint: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "organization_id",
+            "connector_id",
+            "connector_scope_id",
+            "generation_id",
+            "sync_job_id",
+        ):
+            _require_uuid(name, getattr(self, name))
+        _require_code("provider_key", self.provider_key, maximum=64)
+        for name in (
+            "repository_identity",
+            "branch_name",
+            "commit_object_id",
+            "root_tree_object_id",
+        ):
+            _require_nonblank(name, getattr(self, name), MAX_PROVIDER_IDENTITY_LENGTH)
+        _require_identifier(
+            "profile_fingerprint", self.profile_fingerprint, MAX_PROFILE_FINGERPRINT_LENGTH
+        )
+
+
+@dataclass(frozen=True)
+class GenerationActivationView:
+    activation_id: UUID
+    organization_id: UUID
+    connector_id: UUID
+    connector_scope_id: UUID
+    generation_id: UUID
+    repository_identity: str
+    commit_object_id: str
+    profile_fingerprint: str
+    status: GenerationActivationStatus
+    activated_at: datetime
+    retired_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
+class GenerationPromotionResult:
+    activation: GenerationActivationView
+    promoted: bool
+    retired_generation_id: UUID | None
+    materialization_count: int
+    chunk_count: int
+
+
 def _require_uuid(name: str, value: object) -> UUID:
     if not isinstance(value, UUID):
         raise ValueError(f"{name} must be a UUID")
