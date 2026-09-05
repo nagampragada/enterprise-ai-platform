@@ -71,6 +71,22 @@ def test_mapper_configuration_and_migration_head(engine) -> None:
 
 def test_schema_matches_models_and_contains_only_control_plane_metadata(engine) -> None:
     inspector = inspect(engine)
+    later_generation_columns = {
+        "manifest_schema_version",
+        "reconciliation_started_at",
+        "reconciliation_completed_at",
+        "reconciled_membership_count",
+        "reconciled_source_count",
+        "reconciled_document_count",
+    }
+    later_generation_constraints = {
+        "ck_connector_sync_generations_manifest_schema_version_valid",
+        "ck_connector_sync_generations_reconciliation_authority_valid",
+        "ck_connector_sync_generations_reconciliation_completion_order_valid",
+        "ck_connector_sync_generations_reconciliation_counters_valid",
+        "ck_connector_sync_generations_reconciliation_progress_requires_authority",
+        "ck_connector_sync_generations_reconciliation_start_order_valid",
+    }
     expected = {
         "connector_sync_generations": {
             "indexes": {
@@ -100,7 +116,12 @@ def test_schema_matches_models_and_contains_only_control_plane_metadata(engine) 
         reflected_columns = [
             column["name"] for column in inspector.get_columns(table, schema="public")
         ]
-        assert reflected_columns == list(Base.metadata.tables[table].columns.keys())
+        model_columns = list(Base.metadata.tables[table].columns.keys())
+        if table == "connector_sync_generations":
+            model_columns = [
+                name for name in model_columns if name not in later_generation_columns
+            ]
+        assert reflected_columns == model_columns
         assert contract["indexes"] <= {
             index["name"] for index in inspector.get_indexes(table, schema="public")
         }
@@ -112,6 +133,8 @@ def test_schema_matches_models_and_contains_only_control_plane_metadata(engine) 
             for constraint in Base.metadata.tables[table].constraints
             if constraint.name
         }
+        if table == "connector_sync_generations":
+            model_constraints -= later_generation_constraints
         reflected_constraints = {
             inspector.get_pk_constraint(table, schema="public")["name"],
             *(item["name"] for item in inspector.get_unique_constraints(table, schema="public")),

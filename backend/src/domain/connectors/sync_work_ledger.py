@@ -22,6 +22,8 @@ MAX_CHUNK_COUNT = 100_000
 MAX_EMBEDDING_BATCH_COUNT = 100_000
 FILE_WORK_EMBEDDING_DIMENSION = 1536
 MAX_CHUNK_TEXT_LENGTH = 1_000_000
+CURRENT_GENERATION_MANIFEST_SCHEMA_VERSION = 2
+MAX_RECONCILIATION_BATCH_SIZE = 500
 
 
 class RepositoryGenerationStatus(StrEnum):
@@ -42,6 +44,13 @@ class FileWorkStatus(StrEnum):
     QUARANTINED = "quarantined"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+class GenerationObservationDisposition(StrEnum):
+    ELIGIBLE = "eligible"
+    UNSUPPORTED_FORMAT = "unsupported_format"
+    OVERSIZED = "oversized"
+    UNSUPPORTED_OBJECT_TYPE = "unsupported_object_type"
 
 
 TERMINAL_GENERATION_STATUSES = frozenset(
@@ -76,6 +85,7 @@ class RepositoryGenerationRegistration:
     root_tree_object_id: str
     profile_fingerprint: str
     created_at: datetime
+    manifest_schema_version: int = CURRENT_GENERATION_MANIFEST_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
         for name in (
@@ -97,6 +107,42 @@ class RepositoryGenerationRegistration:
             "profile_fingerprint", self.profile_fingerprint, MAX_PROFILE_FINGERPRINT_LENGTH
         )
         _require_aware("created_at", self.created_at)
+        if self.manifest_schema_version != CURRENT_GENERATION_MANIFEST_SCHEMA_VERSION:
+            raise ValueError("manifest_schema_version is unsupported")
+
+
+@dataclass(frozen=True)
+class GenerationSourceObservation:
+    """One path proven present by the pinned, complete repository traversal."""
+
+    source_item_key: str
+    repository_path: str
+    provider_object_id: str
+    provider_revision_id: str
+    profile_fingerprint: str
+    entry_type: str
+    disposition: GenerationObservationDisposition
+    file_size_bytes: int | None
+
+    def __post_init__(self) -> None:
+        _require_nonblank("source_item_key", self.source_item_key, MAX_SOURCE_ITEM_KEY_LENGTH)
+        _require_nonblank("repository_path", self.repository_path, MAX_REPOSITORY_PATH_LENGTH)
+        _require_nonblank(
+            "provider_object_id", self.provider_object_id, MAX_PROVIDER_IDENTITY_LENGTH
+        )
+        _require_nonblank(
+            "provider_revision_id", self.provider_revision_id, MAX_PROVIDER_IDENTITY_LENGTH
+        )
+        _require_identifier(
+            "profile_fingerprint", self.profile_fingerprint, MAX_PROFILE_FINGERPRINT_LENGTH
+        )
+        _require_code("entry_type", self.entry_type, maximum=32)
+        if not isinstance(self.disposition, GenerationObservationDisposition):
+            raise ValueError("observation disposition is invalid")
+        if self.file_size_bytes is not None:
+            _require_bounded_counter(
+                "file_size_bytes", self.file_size_bytes, MAX_FILE_SIZE_BYTES
+            )
 
 
 @dataclass(frozen=True)
@@ -299,6 +345,12 @@ class RepositoryGenerationView:
     created_at: datetime
     updated_at: datetime
     terminal_at: datetime | None
+    manifest_schema_version: int = 1
+    reconciliation_started_at: datetime | None = None
+    reconciliation_completed_at: datetime | None = None
+    reconciled_membership_count: int = 0
+    reconciled_source_count: int = 0
+    reconciled_document_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -336,6 +388,25 @@ class ManifestRegistrationResult:
     created_count: int
     existing_count: int
     work_item_ids: tuple[UUID, ...]
+
+
+@dataclass(frozen=True)
+class DiscoveryRegistrationResult:
+    generation_id: UUID
+    created_observation_count: int
+    existing_observation_count: int
+    created_work_count: int
+    existing_work_count: int
+    observation_ids: tuple[UUID, ...]
+    work_item_ids: tuple[UUID, ...]
+
+    @property
+    def created_count(self) -> int:
+        return self.created_work_count
+
+    @property
+    def existing_count(self) -> int:
+        return self.existing_work_count
 
 
 @dataclass(frozen=True)
@@ -420,6 +491,55 @@ class GenerationPromotionResult:
     retired_generation_id: UUID | None
     materialization_count: int
     chunk_count: int
+
+
+@dataclass(frozen=True)
+class GenerationReconciliationRequest:
+    organization_id: UUID
+    connector_id: UUID
+    connector_scope_id: UUID
+    generation_id: UUID
+    sync_job_id: UUID
+    provider_key: str
+    repository_identity: str
+    branch_name: str
+    commit_object_id: str
+    root_tree_object_id: str
+    profile_fingerprint: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "organization_id",
+            "connector_id",
+            "connector_scope_id",
+            "generation_id",
+            "sync_job_id",
+        ):
+            _require_uuid(name, getattr(self, name))
+        _require_code("provider_key", self.provider_key, maximum=64)
+        for name in (
+            "repository_identity",
+            "branch_name",
+            "commit_object_id",
+            "root_tree_object_id",
+        ):
+            _require_nonblank(name, getattr(self, name), MAX_PROVIDER_IDENTITY_LENGTH)
+        _require_identifier(
+            "profile_fingerprint", self.profile_fingerprint, MAX_PROFILE_FINGERPRINT_LENGTH
+        )
+
+
+@dataclass(frozen=True)
+class GenerationReconciliationResult:
+    generation_id: UUID
+    completed: bool
+    replayed: bool
+    memberships_retired: int
+    sources_retired: int
+    documents_retired: int
+    total_memberships_retired: int
+    total_sources_retired: int
+    total_documents_retired: int
 
 
 def _require_uuid(name: str, value: object) -> UUID:

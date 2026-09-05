@@ -63,8 +63,8 @@ def engine():
 
 def test_schedule_schema_matches_orm_and_tenant_contract(engine):
     inspector = inspect(engine)
-    assert len(Base.metadata.tables) == 48
-    assert len(inspector.get_table_names(schema="public")) == 49
+    assert len(Base.metadata.tables) == 49
+    assert len(inspector.get_table_names(schema="public")) == 50
     reflected = inspector.get_columns(TABLE, schema="public")
     model = list(Base.metadata.tables[TABLE].columns)
     assert [item["name"] for item in reflected] == COLUMNS
@@ -190,6 +190,7 @@ def test_downgrade_removes_only_schedule_table_and_reupgrade_succeeds(engine):
         "connector_sync_file_materialization_chunks",
         "connector_sync_organization_claim_schedules",
         "connector_sync_generation_activations",
+        "connector_sync_generation_observations",
     }
     command.downgrade(_config(), PRIOR)
     after = set(inspect(engine).get_table_names(schema="public"))

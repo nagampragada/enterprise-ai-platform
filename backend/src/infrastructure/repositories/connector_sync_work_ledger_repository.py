@@ -24,13 +24,19 @@ from domain.connectors.sync_work_ledger import (
     FileWorkMaterializationView,
     FileWorkManifestEntry,
     FileWorkStatus,
+    DiscoveryRegistrationResult,
     GenerationActivationStatus,
     GenerationActivationView,
     GenerationBarrierSummary,
+    GenerationObservationDisposition,
     GenerationPromotionRequest,
     GenerationPromotionResult,
+    GenerationReconciliationRequest,
+    GenerationReconciliationResult,
+    GenerationSourceObservation,
     ManifestRegistrationResult,
     MAX_MANIFEST_BATCH_SIZE,
+    MAX_RECONCILIATION_BATCH_SIZE,
     RepositoryGenerationRegistration,
     RepositoryGenerationStatus,
     RepositoryGenerationView,
@@ -43,6 +49,7 @@ from infrastructure.db.models import (
     ConnectorSyncFileWorkItem,
     ConnectorSyncGeneration,
     ConnectorSyncGenerationActivation,
+    ConnectorSyncGenerationObservation,
     ConnectorSyncJob,
     ConnectorSyncOrganizationClaimSchedule,
     ConnectorScope,
@@ -119,6 +126,7 @@ class ConnectorSyncWorkLedgerRepository:
         materialization_id_factory: Callable[[], UUID] = uuid4,
         materialization_chunk_id_factory: Callable[[], UUID] = uuid4,
         activation_id_factory: Callable[[], UUID] = uuid4,
+        observation_id_factory: Callable[[], UUID] = uuid4,
     ) -> None:
         self._session = session
         self._generation_id_factory = generation_id_factory
@@ -127,6 +135,7 @@ class ConnectorSyncWorkLedgerRepository:
         self._materialization_id_factory = materialization_id_factory
         self._materialization_chunk_id_factory = materialization_chunk_id_factory
         self._activation_id_factory = activation_id_factory
+        self._observation_id_factory = observation_id_factory
 
     def register_generation(
         self, request: RepositoryGenerationRegistration
@@ -190,6 +199,12 @@ class ConnectorSyncWorkLedgerRepository:
             declared_bytes=0,
             created_at=request.created_at,
             updated_at=request.created_at,
+            manifest_schema_version=request.manifest_schema_version,
+            reconciliation_started_at=None,
+            reconciliation_completed_at=None,
+            reconciled_membership_count=0,
+            reconciled_source_count=0,
+            reconciled_document_count=0,
         )
         self._session.add(row)
         self._flush("generation could not be registered")
@@ -201,6 +216,205 @@ class ConnectorSyncWorkLedgerRepository:
         row = self._generation(organization_id, generation_id)
         return _generation_view(row) if row is not None else None
 
+    def register_discovery_batch(
+        self,
+        organization_id: UUID,
+        generation_id: UUID,
+        observations: Sequence[GenerationSourceObservation],
+        work_entries: Sequence[FileWorkManifestEntry],
+        *,
+        now: datetime,
+    ) -> DiscoveryRegistrationResult:
+        """Atomically record the authoritative observed manifest and its work subset."""
+        organization_id = _uuid("organization_id", organization_id)
+        generation_id = _uuid("generation_id", generation_id)
+        now = _aware("now", now)
+        if (
+            isinstance(observations, (str, bytes))
+            or not isinstance(observations, Sequence)
+            or not observations
+            or len(observations) > MAX_MANIFEST_BATCH_SIZE
+            or any(not isinstance(row, GenerationSourceObservation) for row in observations)
+        ):
+            raise InvalidSyncWorkLedgerRequest("generation observations are invalid")
+        if (
+            isinstance(work_entries, (str, bytes))
+            or not isinstance(work_entries, Sequence)
+            or len(work_entries) > MAX_MANIFEST_BATCH_SIZE
+            or any(not isinstance(row, FileWorkManifestEntry) for row in work_entries)
+        ):
+            raise InvalidSyncWorkLedgerRequest("generation work entries are invalid")
+        generation = self._locked_generation(organization_id, generation_id)
+        if generation is None:
+            raise SyncWorkLedgerNotFound("generation was not found")
+        if generation.manifest_schema_version != 2:
+            raise SyncWorkLedgerConflict("generation manifest schema is incompatible")
+        if generation.status in {status.value for status in TERMINAL_GENERATION_STATUSES}:
+            raise SyncWorkLedgerConflict("terminal generation cannot accept observations")
+
+        keyed: dict[str, GenerationSourceObservation] = {}
+        for observation in observations:
+            if observation.profile_fingerprint != generation.profile_fingerprint:
+                raise InvalidSyncWorkLedgerRequest(
+                    "observation profile does not match generation"
+                )
+            source_hash = _source_key_hash(
+                observation.source_item_key, observation.repository_path
+            )
+            previous = keyed.get(source_hash)
+            if previous is not None and previous != observation:
+                raise SyncWorkLedgerConflict("observation source identity collision")
+            keyed[source_hash] = observation
+
+        work_by_hash = {
+            _source_key_hash(entry.source_item_key, entry.repository_path): entry
+            for entry in work_entries
+        }
+        if len(work_by_hash) != len(work_entries):
+            raise SyncWorkLedgerConflict("manifest source identity collision")
+        for source_hash, entry in work_by_hash.items():
+            observation = keyed.get(source_hash)
+            if (
+                observation is None
+                or observation.disposition is not GenerationObservationDisposition.ELIGIBLE
+                or observation.source_item_key != entry.source_item_key
+                or observation.repository_path != entry.repository_path
+                or observation.provider_object_id != entry.provider_blob_id
+                or observation.provider_revision_id != entry.provider_revision_id
+                or observation.profile_fingerprint != entry.profile_fingerprint
+            ):
+                raise SyncWorkLedgerConflict(
+                    "generation work is not an eligible observed source"
+                )
+        eligible_hashes = {
+            source_hash
+            for source_hash, observation in keyed.items()
+            if observation.disposition is GenerationObservationDisposition.ELIGIBLE
+        }
+        if set(work_by_hash) != eligible_hashes:
+            raise SyncWorkLedgerConflict("eligible observations and work entries differ")
+
+        if generation.discovery_complete:
+            rows = self._all(
+                select(ConnectorSyncGenerationObservation).where(
+                    ConnectorSyncGenerationObservation.organization_id
+                    == organization_id,
+                    ConnectorSyncGenerationObservation.generation_id == generation_id,
+                    ConnectorSyncGenerationObservation.source_key_hash.in_(tuple(keyed)),
+                ),
+                "completed observation replay lookup failed",
+            )
+            persisted = {row.source_key_hash: row for row in rows}
+            if set(persisted) != set(keyed):
+                raise SyncWorkLedgerConflict(
+                    "completed discovery cannot accept new observations"
+                )
+            for source_hash, observation in keyed.items():
+                if not _observation_row_matches(persisted[source_hash], observation):
+                    raise SyncWorkLedgerConflict(
+                        "observation identity resolves to different attributes"
+                    )
+            work_result = (
+                self.register_manifest(
+                    organization_id,
+                    generation_id,
+                    work_entries,
+                    now=now,
+                    _count_as_discovered=False,
+                )
+                if work_entries
+                else ManifestRegistrationResult(generation_id, 0, 0, ())
+            )
+            return DiscoveryRegistrationResult(
+                generation_id,
+                0,
+                len(keyed),
+                work_result.created_count,
+                work_result.existing_count,
+                tuple(persisted[source_hash].id for source_hash in keyed),
+                work_result.work_item_ids,
+            )
+
+        values = [
+            {
+                "id": self._new_uuid("observation_id", self._observation_id_factory),
+                "organization_id": generation.organization_id,
+                "connector_id": generation.connector_id,
+                "connector_scope_id": generation.connector_scope_id,
+                "generation_id": generation.id,
+                "source_item_key": observation.source_item_key,
+                "source_key_hash": source_hash,
+                "repository_path": observation.repository_path,
+                "provider_object_id": observation.provider_object_id,
+                "provider_revision_id": observation.provider_revision_id,
+                "profile_fingerprint": observation.profile_fingerprint,
+                "entry_type": observation.entry_type,
+                "disposition": observation.disposition.value,
+                "file_size_bytes": observation.file_size_bytes,
+                "observed_at": now,
+            }
+            for source_hash, observation in keyed.items()
+        ]
+        try:
+            inserted = self._session.execute(
+                insert(ConnectorSyncGenerationObservation)
+                .values(values)
+                .on_conflict_do_nothing(
+                    constraint="uq_sync_generation_observations_source"
+                )
+                .returning(
+                    ConnectorSyncGenerationObservation.id,
+                    ConnectorSyncGenerationObservation.source_key_hash,
+                )
+            ).all()
+        except SQLAlchemyError as exc:
+            raise SyncWorkLedgerPersistenceError(
+                "generation observation registration failed"
+            ) from exc
+        rows = self._all(
+            select(ConnectorSyncGenerationObservation).where(
+                ConnectorSyncGenerationObservation.organization_id == organization_id,
+                ConnectorSyncGenerationObservation.generation_id == generation_id,
+                ConnectorSyncGenerationObservation.source_key_hash.in_(tuple(keyed)),
+            ),
+            "registered observation lookup failed",
+        )
+        persisted = {row.source_key_hash: row for row in rows}
+        if set(persisted) != set(keyed):
+            raise SyncWorkLedgerPersistenceError(
+                "registered generation observations are incomplete"
+            )
+        for source_hash, observation in keyed.items():
+            if not _observation_row_matches(persisted[source_hash], observation):
+                raise SyncWorkLedgerConflict(
+                    "observation identity resolves to different attributes"
+                )
+        inserted_hashes = {row.source_key_hash for row in inserted}
+        generation.items_discovered += len(inserted_hashes)
+        generation.updated_at = now
+
+        work_result = (
+            self.register_manifest(
+                organization_id,
+                generation_id,
+                work_entries,
+                now=now,
+                _count_as_discovered=False,
+            )
+            if work_entries
+            else ManifestRegistrationResult(generation_id, 0, 0, ())
+        )
+        self._flush("generation discovery counters could not be updated")
+        return DiscoveryRegistrationResult(
+            generation_id,
+            len(inserted_hashes),
+            len(keyed) - len(inserted_hashes),
+            work_result.created_count,
+            work_result.existing_count,
+            tuple(persisted[source_hash].id for source_hash in keyed),
+            work_result.work_item_ids,
+        )
+
     def register_manifest(
         self,
         organization_id: UUID,
@@ -208,6 +422,7 @@ class ConnectorSyncWorkLedgerRepository:
         entries: Sequence[FileWorkManifestEntry],
         *,
         now: datetime,
+        _count_as_discovered: bool = True,
     ) -> ManifestRegistrationResult:
         organization_id = _uuid("organization_id", organization_id)
         generation_id = _uuid("generation_id", generation_id)
@@ -373,7 +588,8 @@ class ConnectorSyncWorkLedgerRepository:
             (row.source_key_hash, row.provider_blob_id, row.provider_revision_id, row.profile_fingerprint)
             for row in inserted
         }
-        generation.items_discovered += len(inserted_keys)
+        if _count_as_discovered:
+            generation.items_discovered += len(inserted_keys)
         generation.items_registered += len(inserted_keys)
         generation.declared_bytes += sum(
             keyed[key].file_size_bytes or 0 for key in inserted_keys
@@ -572,15 +788,40 @@ class ConnectorSyncWorkLedgerRepository:
                     "fair organization sequence allocation was invalid"
                 )
             if schedule is None:
-                schedule = ConnectorSyncOrganizationClaimSchedule(
-                    organization_id=organization_id,
-                    last_claim_sequence=claim_sequence,
-                    claim_count=1,
-                    last_claimed_at=now,
-                    created_at=now,
-                    updated_at=now,
-                )
-                self._session.add(schedule)
+                # The never-served selection and this write are separate SQL
+                # statements. Under READ COMMITTED, another worker can create
+                # the schedule after our selection snapshot. Advance that row
+                # atomically instead of losing a valid, disjoint item claim.
+                try:
+                    self._session.execute(
+                        insert(ConnectorSyncOrganizationClaimSchedule)
+                        .values(
+                            organization_id=organization_id,
+                            last_claim_sequence=claim_sequence,
+                            claim_count=1,
+                            last_claimed_at=now,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                        .on_conflict_do_update(
+                            index_elements=[
+                                ConnectorSyncOrganizationClaimSchedule.organization_id
+                            ],
+                            set_={
+                                "last_claim_sequence": claim_sequence,
+                                "claim_count": (
+                                    ConnectorSyncOrganizationClaimSchedule.claim_count
+                                    + 1
+                                ),
+                                "last_claimed_at": now,
+                                "updated_at": now,
+                            },
+                        )
+                    )
+                except SQLAlchemyError as exc:
+                    raise SyncWorkLedgerPersistenceError(
+                        "fair organization claim could not be advanced"
+                    ) from exc
             else:
                 schedule.last_claim_sequence = claim_sequence
                 schedule.claim_count += 1
@@ -1131,6 +1372,10 @@ class ConnectorSyncWorkLedgerRepository:
         if existing is not None:
             if not _activation_matches(existing, request):
                 raise SyncWorkLedgerConflict("active generation attribution changed")
+            if generation.manifest_schema_version == 2 and not generation.reconciliation_eligible:
+                raise SyncWorkLedgerConflict(
+                    "active generation reconciliation authority is unavailable"
+                )
             return GenerationPromotionResult(
                 _activation_view(existing),
                 False,
@@ -1184,6 +1429,9 @@ class ConnectorSyncWorkLedgerRepository:
         self._session.add(activation)
         generation.status = RepositoryGenerationStatus.COMPLETED.value
         generation.terminal_at = now
+        if generation.manifest_schema_version == 2:
+            generation.reconciliation_eligible = True
+            generation.reconciliation_eligible_at = now
         generation.updated_at = now
         self._flush("generation promotion failed")
         return GenerationPromotionResult(
@@ -1220,6 +1468,39 @@ class ConnectorSyncWorkLedgerRepository:
             or len({row.repository_path for row in work_rows}) != len(work_rows)
         ):
             raise SyncWorkLedgerConflict("generation work is not completely successful")
+        if generation.manifest_schema_version == 2:
+            observations = self._all(
+                select(ConnectorSyncGenerationObservation)
+                .where(
+                    ConnectorSyncGenerationObservation.organization_id
+                    == generation.organization_id,
+                    ConnectorSyncGenerationObservation.generation_id == generation.id,
+                )
+                .order_by(ConnectorSyncGenerationObservation.id)
+                .with_for_update(),
+                "generation observation validation failed",
+            )
+            observation_by_hash = {row.source_key_hash: row for row in observations}
+            work_by_hash = {row.source_key_hash: row for row in work_rows}
+            eligible_hashes = {
+                row.source_key_hash
+                for row in observations
+                if row.disposition == GenerationObservationDisposition.ELIGIBLE.value
+            }
+            if (
+                len(observations) != generation.items_discovered
+                or len(observation_by_hash) != len(observations)
+                or set(work_by_hash) != eligible_hashes
+                or any(
+                    not _work_matches_observation(work_by_hash[source_hash], observation)
+                    for source_hash, observation in observation_by_hash.items()
+                    if observation.disposition
+                    == GenerationObservationDisposition.ELIGIBLE.value
+                )
+            ):
+                raise SyncWorkLedgerConflict(
+                    "generation observations are incomplete"
+                )
 
         materializations = self._all(
             select(ConnectorSyncFileMaterialization)
@@ -1374,6 +1655,775 @@ class ConnectorSyncWorkLedgerRepository:
         if projection_count != len(materializations):
             raise SyncWorkLedgerConflict("generation citation projection is incomplete")
         return len(materializations), len(chunk_rows)
+
+    def _validate_reconciliation_projection(
+        self, generation: ConnectorSyncGeneration
+    ) -> None:
+        """Validate an immutable completed generation with bounded Python state."""
+        work_total, succeeded_total, distinct_work_hashes, distinct_work_paths = self._row(
+            select(
+                func.count(ConnectorSyncFileWorkItem.id),
+                func.count(ConnectorSyncFileWorkItem.id).filter(
+                    ConnectorSyncFileWorkItem.status == FileWorkStatus.SUCCEEDED.value
+                ),
+                func.count(func.distinct(ConnectorSyncFileWorkItem.source_key_hash)),
+                func.count(func.distinct(ConnectorSyncFileWorkItem.repository_path)),
+            ).where(
+                ConnectorSyncFileWorkItem.organization_id == generation.organization_id,
+                ConnectorSyncFileWorkItem.generation_id == generation.id,
+            ),
+            "generation work aggregate validation failed",
+        )
+        if (
+            work_total != generation.items_registered
+            or succeeded_total != work_total
+            or distinct_work_hashes != work_total
+            or distinct_work_paths != work_total
+        ):
+            raise SyncWorkLedgerConflict("generation work is not completely successful")
+
+        observation_total, eligible_total, distinct_observation_hashes = self._row(
+            select(
+                func.count(ConnectorSyncGenerationObservation.id),
+                func.count(ConnectorSyncGenerationObservation.id).filter(
+                    ConnectorSyncGenerationObservation.disposition
+                    == GenerationObservationDisposition.ELIGIBLE.value
+                ),
+                func.count(
+                    func.distinct(ConnectorSyncGenerationObservation.source_key_hash)
+                ),
+            ).where(
+                ConnectorSyncGenerationObservation.organization_id
+                == generation.organization_id,
+                ConnectorSyncGenerationObservation.generation_id == generation.id,
+            ),
+            "generation observation aggregate validation failed",
+        )
+        matched_observations = self._one(
+            select(func.count(ConnectorSyncGenerationObservation.id))
+            .select_from(ConnectorSyncGenerationObservation)
+            .join(
+                ConnectorSyncFileWorkItem,
+                and_(
+                    ConnectorSyncFileWorkItem.organization_id
+                    == ConnectorSyncGenerationObservation.organization_id,
+                    ConnectorSyncFileWorkItem.connector_id
+                    == ConnectorSyncGenerationObservation.connector_id,
+                    ConnectorSyncFileWorkItem.connector_scope_id
+                    == ConnectorSyncGenerationObservation.connector_scope_id,
+                    ConnectorSyncFileWorkItem.generation_id
+                    == ConnectorSyncGenerationObservation.generation_id,
+                    ConnectorSyncFileWorkItem.source_item_key
+                    == ConnectorSyncGenerationObservation.source_item_key,
+                    ConnectorSyncFileWorkItem.source_key_hash
+                    == ConnectorSyncGenerationObservation.source_key_hash,
+                    ConnectorSyncFileWorkItem.repository_path
+                    == ConnectorSyncGenerationObservation.repository_path,
+                    ConnectorSyncFileWorkItem.provider_blob_id
+                    == ConnectorSyncGenerationObservation.provider_object_id,
+                    ConnectorSyncFileWorkItem.provider_revision_id
+                    == ConnectorSyncGenerationObservation.provider_revision_id,
+                    ConnectorSyncFileWorkItem.profile_fingerprint
+                    == ConnectorSyncGenerationObservation.profile_fingerprint,
+                ),
+            )
+            .where(
+                ConnectorSyncGenerationObservation.organization_id
+                == generation.organization_id,
+                ConnectorSyncGenerationObservation.generation_id == generation.id,
+                ConnectorSyncGenerationObservation.disposition
+                == GenerationObservationDisposition.ELIGIBLE.value,
+            ),
+            "generation observation work validation failed",
+        )
+        if (
+            observation_total != generation.items_discovered
+            or distinct_observation_hashes != observation_total
+            or eligible_total != work_total
+            or matched_observations != work_total
+        ):
+            raise SyncWorkLedgerConflict("generation observations are incomplete")
+
+        materialization_total = self._one(
+            select(func.count(ConnectorSyncFileMaterialization.id)).where(
+                ConnectorSyncFileMaterialization.organization_id
+                == generation.organization_id,
+                ConnectorSyncFileMaterialization.generation_id == generation.id,
+            ),
+            "generation materialization aggregate validation failed",
+        )
+        matched_materializations = self._one(
+            select(func.count(ConnectorSyncFileMaterialization.id))
+            .select_from(ConnectorSyncFileMaterialization)
+            .join(
+                ConnectorSyncFileWorkItem,
+                and_(
+                    ConnectorSyncFileWorkItem.organization_id
+                    == ConnectorSyncFileMaterialization.organization_id,
+                    ConnectorSyncFileWorkItem.connector_id
+                    == ConnectorSyncFileMaterialization.connector_id,
+                    ConnectorSyncFileWorkItem.connector_scope_id
+                    == ConnectorSyncFileMaterialization.connector_scope_id,
+                    ConnectorSyncFileWorkItem.generation_id
+                    == ConnectorSyncFileMaterialization.generation_id,
+                    ConnectorSyncFileWorkItem.id
+                    == ConnectorSyncFileMaterialization.work_item_id,
+                    ConnectorSyncFileWorkItem.source_item_key
+                    == ConnectorSyncFileMaterialization.source_item_key,
+                    ConnectorSyncFileWorkItem.source_key_hash
+                    == ConnectorSyncFileMaterialization.source_key_hash,
+                    ConnectorSyncFileWorkItem.repository_path
+                    == ConnectorSyncFileMaterialization.repository_path,
+                    ConnectorSyncFileWorkItem.provider_blob_id
+                    == ConnectorSyncFileMaterialization.provider_blob_id,
+                    ConnectorSyncFileWorkItem.provider_revision_id
+                    == ConnectorSyncFileMaterialization.provider_revision_id,
+                    ConnectorSyncFileWorkItem.profile_fingerprint
+                    == ConnectorSyncFileMaterialization.profile_fingerprint,
+                ),
+            )
+            .where(
+                ConnectorSyncFileMaterialization.organization_id
+                == generation.organization_id,
+                ConnectorSyncFileMaterialization.generation_id == generation.id,
+                ConnectorSyncFileMaterialization.repository_identity
+                == generation.repository_identity,
+                ConnectorSyncFileMaterialization.branch_name == generation.branch_name,
+                ConnectorSyncFileMaterialization.root_tree_object_id
+                == generation.root_tree_object_id,
+                ConnectorSyncFileMaterialization.profile_fingerprint
+                == generation.profile_fingerprint,
+                ConnectorSyncFileWorkItem.status == FileWorkStatus.SUCCEEDED.value,
+            ),
+            "generation materialization work validation failed",
+        )
+        if materialization_total != work_total or matched_materializations != work_total:
+            raise SyncWorkLedgerConflict("generation materializations are incomplete")
+
+        invalid_chunk_groups = self._one(
+            select(func.count())
+            .select_from(
+                select(ConnectorSyncFileMaterialization.id)
+                .outerjoin(
+                    ConnectorSyncFileMaterializationChunk,
+                    and_(
+                        ConnectorSyncFileMaterializationChunk.organization_id
+                        == ConnectorSyncFileMaterialization.organization_id,
+                        ConnectorSyncFileMaterializationChunk.generation_id
+                        == ConnectorSyncFileMaterialization.generation_id,
+                        ConnectorSyncFileMaterializationChunk.materialization_id
+                        == ConnectorSyncFileMaterialization.id,
+                    ),
+                )
+                .where(
+                    ConnectorSyncFileMaterialization.organization_id
+                    == generation.organization_id,
+                    ConnectorSyncFileMaterialization.generation_id == generation.id,
+                )
+                .group_by(
+                    ConnectorSyncFileMaterialization.id,
+                    ConnectorSyncFileMaterialization.chunk_count,
+                )
+                .having(
+                    or_(
+                        func.count(ConnectorSyncFileMaterializationChunk.id)
+                        != ConnectorSyncFileMaterialization.chunk_count,
+                        func.count(
+                            func.distinct(
+                                ConnectorSyncFileMaterializationChunk.chunk_index
+                            )
+                        )
+                        != ConnectorSyncFileMaterialization.chunk_count,
+                        func.min(ConnectorSyncFileMaterializationChunk.chunk_index) != 0,
+                        func.max(ConnectorSyncFileMaterializationChunk.chunk_index)
+                        != ConnectorSyncFileMaterialization.chunk_count - 1,
+                    )
+                )
+                .subquery()
+            ),
+            "generation materialization chunk aggregate validation failed",
+        )
+        invalid_chunk_models = self._one(
+            select(func.count(ConnectorSyncFileMaterializationChunk.id))
+            .select_from(ConnectorSyncFileMaterializationChunk)
+            .join(
+                ConnectorSyncFileMaterialization,
+                and_(
+                    ConnectorSyncFileMaterialization.organization_id
+                    == ConnectorSyncFileMaterializationChunk.organization_id,
+                    ConnectorSyncFileMaterialization.generation_id
+                    == ConnectorSyncFileMaterializationChunk.generation_id,
+                    ConnectorSyncFileMaterialization.id
+                    == ConnectorSyncFileMaterializationChunk.materialization_id,
+                ),
+            )
+            .where(
+                ConnectorSyncFileMaterializationChunk.organization_id
+                == generation.organization_id,
+                ConnectorSyncFileMaterializationChunk.generation_id == generation.id,
+                ConnectorSyncFileMaterializationChunk.embedding_model
+                != ConnectorSyncFileMaterialization.embedding_model,
+            ),
+            "generation materialization chunk model validation failed",
+        )
+        if invalid_chunk_groups or invalid_chunk_models:
+            raise SyncWorkLedgerConflict("generation materialization chunks are incomplete")
+
+        if self._promotion_projection_count(generation) != materialization_total:
+            raise SyncWorkLedgerConflict("generation citation projection is incomplete")
+
+    def _promotion_projection_count(self, generation: ConnectorSyncGeneration) -> int:
+        return self._one(
+            select(func.count(func.distinct(ConnectorSyncFileMaterialization.id)))
+            .select_from(ConnectorSyncFileMaterialization)
+            .join(
+                SourceItem,
+                and_(
+                    SourceItem.organization_id
+                    == ConnectorSyncFileMaterialization.organization_id,
+                    SourceItem.connector_id
+                    == ConnectorSyncFileMaterialization.connector_id,
+                    SourceItem.source_item_key
+                    == ConnectorSyncFileMaterialization.source_item_key,
+                ),
+            )
+            .join(
+                SourceItemScopeMembership,
+                and_(
+                    SourceItemScopeMembership.organization_id
+                    == SourceItem.organization_id,
+                    SourceItemScopeMembership.connector_id == SourceItem.connector_id,
+                    SourceItemScopeMembership.source_item_id == SourceItem.id,
+                    SourceItemScopeMembership.connector_scope_id
+                    == ConnectorSyncFileMaterialization.connector_scope_id,
+                ),
+            )
+            .join(
+                DocumentVersion,
+                and_(
+                    DocumentVersion.organization_id == SourceItem.organization_id,
+                    DocumentVersion.connector_id == SourceItem.connector_id,
+                    DocumentVersion.source_item_id == SourceItem.id,
+                ),
+            )
+            .join(
+                DocumentVersionDocument,
+                and_(
+                    DocumentVersionDocument.organization_id
+                    == DocumentVersion.organization_id,
+                    DocumentVersionDocument.document_version_id == DocumentVersion.id,
+                ),
+            )
+            .join(
+                Document,
+                and_(
+                    Document.organization_id
+                    == DocumentVersionDocument.organization_id,
+                    Document.id == DocumentVersionDocument.document_id,
+                ),
+            )
+            .join(
+                DocumentIndexingState,
+                and_(
+                    DocumentIndexingState.organization_id
+                    == DocumentVersion.organization_id,
+                    DocumentIndexingState.document_version_id == DocumentVersion.id,
+                    DocumentIndexingState.profile_fingerprint
+                    == ConnectorSyncFileMaterialization.profile_fingerprint,
+                ),
+            )
+            .where(
+                ConnectorSyncFileMaterialization.organization_id
+                == generation.organization_id,
+                ConnectorSyncFileMaterialization.generation_id == generation.id,
+                SourceItem.status == "active",
+                SourceItem.deleted_at.is_(None),
+                SourceItem.source_version
+                == ConnectorSyncFileMaterialization.provider_blob_id,
+                SourceItem.source_checksum
+                == ConnectorSyncFileMaterialization.content_checksum,
+                SourceItem.source_metadata["repository_identity"].as_string()
+                == generation.repository_identity,
+                SourceItem.source_metadata["repository_path"].as_string()
+                == ConnectorSyncFileMaterialization.repository_path,
+                SourceItem.source_metadata["blob_object_id"].as_string()
+                == ConnectorSyncFileMaterialization.provider_blob_id,
+                SourceItem.source_metadata["snapshot_commit_id"].as_string()
+                == generation.commit_object_id,
+                SourceItemScopeMembership.status == "active",
+                SourceItemScopeMembership.removed_at.is_(None),
+                DocumentVersion.is_current.is_(True),
+                DocumentVersion.lifecycle == "available",
+                DocumentVersion.provider_version_id
+                == ConnectorSyncFileMaterialization.provider_blob_id,
+                DocumentVersion.content_checksum
+                == ConnectorSyncFileMaterialization.content_checksum,
+                Document.status == "ready",
+                Document.deleted_at.is_(None),
+                Document.source_type == "github",
+                Document.source_document_key
+                == ConnectorSyncFileMaterialization.source_item_key,
+                DocumentIndexingState.status == "indexed",
+                DocumentIndexingState.indexed_generation
+                == DocumentIndexingState.desired_generation,
+                DocumentIndexingState.embedding_model
+                == ConnectorSyncFileMaterialization.embedding_model,
+                DocumentIndexingState.embedding_dimensions == 1536,
+            ),
+            "generation citation projection validation failed",
+        )
+
+    def reconcile_generation(
+        self,
+        request: GenerationReconciliationRequest,
+        *,
+        now: datetime,
+        limit: int = 100,
+    ) -> GenerationReconciliationResult:
+        """Retire one bounded batch absent from an active authoritative manifest."""
+        if not isinstance(request, GenerationReconciliationRequest):
+            raise InvalidSyncWorkLedgerRequest(
+                "generation reconciliation request is invalid"
+            )
+        now = _aware("now", now)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not (
+            1 <= limit <= MAX_RECONCILIATION_BATCH_SIZE
+        ):
+            raise InvalidSyncWorkLedgerRequest(
+                f"reconciliation limit must be between 1 and {MAX_RECONCILIATION_BATCH_SIZE}"
+            )
+
+        scope = self._one(
+            select(ConnectorScope)
+            .where(
+                ConnectorScope.organization_id == request.organization_id,
+                ConnectorScope.connector_id == request.connector_id,
+                ConnectorScope.id == request.connector_scope_id,
+            )
+            .with_for_update(),
+            "generation reconciliation scope lock failed",
+        )
+        generation = self._locked_generation(
+            request.organization_id, request.generation_id
+        )
+        if scope is None or generation is None:
+            raise SyncWorkLedgerNotFound(
+                "generation reconciliation context was not found"
+            )
+        if (
+            scope.status != "active"
+            or scope.scope_type != "repository"
+            or scope.external_scope_key != request.repository_identity
+            or not _generation_reconciliation_matches(generation, request)
+            or generation.provider_key != "github"
+            or generation.manifest_schema_version != 2
+            or generation.status != RepositoryGenerationStatus.COMPLETED.value
+            or not generation.discovery_complete
+            or not generation.reconciliation_eligible
+            or generation.reconciliation_eligible_at is None
+        ):
+            raise SyncWorkLedgerConflict(
+                "generation reconciliation attribution changed"
+            )
+        if now < generation.reconciliation_eligible_at:
+            raise SyncWorkLedgerConflict(
+                "generation reconciliation time moved backward"
+            )
+
+        job = self._one(
+            select(ConnectorSyncJob)
+            .where(
+                ConnectorSyncJob.organization_id == request.organization_id,
+                ConnectorSyncJob.connector_id == request.connector_id,
+                ConnectorSyncJob.connector_scope_id == request.connector_scope_id,
+                ConnectorSyncJob.id == request.sync_job_id,
+            )
+            .with_for_update(),
+            "generation reconciliation job lock failed",
+        )
+        if job is None or job.status != "succeeded" or job.cancel_requested_at is not None:
+            raise SyncWorkLedgerConflict(
+                "generation reconciliation job is not successful"
+            )
+        other_active_job = self._one(
+            select(ConnectorSyncJob.id)
+            .where(
+                ConnectorSyncJob.organization_id == request.organization_id,
+                ConnectorSyncJob.connector_id == request.connector_id,
+                ConnectorSyncJob.connector_scope_id == request.connector_scope_id,
+                ConnectorSyncJob.id != request.sync_job_id,
+                ConnectorSyncJob.status.in_(("queued", "running", "retry_wait")),
+            )
+            .limit(1)
+            .with_for_update(),
+            "concurrent synchronization lookup failed",
+        )
+        if other_active_job is not None:
+            raise SyncWorkLedgerConflict(
+                "generation reconciliation conflicts with active synchronization"
+            )
+        newer_job = self._one(
+            select(ConnectorSyncJob.id)
+            .where(
+                ConnectorSyncJob.organization_id == request.organization_id,
+                ConnectorSyncJob.connector_id == request.connector_id,
+                ConnectorSyncJob.connector_scope_id == request.connector_scope_id,
+                ConnectorSyncJob.id != request.sync_job_id,
+                or_(
+                    ConnectorSyncJob.created_at > job.created_at,
+                    and_(
+                        ConnectorSyncJob.created_at == job.created_at,
+                        ConnectorSyncJob.id > job.id,
+                    ),
+                ),
+            )
+            .limit(1),
+            "newer synchronization lookup failed",
+        )
+        if newer_job is not None:
+            raise SyncWorkLedgerConflict(
+                "stale generation: newer synchronization prevents reconciliation"
+            )
+
+        activations = self._all(
+            select(ConnectorSyncGenerationActivation)
+            .where(
+                ConnectorSyncGenerationActivation.organization_id
+                == request.organization_id,
+                ConnectorSyncGenerationActivation.connector_id == request.connector_id,
+                ConnectorSyncGenerationActivation.connector_scope_id
+                == request.connector_scope_id,
+            )
+            .order_by(
+                ConnectorSyncGenerationActivation.activated_at,
+                ConnectorSyncGenerationActivation.id,
+            )
+            .with_for_update(),
+            "generation reconciliation activation lock failed",
+        )
+        active = [
+            row
+            for row in activations
+            if row.status == GenerationActivationStatus.ACTIVE.value
+        ]
+        if len(active) != 1 or not _reconciliation_activation_matches(
+            active[0], request
+        ):
+            raise SyncWorkLedgerConflict(
+                "generation is not the active reconciliation authority"
+            )
+        newer = self._one(
+            select(ConnectorSyncGeneration.id)
+            .where(
+                ConnectorSyncGeneration.organization_id == request.organization_id,
+                ConnectorSyncGeneration.connector_id == request.connector_id,
+                ConnectorSyncGeneration.connector_scope_id
+                == request.connector_scope_id,
+                ConnectorSyncGeneration.id != request.generation_id,
+                or_(
+                    ConnectorSyncGeneration.created_at > generation.created_at,
+                    and_(
+                        ConnectorSyncGeneration.created_at == generation.created_at,
+                        ConnectorSyncGeneration.id > generation.id,
+                    ),
+                ),
+            )
+            .limit(1),
+            "newer reconciliation generation lookup failed",
+        )
+        if newer is not None:
+            raise SyncWorkLedgerConflict(
+                "stale generation cannot reconcile lifecycle state"
+            )
+
+        if generation.reconciliation_completed_at is not None:
+            return GenerationReconciliationResult(
+                generation.id,
+                True,
+                True,
+                0,
+                0,
+                0,
+                generation.reconciled_membership_count,
+                generation.reconciled_source_count,
+                generation.reconciled_document_count,
+            )
+        if generation.reconciliation_started_at is None:
+            # Promotion made this completed generation immutable to every
+            # application write path.  Persist the expensive aggregate proof
+            # with the first retirement batch; rollback removes the marker and
+            # forces the next attempt to validate again.  Later batches still
+            # recheck scope, job, activation, and newer-work authority above.
+            self._validate_reconciliation_projection(generation)
+            generation.reconciliation_started_at = now
+
+        observation_exists = exists(
+            select(ConnectorSyncGenerationObservation.id).where(
+                ConnectorSyncGenerationObservation.organization_id
+                == request.organization_id,
+                ConnectorSyncGenerationObservation.generation_id
+                == request.generation_id,
+                ConnectorSyncGenerationObservation.source_item_key
+                == SourceItem.source_item_key,
+            )
+        )
+        candidate_ids = self._all(
+            select(SourceItem.id)
+            .join(
+                SourceItemScopeMembership,
+                and_(
+                    SourceItemScopeMembership.organization_id
+                    == SourceItem.organization_id,
+                    SourceItemScopeMembership.connector_id == SourceItem.connector_id,
+                    SourceItemScopeMembership.source_item_id == SourceItem.id,
+                ),
+            )
+            .where(
+                SourceItem.organization_id == request.organization_id,
+                SourceItem.connector_id == request.connector_id,
+                SourceItemScopeMembership.connector_scope_id
+                == request.connector_scope_id,
+                SourceItemScopeMembership.status == "active",
+                SourceItemScopeMembership.removed_at.is_(None),
+                SourceItem.source_item_type == "file",
+                SourceItem.source_item_key.startswith(
+                    f"{request.repository_identity}:path:"
+                ),
+                SourceItem.source_metadata["provider"].as_string() == "github",
+                SourceItem.source_metadata["repository_identity"].as_string()
+                == request.repository_identity,
+                ~observation_exists,
+            )
+            .order_by(SourceItem.id)
+            .limit(limit),
+            "generation reconciliation candidate lookup failed",
+        )
+
+        memberships_retired = 0
+        sources_retired = 0
+        documents_retired = 0
+        for source_item_id in candidate_ids:
+            retired_source, retired_document = self._retire_absent_source(
+                request, source_item_id, now
+            )
+            memberships_retired += 1
+            sources_retired += int(retired_source)
+            documents_retired += int(retired_document)
+
+        generation.reconciled_membership_count += memberships_retired
+        generation.reconciled_source_count += sources_retired
+        generation.reconciled_document_count += documents_retired
+        generation.updated_at = now
+        self._flush("generation reconciliation batch failed")
+
+        remaining = self._one(
+            select(SourceItem.id)
+            .join(
+                SourceItemScopeMembership,
+                and_(
+                    SourceItemScopeMembership.organization_id
+                    == SourceItem.organization_id,
+                    SourceItemScopeMembership.connector_id == SourceItem.connector_id,
+                    SourceItemScopeMembership.source_item_id == SourceItem.id,
+                ),
+            )
+            .where(
+                SourceItem.organization_id == request.organization_id,
+                SourceItem.connector_id == request.connector_id,
+                SourceItemScopeMembership.connector_scope_id
+                == request.connector_scope_id,
+                SourceItemScopeMembership.status == "active",
+                SourceItemScopeMembership.removed_at.is_(None),
+                SourceItem.source_item_type == "file",
+                SourceItem.source_item_key.startswith(
+                    f"{request.repository_identity}:path:"
+                ),
+                SourceItem.source_metadata["provider"].as_string() == "github",
+                SourceItem.source_metadata["repository_identity"].as_string()
+                == request.repository_identity,
+                ~observation_exists,
+            )
+            .limit(1),
+            "generation reconciliation completion lookup failed",
+        )
+        completed = remaining is None
+        if completed:
+            generation.reconciliation_completed_at = now
+            self._flush("generation reconciliation completion failed")
+        return GenerationReconciliationResult(
+            generation.id,
+            completed,
+            False,
+            memberships_retired,
+            sources_retired,
+            documents_retired,
+            generation.reconciled_membership_count,
+            generation.reconciled_source_count,
+            generation.reconciled_document_count,
+        )
+
+    def _retire_absent_source(
+        self,
+        request: GenerationReconciliationRequest,
+        source_item_id: UUID,
+        now: datetime,
+    ) -> tuple[bool, bool]:
+        source = self._one(
+            select(SourceItem)
+            .where(
+                SourceItem.organization_id == request.organization_id,
+                SourceItem.connector_id == request.connector_id,
+                SourceItem.id == source_item_id,
+            )
+            .with_for_update(),
+            "reconciliation source lock failed",
+        )
+        membership = self._one(
+            select(SourceItemScopeMembership)
+            .where(
+                SourceItemScopeMembership.organization_id == request.organization_id,
+                SourceItemScopeMembership.connector_id == request.connector_id,
+                SourceItemScopeMembership.connector_scope_id
+                == request.connector_scope_id,
+                SourceItemScopeMembership.source_item_id == source_item_id,
+            )
+            .with_for_update(),
+            "reconciliation membership lock failed",
+        )
+        if source is None or membership is None:
+            raise SyncWorkLedgerConflict("reconciliation source context disappeared")
+        metadata = source.source_metadata
+        if (
+            membership.status != "active"
+            or membership.removed_at is not None
+            or source.source_item_type != "file"
+            or source.status not in {"active", "unavailable"}
+            or source.deleted_at is not None
+            or not source.source_item_key.startswith(
+                f"{request.repository_identity}:path:"
+            )
+            or metadata.get("provider") != "github"
+            or metadata.get("repository_identity") != request.repository_identity
+        ):
+            raise SyncWorkLedgerConflict("reconciliation source attribution changed")
+        observed = self._one(
+            select(ConnectorSyncGenerationObservation.id)
+            .where(
+                ConnectorSyncGenerationObservation.organization_id
+                == request.organization_id,
+                ConnectorSyncGenerationObservation.generation_id
+                == request.generation_id,
+                ConnectorSyncGenerationObservation.source_item_key
+                == source.source_item_key,
+            )
+            .limit(1),
+            "reconciliation observation revalidation failed",
+        )
+        if observed is not None:
+            raise SyncWorkLedgerConflict("observed source cannot be retired")
+
+        current = self._one(
+            select(DocumentVersion)
+            .where(
+                DocumentVersion.organization_id == request.organization_id,
+                DocumentVersion.source_item_id == source.id,
+                DocumentVersion.is_current.is_(True),
+            )
+            .with_for_update(),
+            "reconciliation current version lock failed",
+        )
+        materialization = None
+        document = None
+        if current is not None:
+            materialization = self._one(
+                select(DocumentVersionDocument)
+                .where(
+                    DocumentVersionDocument.organization_id
+                    == request.organization_id,
+                    DocumentVersionDocument.document_version_id == current.id,
+                )
+                .with_for_update(),
+                "reconciliation document link lock failed",
+            )
+            if materialization is not None:
+                document = self._one(
+                    select(Document)
+                    .where(
+                        Document.organization_id == request.organization_id,
+                        Document.id == materialization.document_id,
+                    )
+                    .with_for_update(),
+                    "reconciliation document lock failed",
+                )
+
+        membership.status = "removed"
+        membership.removed_at = now
+        membership.last_seen_at = now
+        membership.updated_at = now
+        self._flush("source membership retirement failed")
+        other_membership = self._one(
+            select(SourceItemScopeMembership.id)
+            .where(
+                SourceItemScopeMembership.organization_id == request.organization_id,
+                SourceItemScopeMembership.connector_id == request.connector_id,
+                SourceItemScopeMembership.source_item_id == source.id,
+                SourceItemScopeMembership.status == "active",
+                SourceItemScopeMembership.removed_at.is_(None),
+            )
+            .limit(1),
+            "shared source membership lookup failed",
+        )
+        if other_membership is not None:
+            return False, False
+
+        source.status = "deleted"
+        source.deleted_at = now
+        source.updated_at = now
+        if current is None or current.lifecycle != "deleted":
+            next_number = self._one(
+                select(func.coalesce(func.max(DocumentVersion.version_number), 0) + 1)
+                .where(
+                    DocumentVersion.organization_id == request.organization_id,
+                    DocumentVersion.source_item_id == source.id,
+                ),
+                "reconciliation document version allocation failed",
+            )
+            if current is not None:
+                current.is_current = False
+            self._session.add(
+                DocumentVersion(
+                    id=self._new_uuid("document_version_id", uuid4),
+                    organization_id=request.organization_id,
+                    connector_id=request.connector_id,
+                    source_item_id=source.id,
+                    version_number=int(next_number),
+                    provider_version_id=(
+                        current.provider_version_id if current is not None else None
+                    ),
+                    content_checksum=None,
+                    checksum_algorithm=None,
+                    source_modified_at=None,
+                    source_size_bytes=None,
+                    content_type=None,
+                    file_extension=None,
+                    version_cause="tombstone",
+                    lifecycle="deleted",
+                    is_current=True,
+                    discovered_at=now,
+                    version_metadata={
+                        "provider": "github",
+                        "reason": "provider_deleted",
+                        "generation_id": str(request.generation_id),
+                    },
+                    metadata_schema_version=1,
+                )
+            )
+        document_retired = document is not None and document.deleted_at is None
+        if document_retired:
+            document.deleted_at = now
+            document.updated_at = now
+        self._flush("source lifecycle retirement failed")
+        return True, document_retired
 
     def get_work_item(
         self, organization_id: UUID, generation_id: UUID, work_item_id: UUID
@@ -1650,6 +2700,12 @@ class ConnectorSyncWorkLedgerRepository:
         except SQLAlchemyError as exc:
             raise SyncWorkLedgerPersistenceError(message) from exc
 
+    def _row(self, statement, message: str):
+        try:
+            return self._session.execute(statement).one()
+        except SQLAlchemyError as exc:
+            raise SyncWorkLedgerPersistenceError(message) from exc
+
     def _scalar(self, statement, message: str):
         try:
             return self._session.execute(statement).scalar_one_or_none()
@@ -1751,12 +2807,33 @@ def _generation_matches(row, request: RepositoryGenerationRegistration) -> bool:
             "commit_object_id",
             "root_tree_object_id",
             "profile_fingerprint",
+            "manifest_schema_version",
         )
     )
 
 
 def _generation_promotion_matches(
     row: ConnectorSyncGeneration, request: GenerationPromotionRequest
+) -> bool:
+    return row.id == request.generation_id and all(
+        getattr(row, field) == getattr(request, field)
+        for field in (
+            "organization_id",
+            "connector_id",
+            "connector_scope_id",
+            "sync_job_id",
+            "provider_key",
+            "repository_identity",
+            "branch_name",
+            "commit_object_id",
+            "root_tree_object_id",
+            "profile_fingerprint",
+        )
+    )
+
+
+def _generation_reconciliation_matches(
+    row: ConnectorSyncGeneration, request: GenerationReconciliationRequest
 ) -> bool:
     return row.id == request.generation_id and all(
         getattr(row, field) == getattr(request, field)
@@ -1803,6 +2880,23 @@ def _persisted_promotion_materialization_matches(
 
 def _activation_matches(
     row: ConnectorSyncGenerationActivation, request: GenerationPromotionRequest
+) -> bool:
+    return (
+        row.organization_id == request.organization_id
+        and row.connector_id == request.connector_id
+        and row.connector_scope_id == request.connector_scope_id
+        and row.generation_id == request.generation_id
+        and row.repository_identity == request.repository_identity
+        and row.commit_object_id == request.commit_object_id
+        and row.profile_fingerprint == request.profile_fingerprint
+        and row.status == GenerationActivationStatus.ACTIVE.value
+        and row.retired_at is None
+    )
+
+
+def _reconciliation_activation_matches(
+    row: ConnectorSyncGenerationActivation,
+    request: GenerationReconciliationRequest,
 ) -> bool:
     return (
         row.organization_id == request.organization_id
@@ -1924,6 +3018,40 @@ def _manifest_row_matches(row, entry: FileWorkManifestEntry) -> bool:
     )
 
 
+def _observation_row_matches(
+    row: ConnectorSyncGenerationObservation,
+    observation: GenerationSourceObservation,
+) -> bool:
+    return (
+        row.source_item_key == observation.source_item_key
+        and row.repository_path == observation.repository_path
+        and row.provider_object_id == observation.provider_object_id
+        and row.provider_revision_id == observation.provider_revision_id
+        and row.profile_fingerprint == observation.profile_fingerprint
+        and row.entry_type == observation.entry_type
+        and row.disposition == observation.disposition.value
+        and row.file_size_bytes == observation.file_size_bytes
+    )
+
+
+def _work_matches_observation(
+    work: ConnectorSyncFileWorkItem,
+    observation: ConnectorSyncGenerationObservation,
+) -> bool:
+    return (
+        work.organization_id == observation.organization_id
+        and work.connector_id == observation.connector_id
+        and work.connector_scope_id == observation.connector_scope_id
+        and work.generation_id == observation.generation_id
+        and work.source_item_key == observation.source_item_key
+        and work.source_key_hash == observation.source_key_hash
+        and work.repository_path == observation.repository_path
+        and work.provider_blob_id == observation.provider_object_id
+        and work.provider_revision_id == observation.provider_revision_id
+        and work.profile_fingerprint == observation.profile_fingerprint
+    )
+
+
 def _apply_terminal(
     row,
     status: str,
@@ -2002,6 +3130,12 @@ def _generation_view(row) -> RepositoryGenerationView:
         row.created_at,
         row.updated_at,
         row.terminal_at,
+        row.manifest_schema_version,
+        row.reconciliation_started_at,
+        row.reconciliation_completed_at,
+        row.reconciled_membership_count,
+        row.reconciled_source_count,
+        row.reconciled_document_count,
     )
 
 

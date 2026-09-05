@@ -6,9 +6,9 @@
 |---|---|
 | Repository | `enterprise-ai-platform` |
 | Snapshot branch | `main` |
-| Snapshot commit | `fd8e878bb11486041934be94793178e5207f5a7d8` (base of the unstaged Slice 4 implementation) |
-| Snapshot date | 2026-09-04 |
-| Alembic head | `20260904_000023` |
+| Snapshot commit | `6339d45cb4c89dabd61c47a3b35c3bab591029bd` (base of the unstaged Slice 5 implementation) |
+| Snapshot date | 2026-09-05 |
+| Alembic head | `20260905_000024` |
 | Purpose | Authoritative, code-evidenced inventory of implemented, exposed, partial, planned, deferred, and excluded capabilities |
 | Audiences | Product owners, backend/data/security/connector/operations/UI/QA engineers, and future repository agents |
 
@@ -125,7 +125,7 @@ Evidence: `backend/pyproject.toml`, `infra/docker/docker-compose.postgres.yml`, 
 
 ## 6. Database architecture
 
-SQLAlchemy metadata contains **48 live tables**. Alembic head is `20260904_000023`; migrations are forward-ordered, tested against real PostgreSQL, and generally provide narrow downgrades. The pgvector extension downgrade is intentionally conservative because extensions can be shared infrastructure.
+SQLAlchemy metadata contains **49 live tables**. Alembic head is `20260905_000024`; migrations are forward-ordered, tested against real PostgreSQL, and generally provide narrow downgrades. The pgvector extension downgrade is intentionally conservative because extensions can be shared infrastructure.
 
 ### Organizations, users, authentication, and structure
 
@@ -175,6 +175,7 @@ SQLAlchemy metadata contains **48 live tables**. Alembic head is `20260904_00002
 | `connector_sync_errors` | Append-oriented safe run/item errors | UUID PK; run CASCADE, optional item SET NULL | Controlled category/code, retry metadata |
 | `connector_sync_cursors` | Versioned scope continuation | UUID PK; unique scope/version and one active cursor | Active/superseded/invalid; safe JSON or secret reference |
 | `connector_sync_generations` | Immutable pinned repository generation | UUID PK; one per sync job; tenant/scope/profile candidate keys | Discovery/processing barrier; visible only through active promotion |
+| `connector_sync_generation_observations` | Complete pinned non-tree presence manifest | UUID PK; unique tenant generation/source digest; generation/profile FK | Eligible and non-indexable presence; schema-v2 deletion authority |
 | `connector_sync_file_work_items` | Independently leased generation file work | UUID PK; immutable logical identity; unique lease | Retry/fence/cancellation/quarantine counters |
 | `connector_sync_file_materializations` | Retrieval-isolated Phase 3 file output | UUID PK; one per generation work item; immutable logical identity | Exact repository/blob/commit/profile attribution; no legacy document FK |
 | `connector_sync_file_materialization_chunks` | Ordered staged text and vectors | UUID PK; unique materialization/index; `Vector(1536)` | Generation-owned; visible only through active promotion |
@@ -197,9 +198,11 @@ eligible scheduling turns across concurrent workers. Claim/fence and fairness
 advancement are atomic; rollback leaves no durable turn but can leave a harmless
 PostgreSQL sequence gap, and retry/recovery retains the established semantics.
 Fair scheduling does not impose a per-organization active-processing cap.
-Slice 4 now provides a local, default-off atomic generation-promotion and
-retrieval-activation contract. Deletion reconciliation, cleanup, and automatic
-promotion orchestration remain later slices.
+Slice 4 provides a default-off atomic generation-promotion and
+retrieval-activation contract. Slice 5 now adds a local, independently
+default-off full-observation manifest and bounded lifecycle reconciliation.
+Physical cleanup/retention and automatic promotion/reconciliation orchestration
+remain Slice 6.
 
 ### Immutable versions and indexing
 
@@ -462,19 +465,27 @@ embedded, and atomically staged with fenced work completion. The staging schema
 has no mutable legacy source/document/version/indexing/chunk relationship.
 Slice 4 validates stable legacy citation identities and exposes staged chunks
 only through one active tenant/scope generation; unpromoted output remains
-absent from permission-aware results. Deletion reconciliation and cleanup remain
+absent from permission-aware results. Slice 5 records all observed non-tree
+paths, grants deletion authority only to a promoted all-success schema-v2
+generation, and retires absent legacy membership/source/document state in
+transactions selecting at most 500 memberships, with scope-serialized sync
+exclusion, database-side projection validation, atomic progress, and no
+unbounded manifest/chunk materialization or repeated full-generation scan in
+the reconciliation continuation process.
+Unrepresentable path identity fails discovery before cursor advancement.
+Downgrade cannot reverse previously committed lifecycle retirement. Cleanup remains
 unimplemented.
 Nonrecursive Git Trees remain limited to 1 MiB and 1,000 entries per tree, and
 the legacy cursor still caps one run at 100,000 examined entries and 10,000
 observed files, so true million-file repository discovery remains future work.
 
-Phase 3 API readiness supports the Slice 4 zero-downtime expand-migration sequence with
-an exact immutable compatibility set containing only `20260902_000022` and
-`20260904_000023`. The predecessor is compatible but not current and reports
+Phase 3 API readiness supports the Slice 5 zero-downtime expand-migration sequence with
+an exact immutable compatibility set containing only `20260904_000023` and
+`20260905_000024`. The predecessor is compatible but not current and reports
 migration required; the application head is compatible and current. Unknown,
 missing, malformed, older, newer, and multiple heads fail closed. The
 predecessor allowance is temporary and must be removed after every environment
-has reached `20260904_000023`.
+has reached `20260905_000024`.
 
 Migration `20260902_000022` adds one isolated organization scheduling-state
 table and one monotonic sequence. Indexed correlated eligibility probes avoid a
@@ -487,9 +498,10 @@ not durably consume a turn, although sequence gaps are permitted, while an
 expired lease keeps its original consumed turn.
 Retry-wait, cancelled, quarantined, terminal, incomplete-discovery, and
 profile-incompatible work is excluded until or unless it becomes eligible.
-Legacy synchronization ordering is unchanged. Slice 4 adds a local-only,
-default-off promotion transaction and generation-aware retrieval cutover.
-Reconciliation and staging cleanup remain future slices.
+Legacy synchronization ordering is unchanged. Slice 4 adds a default-off
+promotion transaction and generation-aware retrieval cutover. Slice 5 adds a
+separate default-off bounded reconciliation transaction; no existing host calls
+it. Staging cleanup remains Slice 6.
 
 ### GitHub App operator configuration
 
@@ -912,7 +924,7 @@ Known output at snapshot:
 | Local PostgreSQL | Docker Compose uses `pgvector/pgvector:pg16`, localhost port, health check, named volume; development credentials only |
 | pgvector | Extension migration and vector column complete |
 | Local configuration | Environment-driven database/JWT/OpenAI settings; no secrets are documented here |
-| Migrations | 23 revisions, head `20260904_000023`, real PostgreSQL lifecycle tests |
+| Migrations | 24 revisions, head `20260905_000024`, real PostgreSQL lifecycle tests |
 | Worker runner | Bounded staged callable class implemented |
 | Continuous worker host | Direct module with continuous and one-shot modes implemented |
 | Scheduler/automatic recovery | Continuous/one-shot interval scheduler and worker expired recovery implemented |

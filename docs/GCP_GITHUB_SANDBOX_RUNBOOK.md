@@ -151,8 +151,20 @@ Slice 4 adds `GITHUB_SYNC_LEDGER_PROMOTION_ENABLED`, defaulting to lowercase
 the promotion contract yet. A later controlled promotion operator must use the
 same immutable application image, schema `20260904_000023`, one caller-owned
 transaction, and read-only before/after retrieval verification. Promotion makes
-no provider call. Slices 5 and 6 must separately address deletion reconciliation,
-staging retention, automation, and rollback operations.
+no provider call. Slice 5 separately addresses deletion reconciliation; Slice 6
+retains staging retention, automation, and rollback operations.
+
+Slice 5 adds `GITHUB_SYNC_LEDGER_RECONCILIATION_ENABLED`, also strict and
+defaulting to lowercase `false`. No existing Cloud Run host consumes it. Do not
+add or enable it on the connector or dedicated worker. A future authorized
+operator must use schema `20260905_000024`, a promoted manifest-schema-v2
+generation, bounded caller-owned transactions, and read-only retrieval checks.
+Reconciliation makes no provider call and physically deletes no history.
+Its 500 limit counts selected absent memberships, not every related row update.
+The caller commits each batch and its progress together. A schema downgrade
+removes observation/progress metadata but cannot reverse lifecycle retirements;
+do not downgrade after reconciliation without a separately validated recovery
+plan.
 
 Create the bootstrap job with no command-line bootstrap values:
 
@@ -168,18 +180,19 @@ each operation's nonsecret status before continuing:
 1. deploy the transition-compatible API image before changing the database;
 2. require readiness HTTP 200 with `schema_compatible=true`,
    `schema_current=false`, and `migration_required=true` at revision
-   `20260831_000021`;
+   `20260904_000023`;
 3. update only the established migration job to the same immutable image;
 4. execute the migration job exactly once and verify the image's expected
-   revision (Slice 4: `20260904_000023`);
+   revision (Slice 5: `20260905_000024`);
 5. require readiness HTTP 200 with `schema_compatible=true`,
    `schema_current=true`, and `migration_required=false`;
-6. update the worker image with both ledger flags explicitly false;
+6. update worker images while keeping planning/processing false and leaving
+   promotion/reconciliation absent or explicitly false;
 7. continue only with the separately authorized controlled Phase 3 verification.
 
 The predecessor compatibility entry is deliberate temporary expand-migration
 policy. Remove it in a later cleanup only after all environments are confirmed
-at `20260904_000023`. Do not broaden it into revision ordering or a range.
+at `20260905_000024`. Do not broaden it into revision ordering or a range.
 
 For initial provisioning after the compatible API is deployed:
 

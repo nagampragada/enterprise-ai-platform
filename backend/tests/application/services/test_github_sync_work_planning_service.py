@@ -17,7 +17,7 @@ from application.services.github_sync_work_planning_service import (
     GitHubSyncWorkPlanningService,
     InvalidGitHubSyncWorkPlanningRequest,
 )
-from domain.connectors.sync_work_ledger import ManifestRegistrationResult
+from domain.connectors.sync_work_ledger import DiscoveryRegistrationResult
 from infrastructure.repositories.connector_sync_work_ledger_repository import (
     ConnectorSyncWorkLedgerRepository,
 )
@@ -85,14 +85,18 @@ def _service():
         SimpleNamespace(generation_id=generation_id),
         True,
     )
-    repository.register_manifest.side_effect = lambda _organization, _generation, entries, now: (
-        ManifestRegistrationResult(
+    repository.register_discovery_batch.side_effect = (
+        lambda _organization, _generation, observations, entries, now: (
+        DiscoveryRegistrationResult(
             generation_id,
+            len(observations),
+            0,
             len(entries),
             0,
+            tuple(uuid4() for _ in observations),
             tuple(uuid4() for _ in entries),
         )
-    )
+    ))
     return GitHubSyncWorkPlanningService(repository), repository, generation_id
 
 
@@ -134,7 +138,12 @@ def test_supported_manifest_entries_preserve_exact_pinned_attribution() -> None:
     assert request.commit_object_id == COMMIT
     assert request.root_tree_object_id == TREE
     assert request.profile_fingerprint == PROFILE
-    manifest = repository.register_manifest.call_args.args[2]
+    observations = repository.register_discovery_batch.call_args.args[2]
+    manifest = repository.register_discovery_batch.call_args.args[3]
+    assert [row.repository_path for row in observations] == [
+        "documents/one.md",
+        "documents/two.PDF",
+    ]
     assert [entry.repository_path for entry in manifest] == [
         "documents/one.md",
         "documents/two.PDF",
@@ -143,7 +152,13 @@ def test_supported_manifest_entries_preserve_exact_pinned_attribution() -> None:
     assert all(entry.provider_revision_id == COMMIT for entry in manifest)
     assert all(entry.profile_fingerprint == PROFILE for entry in manifest)
     assert result.generation_id == generation_id
-    assert (result.eligible_count, result.created_count, result.existing_count) == (2, 2, 0)
+    assert (
+        result.observed_count,
+        result.created_observation_count,
+        result.eligible_count,
+        result.created_count,
+        result.existing_count,
+    ) == (2, 2, 2, 2, 0)
 
 
 def test_unsupported_oversized_and_nonregular_entries_never_create_work() -> None:
@@ -160,7 +175,14 @@ def test_unsupported_oversized_and_nonregular_entries_never_create_work() -> Non
         ),
     )
     assert result.eligible_count == 0
-    repository.register_manifest.assert_not_called()
+    assert result.observed_count == 3
+    observations = repository.register_discovery_batch.call_args.args[2]
+    assert [row.disposition.value for row in observations] == [
+        "unsupported_format",
+        "oversized",
+        "unsupported_object_type",
+    ]
+    assert repository.register_discovery_batch.call_args.args[3] == ()
 
 
 def test_exact_duplicates_collapse_and_conflicting_source_identity_fails_closed() -> None:
@@ -170,7 +192,8 @@ def test_exact_duplicates_collapse_and_conflicting_source_identity_fails_closed(
     entry = _entry(snapshot, "documents/repeated.md", object_id="1" * 40)
     result = _register(service, context, (entry, entry))
     assert result.eligible_count == 1
-    assert len(repository.register_manifest.call_args.args[2]) == 1
+    assert len(repository.register_discovery_batch.call_args.args[2]) == 1
+    assert len(repository.register_discovery_batch.call_args.args[3]) == 1
 
     conflicting = _entry(snapshot, entry.path, object_id="2" * 40)
     with pytest.raises(InvalidGitHubSyncWorkPlanningRequest, match="duplicated"):

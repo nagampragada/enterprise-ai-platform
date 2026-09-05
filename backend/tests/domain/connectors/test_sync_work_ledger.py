@@ -12,7 +12,10 @@ from domain.connectors.sync_work_ledger import (
     FileWorkLease,
     FileWorkMaterialization,
     FileWorkMaterializationChunk,
+    GenerationObservationDisposition,
     GenerationPromotionRequest,
+    GenerationReconciliationRequest,
+    GenerationSourceObservation,
     RepositoryGenerationRegistration,
 )
 
@@ -206,4 +209,48 @@ def test_generation_promotion_request_is_immutable_and_strict() -> None:
             request.commit_object_id,
             request.root_tree_object_id,
             request.profile_fingerprint,
+        )
+
+
+def test_generation_observation_and_reconciliation_contracts_are_strict() -> None:
+    registration = _generation()
+    observation = GenerationSourceObservation(
+        "github:repository:123:path:README.md",
+        "README.md",
+        "b" * 40,
+        registration.commit_object_id,
+        registration.profile_fingerprint,
+        "regular_blob",
+        GenerationObservationDisposition.ELIGIBLE,
+        42,
+    )
+    request = GenerationReconciliationRequest(
+        registration.organization_id,
+        registration.connector_id,
+        registration.connector_scope_id,
+        uuid4(),
+        registration.sync_job_id,
+        registration.provider_key,
+        registration.repository_identity,
+        registration.branch_name,
+        registration.commit_object_id,
+        registration.root_tree_object_id,
+        registration.profile_fingerprint,
+    )
+    with pytest.raises(FrozenInstanceError):
+        observation.repository_path = "other.md"  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        request.generation_id = uuid4()  # type: ignore[misc]
+    with pytest.raises(ValueError):
+        _generation(manifest_schema_version=1)
+    with pytest.raises(ValueError):
+        GenerationSourceObservation(
+            observation.source_item_key,
+            observation.repository_path,
+            observation.provider_object_id,
+            observation.provider_revision_id,
+            observation.profile_fingerprint,
+            observation.entry_type,
+            "eligible",  # type: ignore[arg-type]
+            observation.file_size_bytes,
         )

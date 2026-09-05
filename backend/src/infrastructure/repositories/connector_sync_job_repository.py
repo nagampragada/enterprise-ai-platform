@@ -13,7 +13,12 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from infrastructure.db.models import Connector, ConnectorSyncJob, ConnectorSyncRun
+from infrastructure.db.models import (
+    Connector,
+    ConnectorScope,
+    ConnectorSyncJob,
+    ConnectorSyncRun,
+)
 from infrastructure.repositories.connector_repository import (
     _require_aware,
     _require_choice,
@@ -250,6 +255,21 @@ class ConnectorSyncJobRepository:
             .returning(ConnectorSyncJob.id)
         )
         try:
+            # Reconciliation takes the same scope lock before deciding that no
+            # synchronization is active.  Sharing this lock closes the window
+            # in which a new job could be enqueued while an authoritative
+            # generation retires the scope's missing sources.
+            scope_id = self._session.scalar(
+                select(ConnectorScope.id)
+                .where(
+                    ConnectorScope.organization_id == organization_id,
+                    ConnectorScope.connector_id == connector_id,
+                    ConnectorScope.id == connector_scope_id,
+                )
+                .with_for_update()
+            )
+            if scope_id is None:
+                raise SyncJobConflict("synchronization scope is unavailable")
             created_id = self._session.execute(statement).scalar_one_or_none()
             if created_id is not None:
                 return EnqueueResult(created_id, "queued", False)

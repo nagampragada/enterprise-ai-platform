@@ -1,5 +1,79 @@
 # Database Architecture
 
+## Authoritative generation observations and deletion reconciliation (`20260905_000024`)
+
+Migration `20260905_000024` adds the tenant-qualified
+`connector_sync_generation_observations` table and bounded reconciliation
+progress to `connector_sync_generations`. New generations use manifest schema
+version 2; existing rows remain version 1 and cannot become deletion authority.
+Readiness accepts exactly predecessor `20260904_000023` and current
+`20260905_000024` during the additive transition.
+
+Every non-tree entry accepted by the pinned traversal is recorded once by
+source identity, path, object, commit, profile, entry type, disposition, and
+bounded size. `eligible` observations correspond one-to-one with work items;
+unsupported formats, oversized blobs, symlinks, and submodules remain explicit
+presence evidence without creating processing work. Observation and work
+registration share one caller-owned transaction, so a failed batch cannot
+partially establish a deletion manifest. An entry whose canonical source
+identity cannot fit the persisted identity contract fails discovery before its
+cursor can advance; it is never silently omitted. A valid empty repository has
+zero observations and zero work only after the pinned traversal positively
+exhausts every tree frame and discovery completion is committed with the
+legacy cursor transition. Pagination interruption, cancellation, tree/commit
+drift, budget exhaustion, or any failed batch leaves the generation
+non-authoritative. Migration defaults every historical generation to manifest
+schema version 1 and therefore manufactures no deletion authority.
+
+Promotion revalidates the complete schema-v2 observation/work projection and
+atomically marks the successful active generation as reconciliation authority.
+`GitHubSyncGenerationReconciliationService` is separately gated, default-off,
+and has no automatic caller. Reconciliation locks the exact scope first,
+requires its one matching active activation, the successful source job, no
+active or newer synchronization and no newer generation, then revalidates the
+complete all-success projection with database-side aggregate and bijection
+checks rather than loading the complete manifest or chunk set into application
+memory. That complete proof is persisted with the first retirement batch;
+rollback removes its start marker and forces revalidation, while later batches
+recheck scope, job, activation, tenant attribution, and newer-work exclusion
+without repeatedly scanning the immutable generation. Each transaction selects at most 500 absent active file memberships in
+stable source-ID order; that bound is a membership-candidate bound, not a total
+row-mutation bound, because one candidate can also update its source, current
+version, document, and tombstone state. Progress counters are updated in the
+same transaction as those mutations. Replay after completion is idempotent,
+concurrent calls serialize, and caller rollback preserves all lifecycle and
+progress state. Job enqueue and legacy GitHub persistence/reconciliation share
+the same scope-first lock order, closing the between-batch synchronization race;
+source rows are locked only after the scope lock.
+
+Retirement first removes only the exact scope membership. Another active scope
+membership preserves the shared source, current version, document, indexing,
+and retrieval path. Without one, the source is soft-deleted, the current
+available/unavailable version is superseded by a current `deleted` tombstone,
+and its linked document is soft-retired. Existing immutable versions,
+document/version links, indexing states and attempts, legacy chunks, staged
+materializations/chunks, activation history, and citations are not physically
+deleted. The active generation already controls retrieval atomically, while
+the lifecycle update makes the legacy graph agree with that authority. Physical
+cleanup, retention, compaction, restore tooling, and automatic orchestration
+remain Slice 6.
+
+The current document model does not support independently shared document
+ownership across source items: tenant uniqueness on the document/version link
+allows one current source-version materialization per document. Consequently,
+the last-membership decision is made for the connector-wide `SourceItem`, and
+the linked document can be retired only after that source has no active scope
+membership. A second source cannot silently depend on the same document row;
+the database rejects such a link. A previously retired path is reactivated by
+the existing synchronization contract using the same source/document identity
+and a new available immutable version.
+
+Downgrade is schema-only. It removes observation/progress columns and cannot
+undo any lifecycle retirement already committed by reconciliation. Operators
+must downgrade only before reconciliation is used or follow an independently
+validated data-recovery plan; upgrade/downgrade/re-upgrade DDL reversibility is
+not a claim that business lifecycle mutations are reversible.
+
 ## Organization-fair ledger claims (`20260902_000022`)
 
 The Slice 3 fairness rollout used an explicit compatibility window containing
@@ -91,6 +165,9 @@ generation, and profile. A successful cutover retires the prior row and inserts
 the next active row in the same caller-owned transaction; rollback preserves the
 previous authority. Readiness accepts only predecessor `20260902_000022` and
 current `20260904_000023` during this additive transition.
+
+That Slice 4 compatibility window is historical. The current Slice 5 window is
+the exact `20260904_000023`/`20260905_000024` pair documented above.
 
 `GitHubSyncGenerationPromotionService` requires explicit
 `GITHUB_SYNC_LEDGER_PROMOTION_ENABLED=true`. The flag defaults to `false` and
@@ -744,7 +821,7 @@ These are the next tables that can be implemented once the migration slice is ap
 - Security: `safe_config` and the capability snapshot contain only non-secret JSON objects. Credentials, tokens, API keys, private keys, and passwords must never be persisted there; `secret_reference` contains only a reference to externally managed secret material. A future connector service must validate provider-specific schemas and reject secret-like configuration keys.
 - ACL declaration: `acl_support` is the typed security-relevant declaration (`none`, `partial`, or `complete`). Capability JSON is descriptive and is not authoritative for access security.
 - Lifecycle: connectors progress through draft, validation, active/degraded/auth-failed/paused, and archived states. Hard deletion cascades owned scopes, while normal behavior archives connectors.
-- Integration status: connector instance/scope repositories and Local Folder/GitHub management services/APIs exist. GitHub repository scopes persist desired boundaries, and an internal staged service persists bounded creates, updates, unindexable-state retirement, and authoritative deletion reconciliation; GitHub worker routing is not implemented.
+- Integration status: connector instance/scope repositories and Local Folder/GitHub management services/APIs exist. GitHub repository scopes persist desired boundaries. The legacy worker remains available, and the default-off ledger path provides bounded planning, isolated processing, promotion, and explicit deletion reconciliation; reconciliation has no automatic caller in Slice 5.
 
 #### connector_scopes
 

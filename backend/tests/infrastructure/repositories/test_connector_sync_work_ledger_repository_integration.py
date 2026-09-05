@@ -32,7 +32,10 @@ from domain.connectors.sync_work_ledger import (
     FileWorkMaterialization,
     FileWorkMaterializationChunk,
     FileWorkStatus,
+    GenerationObservationDisposition,
     GenerationPromotionRequest,
+    GenerationReconciliationRequest,
+    GenerationSourceObservation,
     RepositoryGenerationRegistration,
 )
 from infrastructure.db.models import (
@@ -41,9 +44,21 @@ from infrastructure.db.models import (
     ConnectorSyncFileWorkItem,
     ConnectorSyncGeneration,
     ConnectorSyncGenerationActivation,
+    ConnectorSyncGenerationObservation,
     ConnectorSyncOrganizationClaimSchedule,
+    ConnectorScope,
+    Document,
+    DocumentChunk,
+    DocumentIndexingState,
+    DocumentVersion,
+    SourceItem,
+    SourceItemScopeMembership,
     Organization,
 )
+from infrastructure.repositories.connector_sync_job_repository import (
+    ConnectorSyncJobRepository,
+)
+from infrastructure.repositories.connector_scope_repository import ConnectorScopeRepository
 from infrastructure.repositories.connector_sync_work_ledger_repository import (
     ConnectorSyncWorkLedgerRepository,
     FileWorkCancellationConflict,
@@ -52,7 +67,12 @@ from infrastructure.repositories.connector_sync_work_ledger_repository import (
     StaleFileWorkFence,
     SyncWorkLedgerConflict,
     SyncWorkLedgerNotFound,
+    SyncWorkLedgerPersistenceError,
 )
+from infrastructure.repositories.permission_aware_document_chunk_search_repository import (
+    PermissionAwareDocumentChunkSearchRepository,
+)
+from infrastructure.repositories.source_item_repository import SourceItemRepository
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -292,8 +312,22 @@ def _generation(session: Session, label: str = "Ledger"):
 def _register(
     session: Session, organization_id: UUID, generation_id: UUID, entries
 ):
-    result = ConnectorSyncWorkLedgerRepository(session).register_manifest(
-        organization_id, generation_id, entries, now=NOW
+    entries = tuple(entries)
+    observations = tuple(
+        GenerationSourceObservation(
+            entry.source_item_key,
+            entry.repository_path,
+            entry.provider_blob_id,
+            entry.provider_revision_id,
+            entry.profile_fingerprint,
+            "regular_blob",
+            GenerationObservationDisposition.ELIGIBLE,
+            entry.file_size_bytes,
+        )
+        for entry in entries
+    )
+    result = ConnectorSyncWorkLedgerRepository(session).register_discovery_batch(
+        organization_id, generation_id, observations, entries, now=NOW
     )
     session.commit()
     return result
@@ -340,6 +374,224 @@ def _promotion_request(generation) -> GenerationPromotionRequest:
         generation.root_tree_object_id,
         generation.profile_fingerprint,
     )
+
+
+def _reconciliation_request(generation) -> GenerationReconciliationRequest:
+    return GenerationReconciliationRequest(
+        generation.organization_id,
+        generation.connector_id,
+        generation.connector_scope_id,
+        generation.generation_id,
+        generation.sync_job_id,
+        generation.provider_key,
+        generation.repository_identity,
+        generation.branch_name,
+        generation.commit_object_id,
+        generation.root_tree_object_id,
+        generation.profile_fingerprint,
+    )
+
+
+def _add_absent_legacy_source(
+    session: Session,
+    context,
+    generation,
+    *,
+    path: str,
+    additional_scope_id: UUID | None = None,
+):
+    source_id, version_id, document_id, chunk_id = (uuid4() for _ in range(4))
+    source_key = f"{generation.repository_identity}:path:{path}"
+    session.add(
+        SourceItem(
+            id=source_id,
+            organization_id=context[0],
+            connector_id=context[1],
+            source_item_key=source_key,
+            parent_source_item_key=None,
+            source_item_type="file",
+            title=path.rsplit("/", 1)[-1],
+            source_url=None,
+            mime_type="text/markdown",
+            source_checksum="e" * 64,
+            source_version="f" * 40,
+            size_bytes=10,
+            source_created_at=None,
+            source_modified_at=None,
+            first_seen_at=NOW,
+            last_seen_at=NOW,
+            status="active",
+            deleted_at=None,
+            source_metadata={
+                "provider": "github",
+                "repository_identity": generation.repository_identity,
+                "repository_path": path,
+                "blob_object_id": "f" * 40,
+                "snapshot_commit_id": "0" * 40,
+            },
+            metadata_schema_version=1,
+        )
+    )
+    for scope_id in (context[2], additional_scope_id):
+        if scope_id is not None:
+            session.add(
+                SourceItemScopeMembership(
+                    id=uuid4(),
+                    organization_id=context[0],
+                    connector_id=context[1],
+                    source_item_id=source_id,
+                    connector_scope_id=scope_id,
+                    status="active",
+                    first_discovered_at=NOW,
+                    last_seen_at=NOW,
+                    removed_at=None,
+                )
+            )
+    # These fixtures intentionally use independent ORM objects rather than
+    # relationships.  Flush the tenant-qualified source graph before adding
+    # its version so PostgreSQL, rather than ORM insertion ordering, remains
+    # the authoritative foreign-key check.
+    session.flush()
+    session.add(
+        DocumentVersion(
+            id=version_id,
+            organization_id=context[0],
+            connector_id=context[1],
+            source_item_id=source_id,
+            version_number=1,
+            provider_version_id="f" * 40,
+            content_checksum="e" * 64,
+            checksum_algorithm="sha256",
+            source_modified_at=None,
+            source_size_bytes=10,
+            content_type="text/markdown",
+            file_extension=".md",
+            version_cause="discovered",
+            lifecycle="available",
+            is_current=True,
+            discovered_at=NOW,
+            version_metadata={},
+            metadata_schema_version=1,
+        )
+    )
+    session.add(
+        Document(
+            id=document_id,
+            organization_id=context[0],
+            source_type="github",
+            source_document_key=source_key,
+            title=path,
+            source_url=None,
+            mime_type="text/markdown",
+            checksum_latest="e" * 64,
+            status="ready",
+            source_created_at=None,
+            source_updated_at=None,
+            deleted_at=None,
+        )
+    )
+    session.flush()
+    session.execute(
+        text(
+            "INSERT INTO document_version_documents "
+            "(id,organization_id,document_version_id,document_id) "
+            "VALUES (:id,:org,:version,:document)"
+        ),
+        {
+            "id": uuid4(),
+            "org": context[0],
+            "version": version_id,
+            "document": document_id,
+        },
+    )
+    session.add(
+        DocumentIndexingState(
+            id=uuid4(),
+            organization_id=context[0],
+            document_version_id=version_id,
+            extraction_profile="github",
+            extraction_version="v1",
+            chunking_profile="deterministic",
+            chunking_version="v2",
+            embedding_provider="test",
+            embedding_model="fake:model:1536",
+            embedding_dimensions=1536,
+            profile_fingerprint=generation.profile_fingerprint,
+            desired_generation=1,
+            indexed_generation=1,
+            status="indexed",
+            reason="new_version",
+            attempt_count=1,
+            requested_at=NOW,
+            started_at=NOW,
+            completed_at=NOW,
+        )
+    )
+    session.add(
+        DocumentChunk(
+            id=chunk_id,
+            organization_id=context[0],
+            document_id=document_id,
+            chunk_index=0,
+            chunk_text="legacy absent chunk",
+            content_hash="9" * 64,
+            token_count=None,
+            embedding=[0.0] * 1536,
+            embedding_model="fake:model:1536",
+        )
+    )
+    session.commit()
+    return source_id, version_id, document_id, chunk_id
+
+
+def _retrieval_user(session: Session, organization_id: UUID, scope_id: UUID) -> UUID:
+    user_id = uuid4()
+    knowledge_space_id = session.scalar(
+        select(ConnectorScope.knowledge_space_id).where(ConnectorScope.id == scope_id)
+    )
+    assert knowledge_space_id is not None
+    session.execute(
+        text(
+            "INSERT INTO users "
+            "(id,organization_id,email,normalized_email,password_hash,display_name) "
+            "VALUES (:id,:org,:email,:email,'hash','Reconciliation Reader')"
+        ),
+        {
+            "id": user_id,
+            "org": organization_id,
+            "email": f"{user_id}@example.test",
+        },
+    )
+    session.execute(
+        text(
+            "INSERT INTO knowledge_space_user_grants "
+            "(id,organization_id,knowledge_space_id,user_id,permission_level,granted_at) "
+            "VALUES (:id,:org,:space,:user,'viewer',:now)"
+        ),
+        {
+            "id": uuid4(),
+            "org": organization_id,
+            "space": knowledge_space_id,
+            "user": user_id,
+            "now": NOW,
+        },
+    )
+    session.commit()
+    return user_id
+
+
+def _retrieval_chunk_ids(
+    session: Session, organization_id: UUID, user_id: UUID
+) -> set[UUID]:
+    rows = PermissionAwareDocumentChunkSearchRepository(session).search(
+        organization_id,
+        user_id,
+        [1.0] + [0.0] * 1535,
+        "fake:model:1536",
+        100,
+        source_item_types=("file",),
+    )
+    return {row.chunk_id for row in rows}
 
 
 def _ready_promotion(session: Session, label: str = "Promotion"):
@@ -503,6 +755,120 @@ def test_generation_and_duplicate_manifest_registration_are_idempotent(engine) -
                 [_entry(index) for index in range(501)], now=NOW,
             )
         session.rollback()
+
+
+def test_discovery_batch_failure_cannot_leave_partial_observations(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation = _generation(session, "AtomicDiscovery")
+        first = _entry(1)
+        first_result = _register(
+            session, context[0], generation.generation_id, (first,)
+        )
+        second = _entry(2)
+        second_observation = GenerationSourceObservation(
+            second.source_item_key,
+            second.repository_path,
+            second.provider_blob_id,
+            second.provider_revision_id,
+            second.profile_fingerprint,
+            "regular_blob",
+            GenerationObservationDisposition.ELIGIBLE,
+            second.file_size_bytes,
+        )
+        repository = ConnectorSyncWorkLedgerRepository(
+            session,
+            work_item_id_factory=lambda: first_result.work_item_ids[0],
+        )
+        with pytest.raises(SyncWorkLedgerPersistenceError, match="manifest registration"):
+            repository.register_discovery_batch(
+                context[0],
+                generation.generation_id,
+                (second_observation,),
+                (second,),
+                now=NOW,
+            )
+        session.rollback()
+        assert session.scalar(
+            select(func.count(ConnectorSyncGenerationObservation.id)).where(
+                ConnectorSyncGenerationObservation.generation_id
+                == generation.generation_id
+            )
+        ) == 1
+        persisted = repository.get_generation(context[0], generation.generation_id)
+        assert persisted is not None
+        assert (persisted.items_discovered, persisted.items_registered) == (1, 1)
+
+
+def test_completed_discovery_rejects_new_observation_before_any_write(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation = _generation(session, "ImmutableDiscovery")
+        first = _entry(1)
+        first_result = _register(
+            session, context[0], generation.generation_id, (first,)
+        )
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        repository.mark_discovery_complete(
+            context[0], generation.generation_id, now=NOW
+        )
+        session.commit()
+
+        replay = repository.register_discovery_batch(
+            context[0],
+            generation.generation_id,
+            (
+                GenerationSourceObservation(
+                    first.source_item_key,
+                    first.repository_path,
+                    first.provider_blob_id,
+                    first.provider_revision_id,
+                    first.profile_fingerprint,
+                    "regular_blob",
+                    GenerationObservationDisposition.ELIGIBLE,
+                    first.file_size_bytes,
+                ),
+            ),
+            (first,),
+            now=NOW,
+        )
+        assert replay.created_observation_count == replay.created_work_count == 0
+        assert replay.observation_ids == first_result.observation_ids
+
+        second = _entry(2)
+        with pytest.raises(
+            SyncWorkLedgerConflict,
+            match="completed discovery cannot accept new observations",
+        ):
+            repository.register_discovery_batch(
+                context[0],
+                generation.generation_id,
+                (
+                    GenerationSourceObservation(
+                        second.source_item_key,
+                        second.repository_path,
+                        second.provider_blob_id,
+                        second.provider_revision_id,
+                        second.profile_fingerprint,
+                        "regular_blob",
+                        GenerationObservationDisposition.ELIGIBLE,
+                        second.file_size_bytes,
+                    ),
+                ),
+                (second,),
+                now=NOW,
+            )
+        # Even an exception-catching caller cannot commit the rejected mutation.
+        session.commit()
+        assert session.scalar(
+            select(func.count(ConnectorSyncGenerationObservation.id)).where(
+                ConnectorSyncGenerationObservation.generation_id
+                == generation.generation_id
+            )
+        ) == 1
+        assert session.scalar(
+            select(func.count(ConnectorSyncFileWorkItem.id)).where(
+                ConnectorSyncFileWorkItem.generation_id == generation.generation_id
+            )
+        ) == 1
 
 
 def test_cross_tenant_provider_claim_is_single_bounded_and_requires_completed_discovery(engine) -> None:
@@ -970,14 +1336,18 @@ def test_forced_failure_at_each_fair_claim_boundary_rolls_back_all_durable_state
 
             monkeypatch.setattr(repository, "_select_fair_organization", fail_after_selection)
         elif boundary == "after_schedule_initialization":
-            original_add = session.add
+            original_execute = session.execute
 
-            def fail_after_add(instance, *args, **kwargs):
-                original_add(instance, *args, **kwargs)
-                if isinstance(instance, ConnectorSyncOrganizationClaimSchedule):
+            def fail_after_schedule_insert(statement, *args, **kwargs):
+                result = original_execute(statement, *args, **kwargs)
+                if (
+                    getattr(getattr(statement, "table", None), "name", None)
+                    == ConnectorSyncOrganizationClaimSchedule.__tablename__
+                ):
                     raise RuntimeError(boundary)
+                return result
 
-            monkeypatch.setattr(session, "add", fail_after_add)
+            monkeypatch.setattr(session, "execute", fail_after_schedule_insert)
         elif boundary == "after_work_item_lock":
             def fail_after_item_lock(statement, **kwargs):
                 assert repository._one(statement, "forced item lock") is not None
@@ -1050,6 +1420,48 @@ def test_rolled_back_sequence_value_leaves_gap_but_no_committed_turn(engine) -> 
         schedule = session.get(ConnectorSyncOrganizationClaimSchedule, context[0])
         assert schedule.claim_count == 1
         assert schedule.last_claim_sequence == committed.fairness_claim_sequence
+
+
+def test_stale_never_served_snapshot_atomically_advances_existing_schedule(
+    engine, monkeypatch
+) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation = _make_fair_generation(
+            session, "FairFirstTurnRace", 2
+        )
+        first = _fair_claim(session, "fair-first-turn-winner")
+        assert first is not None
+        schedule = session.get(
+            ConnectorSyncOrganizationClaimSchedule, context[0]
+        )
+        assert schedule.claim_count == 1
+        first_sequence = schedule.last_claim_sequence
+
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        monkeypatch.setattr(
+            repository,
+            "_select_fair_organization",
+            lambda **_kwargs: (context[0], None),
+        )
+        second = repository.claim_next_available_fair(
+            provider_key="github",
+            profile_fingerprint=PROFILE,
+            worker_id="fair-stale-never-served-snapshot",
+            now=NOW,
+            lease_duration=LEASE,
+        )
+        session.commit()
+
+        assert second is not None
+        assert second.organization_id == context[0]
+        assert second.generation_id == generation.generation_id
+        assert second.fairness_claim_sequence > first_sequence
+        session.expire_all()
+        schedule = session.get(
+            ConnectorSyncOrganizationClaimSchedule, context[0]
+        )
+        assert schedule.claim_count == 2
+        assert schedule.last_claim_sequence == second.fairness_claim_sequence
 
 
 def test_repeated_rollback_for_one_organization_does_not_corrupt_other_schedules(
@@ -2101,7 +2513,7 @@ def test_github_planner_concurrent_replay_is_unique_and_conflicts_fail_closed(
             ConnectorSyncWorkLedgerRepository(session)
         )
         conflicting = replace(entries[0], object_id="f" * 40)
-        with pytest.raises(SyncWorkLedgerConflict, match="source identity"):
+        with pytest.raises(SyncWorkLedgerConflict, match="observation identity"):
             _plan(service, context, (conflicting,))
         session.rollback()
         assert session.scalar(
@@ -2647,3 +3059,817 @@ def test_ten_thousand_item_ledger_benchmark_is_bounded_and_unique(engine) -> Non
         }
         print(f"sync_work_ledger_benchmark={json.dumps(metrics, sort_keys=True)}")
         assert metrics["peak_process_memory_growth_bytes"] < 512 * 1024 * 1024
+
+
+def test_generation_reconciliation_retires_absent_lifecycle_and_replays(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation, *_ = _ready_promotion(session, "ReconcileAbsent")
+        absent_source, absent_version, absent_document, absent_chunk = (
+            _add_absent_legacy_source(
+                session, context, generation, path="documents/removed.md"
+            )
+        )
+        user_id = _retrieval_user(session, context[0], context[2])
+        assert absent_chunk in _retrieval_chunk_ids(session, context[0], user_id)
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        repository.promote_generation(
+            _promotion_request(generation), now=NOW + timedelta(hours=1)
+        )
+        session.commit()
+        activated_ids = _retrieval_chunk_ids(session, context[0], user_id)
+        assert absent_chunk not in activated_ids
+        assert len(activated_ids) == 1
+
+        result = repository.reconcile_generation(
+            _reconciliation_request(generation),
+            now=NOW + timedelta(hours=2),
+            limit=10,
+        )
+        session.commit()
+        assert result.completed is True and result.replayed is False
+        assert (
+            result.memberships_retired,
+            result.sources_retired,
+            result.documents_retired,
+        ) == (1, 1, 1)
+        membership = session.scalar(
+            select(SourceItemScopeMembership).where(
+                SourceItemScopeMembership.connector_scope_id == context[2],
+                SourceItemScopeMembership.source_item_id == absent_source,
+            )
+        )
+        source = session.get(SourceItem, absent_source)
+        document = session.get(Document, absent_document)
+        versions = session.scalars(
+            select(DocumentVersion)
+            .where(DocumentVersion.source_item_id == absent_source)
+            .order_by(DocumentVersion.version_number)
+        ).all()
+        assert membership is not None and membership.status == "removed"
+        assert source is not None and source.status == "deleted"
+        assert document is not None and document.deleted_at is not None
+        assert [(row.version_number, row.lifecycle, row.is_current) for row in versions] == [
+            (1, "available", False),
+            (2, "deleted", True),
+        ]
+        assert session.get(DocumentChunk, absent_chunk) is not None
+        assert session.get(DocumentVersion, absent_version) is not None
+        assert session.scalar(
+            select(func.count(DocumentIndexingState.id)).where(
+                DocumentIndexingState.document_version_id == absent_version
+            )
+        ) == 1
+        assert _retrieval_chunk_ids(session, context[0], user_id) == activated_ids
+        generation_row = session.get(ConnectorSyncGeneration, generation.generation_id)
+        assert generation_row is not None
+        assert generation_row.reconciliation_eligible is True
+        assert generation_row.reconciliation_completed_at is not None
+        assert generation_row.reconciled_membership_count == 1
+
+        replay = repository.reconcile_generation(
+            _reconciliation_request(generation),
+            now=NOW + timedelta(hours=3),
+            limit=10,
+        )
+        session.commit()
+        assert replay.completed is replay.replayed is True
+        assert replay.memberships_retired == 0
+        assert session.scalar(
+            select(func.count(DocumentVersion.id)).where(
+                DocumentVersion.source_item_id == absent_source
+            )
+        ) == 2
+
+
+def test_reconciliation_preserves_shared_scope_and_rolls_back_atomically(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation, *_ = _ready_promotion(session, "ReconcileShared")
+        other_space, other_scope = uuid4(), uuid4()
+        session.execute(
+            text(
+                "INSERT INTO knowledge_spaces (id,organization_id,name,slug) "
+                "VALUES (:id,:org,'Shared','shared-space')"
+            ),
+            {"id": other_space, "org": context[0]},
+        )
+        session.execute(
+            text(
+                "INSERT INTO connector_scopes "
+                "(id,organization_id,connector_id,knowledge_space_id,display_name,slug,"
+                "scope_type,external_scope_key,access_mode,status) VALUES "
+                "(:id,:org,:connector,:space,'Shared','shared-scope','repository',"
+                ":key,'platform_managed','active')"
+            ),
+            {
+                "id": other_scope,
+                "org": context[0],
+                "connector": context[1],
+                "space": other_space,
+                "key": "github:repository:999999",
+            },
+        )
+        session.commit()
+        absent_source, absent_version, absent_document, shared_chunk = _add_absent_legacy_source(
+            session,
+            context,
+            generation,
+            path="documents/shared.md",
+            additional_scope_id=other_scope,
+        )
+        shared_user = _retrieval_user(session, context[0], other_scope)
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        repository.promote_generation(
+            _promotion_request(generation), now=NOW + timedelta(hours=1)
+        )
+        session.commit()
+        prepared = repository.reconcile_generation(
+            _reconciliation_request(generation), now=NOW + timedelta(hours=2)
+        )
+        assert prepared.memberships_retired == 1
+        session.rollback()
+        assert session.scalar(
+            select(SourceItemScopeMembership.status).where(
+                SourceItemScopeMembership.source_item_id == absent_source,
+                SourceItemScopeMembership.connector_scope_id == context[2],
+            )
+        ) == "active"
+
+        result = repository.reconcile_generation(
+            _reconciliation_request(generation), now=NOW + timedelta(hours=2)
+        )
+        session.commit()
+        assert (result.memberships_retired, result.sources_retired) == (1, 0)
+        memberships = session.scalars(
+            select(SourceItemScopeMembership).where(
+                SourceItemScopeMembership.source_item_id == absent_source
+            )
+        ).all()
+        assert {row.connector_scope_id: row.status for row in memberships} == {
+            context[2]: "removed",
+            other_scope: "active",
+        }
+        assert session.get(SourceItem, absent_source).status == "active"
+        assert session.get(Document, absent_document).deleted_at is None
+        assert session.get(DocumentVersion, absent_version).is_current is True
+        assert shared_chunk in _retrieval_chunk_ids(
+            session, context[0], shared_user
+        )
+
+
+def test_empty_repository_reconciles_bounded_and_stale_generation_fails(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation = _generation(session, "ReconcileEmpty")
+        session.execute(
+            text("UPDATE connector_scopes SET external_scope_key=:key WHERE id=:scope"),
+            {"key": generation.repository_identity, "scope": context[2]},
+        )
+        session.execute(
+            text(
+                "UPDATE connector_sync_jobs SET status='succeeded',attempt_count=1,"
+                "fencing_token=1,next_attempt_at=NULL,completed_at=created_at WHERE id=:job"
+            ),
+            {"job": context[3]},
+        )
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        repository.mark_discovery_complete(context[0], generation.generation_id, now=NOW)
+        session.commit()
+        source_ids = [
+            _add_absent_legacy_source(
+                session,
+                context,
+                generation,
+                path=f"documents/removed-{index}.md",
+            )[0]
+            for index in range(3)
+        ]
+        repository.promote_generation(
+            _promotion_request(generation), now=NOW + timedelta(hours=1)
+        )
+        session.commit()
+        first = repository.reconcile_generation(
+            _reconciliation_request(generation),
+            now=NOW + timedelta(hours=2),
+            limit=2,
+        )
+        session.commit()
+        assert first.completed is False and first.memberships_retired == 2
+        _new_generation_same_scope(
+            session, context, created_at=NOW + timedelta(hours=3)
+        )
+        with pytest.raises(SyncWorkLedgerConflict, match="stale generation"):
+            repository.reconcile_generation(
+                _reconciliation_request(generation), now=NOW + timedelta(hours=4)
+            )
+        session.rollback()
+        assert sum(session.get(SourceItem, source_id).status == "deleted" for source_id in source_ids) == 2
+
+
+def test_reconciliation_over_500_candidates_commits_resumes_and_replays(
+    engine, monkeypatch
+) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation = _generation(session, "ReconcileLarge")
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        repository.mark_discovery_complete(
+            context[0], generation.generation_id, now=NOW
+        )
+        session.execute(
+            text("UPDATE connector_scopes SET external_scope_key=:key WHERE id=:scope"),
+            {"key": generation.repository_identity, "scope": context[2]},
+        )
+        session.execute(
+            text(
+                "UPDATE connector_sync_jobs SET status='succeeded',attempt_count=1,"
+                "fencing_token=1,next_attempt_at=NULL,completed_at=created_at WHERE id=:job"
+            ),
+            {"job": context[3]},
+        )
+        source_ids = [uuid4() for _ in range(501)]
+        session.execute(
+            SourceItem.__table__.insert(),
+            [
+                {
+                    "id": source_id,
+                    "organization_id": context[0],
+                    "connector_id": context[1],
+                    "source_item_key": (
+                        f"{generation.repository_identity}:path:removed-{index:04d}.md"
+                    ),
+                    "source_item_type": "file",
+                    "title": f"removed-{index:04d}.md",
+                    "first_seen_at": NOW,
+                    "last_seen_at": NOW,
+                    "status": "active",
+                    "metadata": {
+                        "provider": "github",
+                        "repository_identity": generation.repository_identity,
+                        "repository_path": f"removed-{index:04d}.md",
+                    },
+                    "metadata_schema_version": 1,
+                }
+                for index, source_id in enumerate(source_ids)
+            ],
+        )
+        session.execute(
+            SourceItemScopeMembership.__table__.insert(),
+            [
+                {
+                    "id": uuid4(),
+                    "organization_id": context[0],
+                    "connector_id": context[1],
+                    "source_item_id": source_id,
+                    "connector_scope_id": context[2],
+                    "status": "active",
+                    "first_discovered_at": NOW,
+                    "last_seen_at": NOW,
+                }
+                for source_id in source_ids
+            ],
+        )
+        repository.promote_generation(
+            _promotion_request(generation), now=NOW + timedelta(hours=1)
+        )
+        session.commit()
+        projection_validations = 0
+        original_validate = repository._validate_reconciliation_projection
+
+        def count_projection_validation(persisted_generation):
+            nonlocal projection_validations
+            projection_validations += 1
+            return original_validate(persisted_generation)
+
+        monkeypatch.setattr(
+            repository,
+            "_validate_reconciliation_projection",
+            count_projection_validation,
+        )
+
+        rolled_back = repository.reconcile_generation(
+            _reconciliation_request(generation),
+            now=NOW + timedelta(hours=2),
+            limit=500,
+        )
+        assert rolled_back.completed is False
+        assert rolled_back.memberships_retired == 500
+        session.rollback()
+        assert session.scalar(
+            select(func.count(SourceItemScopeMembership.id)).where(
+                SourceItemScopeMembership.connector_scope_id == context[2],
+                SourceItemScopeMembership.status == "active",
+            )
+        ) == 501
+        persisted = session.get(
+            ConnectorSyncGeneration, generation.generation_id
+        )
+        assert persisted.reconciled_membership_count == 0
+        assert persisted.reconciliation_started_at is None
+
+        first = repository.reconcile_generation(
+            _reconciliation_request(generation),
+            now=NOW + timedelta(hours=2),
+            limit=500,
+        )
+        session.commit()
+        assert first.completed is False
+        assert (
+            first.memberships_retired,
+            first.sources_retired,
+            first.documents_retired,
+        ) == (500, 500, 0)
+        second = repository.reconcile_generation(
+            _reconciliation_request(generation),
+            now=NOW + timedelta(hours=3),
+            limit=500,
+        )
+        session.commit()
+        assert second.completed is True
+        assert (
+            second.memberships_retired,
+            second.sources_retired,
+            second.documents_retired,
+        ) == (1, 1, 0)
+        assert (
+            second.total_memberships_retired,
+            second.total_sources_retired,
+            second.total_documents_retired,
+        ) == (501, 501, 0)
+        assert session.scalar(
+            select(func.count(DocumentVersion.id)).where(
+                DocumentVersion.source_item_id.in_(source_ids),
+                DocumentVersion.lifecycle == "deleted",
+                DocumentVersion.is_current.is_(True),
+            )
+        ) == 501
+        replay = repository.reconcile_generation(
+            _reconciliation_request(generation),
+            now=NOW + timedelta(hours=4),
+            limit=500,
+        )
+        session.commit()
+        assert replay.completed is replay.replayed is True
+        assert replay.memberships_retired == replay.sources_retired == 0
+        assert replay.total_memberships_retired == 501
+        # Rollback forces the initial proof to run again; committed progress
+        # avoids an O(generation-size) rescan on each continuation and replay.
+        assert projection_validations == 2
+
+
+def test_observed_unindexable_source_is_not_treated_as_deleted(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation = _generation(session, "ReconcileUnsupported")
+        path = "code/present.py"
+        source_id, version_id, document_id, chunk_id = _add_absent_legacy_source(
+            session, context, generation, path=path
+        )
+        user_id = _retrieval_user(session, context[0], context[2])
+        assert chunk_id in _retrieval_chunk_ids(session, context[0], user_id)
+        observation = GenerationSourceObservation(
+            f"{generation.repository_identity}:path:{path}",
+            path,
+            "f" * 40,
+            generation.commit_object_id,
+            generation.profile_fingerprint,
+            "regular_blob",
+            GenerationObservationDisposition.UNSUPPORTED_FORMAT,
+            10,
+        )
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        repository.register_discovery_batch(
+            context[0], generation.generation_id, (observation,), (), now=NOW
+        )
+        repository.mark_discovery_complete(context[0], generation.generation_id, now=NOW)
+        session.execute(
+            text("UPDATE connector_scopes SET external_scope_key=:key WHERE id=:scope"),
+            {"key": generation.repository_identity, "scope": context[2]},
+        )
+        session.execute(
+            text(
+                "UPDATE connector_sync_jobs SET status='succeeded',attempt_count=1,"
+                "fencing_token=1,next_attempt_at=NULL,completed_at=created_at WHERE id=:job"
+            ),
+            {"job": context[3]},
+        )
+        session.commit()
+        repository.promote_generation(
+            _promotion_request(generation), now=NOW + timedelta(hours=1)
+        )
+        session.commit()
+        assert chunk_id not in _retrieval_chunk_ids(session, context[0], user_id)
+        result = repository.reconcile_generation(
+            _reconciliation_request(generation), now=NOW + timedelta(hours=2)
+        )
+        session.commit()
+        assert result.completed is True and result.memberships_retired == 0
+        assert session.get(SourceItem, source_id).status == "active"
+        assert session.get(DocumentVersion, version_id).is_current is True
+        assert session.get(Document, document_id).deleted_at is None
+        assert chunk_id not in _retrieval_chunk_ids(session, context[0], user_id)
+
+
+def test_reconciliation_rejects_projection_drift_and_cross_tenant_request(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation, work, *_ = _ready_promotion(
+            session, "ReconcileFailClosed"
+        )
+        source_id, *_ = _add_absent_legacy_source(
+            session, context, generation, path="documents/unchanged-on-failure.md"
+        )
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        repository.promote_generation(
+            _promotion_request(generation), now=NOW + timedelta(hours=1)
+        )
+        session.commit()
+
+        with pytest.raises(SyncWorkLedgerConflict, match="time moved backward"):
+            repository.reconcile_generation(
+                _reconciliation_request(generation), now=NOW
+            )
+        session.rollback()
+        with pytest.raises(SyncWorkLedgerNotFound):
+            repository.reconcile_generation(
+                replace(_reconciliation_request(generation), organization_id=uuid4()),
+                now=NOW + timedelta(hours=2),
+            )
+        session.rollback()
+        session.execute(
+            text(
+                "UPDATE connector_sync_file_work_items SET status='failed', "
+                "last_error_category='internal', last_error_code='forced_drift' "
+                "WHERE id=:work"
+            ),
+            {"work": work.work_item_id},
+        )
+        session.flush()
+        with pytest.raises(SyncWorkLedgerConflict, match="not completely successful"):
+            repository.reconcile_generation(
+                _reconciliation_request(generation), now=NOW + timedelta(hours=2)
+            )
+        session.rollback()
+        observation_id = session.scalar(
+            select(ConnectorSyncGenerationObservation.id).where(
+                ConnectorSyncGenerationObservation.generation_id
+                == generation.generation_id
+            )
+        )
+        assert observation_id is not None
+        session.execute(
+            ConnectorSyncGenerationObservation.__table__.delete().where(
+                ConnectorSyncGenerationObservation.id == observation_id
+            )
+        )
+        with pytest.raises(SyncWorkLedgerConflict, match="observations are incomplete"):
+            repository.reconcile_generation(
+                _reconciliation_request(generation), now=NOW + timedelta(hours=2)
+            )
+        session.rollback()
+        chunk_id = session.scalar(
+            select(ConnectorSyncFileMaterializationChunk.id).where(
+                ConnectorSyncFileMaterializationChunk.generation_id
+                == generation.generation_id
+            )
+        )
+        assert chunk_id is not None
+        session.execute(
+            ConnectorSyncFileMaterializationChunk.__table__.delete().where(
+                ConnectorSyncFileMaterializationChunk.id == chunk_id
+            )
+        )
+        with pytest.raises(
+            SyncWorkLedgerConflict, match="materialization chunks are incomplete"
+        ):
+            repository.reconcile_generation(
+                _reconciliation_request(generation), now=NOW + timedelta(hours=2)
+            )
+        session.rollback()
+        membership_status = session.scalar(
+            select(SourceItemScopeMembership.status).where(
+                SourceItemScopeMembership.source_item_id == source_id,
+                SourceItemScopeMembership.connector_scope_id == context[2],
+            )
+        )
+        assert membership_status == "active"
+
+
+def test_concurrent_reconciliation_serializes_and_creates_one_tombstone(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation, *_ = _ready_promotion(
+            session, "ReconcileConcurrent"
+        )
+        source_id, *_ = _add_absent_legacy_source(
+            session, context, generation, path="documents/concurrent-delete.md"
+        )
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        repository.promote_generation(
+            _promotion_request(generation), now=NOW + timedelta(hours=1)
+        )
+        session.commit()
+
+    start = threading.Barrier(2)
+    results: list[object] = []
+    errors: list[BaseException] = []
+    guard = threading.Lock()
+
+    def reconcile() -> None:
+        with Session(engine, expire_on_commit=False) as session:
+            try:
+                start.wait(timeout=20)
+                result = ConnectorSyncWorkLedgerRepository(
+                    session
+                ).reconcile_generation(
+                    _reconciliation_request(generation),
+                    now=NOW + timedelta(hours=2),
+                )
+                session.commit()
+                with guard:
+                    results.append(result)
+            except BaseException as exc:  # pragma: no cover - asserted below
+                session.rollback()
+                with guard:
+                    errors.append(exc)
+
+    threads = [threading.Thread(target=reconcile) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len(results) == 2
+    assert sum(result.memberships_retired for result in results) == 1
+    assert sum(result.replayed for result in results) == 1
+
+    with Session(engine, expire_on_commit=False) as session:
+        versions = session.scalars(
+            select(DocumentVersion)
+            .where(DocumentVersion.source_item_id == source_id)
+            .order_by(DocumentVersion.version_number)
+        ).all()
+        assert [(row.version_number, row.lifecycle) for row in versions] == [
+            (1, "available"),
+            (2, "deleted"),
+        ]
+
+
+def test_newer_synchronization_fails_closed_before_lifecycle_changes(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation, *_ = _ready_promotion(session, "ReconcileNewerSync")
+        source_id, *_ = _add_absent_legacy_source(
+            session, context, generation, path="documents/newer-sync.md"
+        )
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        repository.promote_generation(
+            _promotion_request(generation), now=NOW + timedelta(hours=1)
+        )
+        session.commit()
+        newer_job = uuid4()
+        original_job_created_at = session.scalar(
+            text("SELECT created_at FROM connector_sync_jobs WHERE id=:job"),
+            {"job": context[3]},
+        )
+        assert original_job_created_at is not None
+        newer_job_created_at = original_job_created_at + timedelta(seconds=1)
+        session.execute(
+            text(
+                "INSERT INTO connector_sync_jobs "
+                "(id,organization_id,connector_id,connector_scope_id,mode,trigger_type,"
+                "status,attempt_count,fencing_token,next_attempt_at,completed_at,"
+                "created_at,updated_at) VALUES "
+                "(:id,:org,:connector,:scope,'incremental','manual','succeeded',1,1,"
+                "NULL,:created,:created,:created)"
+            ),
+            {
+                "id": newer_job,
+                "org": context[0],
+                "connector": context[1],
+                "scope": context[2],
+                "created": newer_job_created_at,
+            },
+        )
+        session.commit()
+        with pytest.raises(SyncWorkLedgerConflict, match="newer synchronization"):
+            repository.reconcile_generation(
+                _reconciliation_request(generation),
+                now=NOW + timedelta(hours=3),
+            )
+        session.rollback()
+        assert session.scalar(
+            select(SourceItemScopeMembership.status).where(
+                SourceItemScopeMembership.source_item_id == source_id,
+                SourceItemScopeMembership.connector_scope_id == context[2],
+            )
+        ) == "active"
+
+
+def test_concurrent_enqueue_serializes_before_reconciliation_decision(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation, *_ = _ready_promotion(
+            session, "ReconcileConcurrentEnqueue"
+        )
+        source_id, *_ = _add_absent_legacy_source(
+            session, context, generation, path="documents/concurrent-enqueue.md"
+        )
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        repository.promote_generation(
+            _promotion_request(generation), now=NOW + timedelta(hours=1)
+        )
+        session.commit()
+
+    enqueue_locked = threading.Event()
+    allow_enqueue_commit = threading.Event()
+    reconcile_started = threading.Event()
+    errors: list[BaseException] = []
+    reconciliation_errors: list[BaseException] = []
+
+    def enqueue() -> None:
+        with Session(engine, expire_on_commit=False) as session:
+            try:
+                result = ConnectorSyncJobRepository(session).enqueue_or_coalesce(
+                    context[0],
+                    context[1],
+                    context[2],
+                    mode="incremental",
+                    trigger_type="manual",
+                    now=NOW + timedelta(hours=2),
+                )
+                assert result.coalesced is False
+                enqueue_locked.set()
+                assert allow_enqueue_commit.wait(timeout=20)
+                session.commit()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                session.rollback()
+                errors.append(exc)
+
+    def reconcile() -> None:
+        with Session(engine, expire_on_commit=False) as session:
+            try:
+                reconcile_started.set()
+                ConnectorSyncWorkLedgerRepository(session).reconcile_generation(
+                    _reconciliation_request(generation),
+                    now=NOW + timedelta(hours=3),
+                )
+                session.commit()
+            except BaseException as exc:  # expected conflict after enqueue commits
+                session.rollback()
+                reconciliation_errors.append(exc)
+
+    enqueue_thread = threading.Thread(target=enqueue)
+    enqueue_thread.start()
+    assert enqueue_locked.wait(timeout=20)
+    reconcile_thread = threading.Thread(target=reconcile)
+    reconcile_thread.start()
+    assert reconcile_started.wait(timeout=20)
+    time.sleep(0.1)
+    assert reconcile_thread.is_alive()
+    allow_enqueue_commit.set()
+    enqueue_thread.join(20)
+    reconcile_thread.join(20)
+
+    assert not enqueue_thread.is_alive() and not reconcile_thread.is_alive()
+    assert errors == []
+    assert len(reconciliation_errors) == 1
+    assert isinstance(reconciliation_errors[0], SyncWorkLedgerConflict)
+    assert "active synchronization" in str(reconciliation_errors[0])
+    with Session(engine) as session:
+        assert session.scalar(
+            select(SourceItemScopeMembership.status).where(
+                SourceItemScopeMembership.source_item_id == source_id,
+                SourceItemScopeMembership.connector_scope_id == context[2],
+            )
+        ) == "active"
+        persisted = session.get(
+            ConnectorSyncGeneration, generation.generation_id
+        )
+        assert persisted.reconciliation_started_at is None
+        assert persisted.reconciled_membership_count == 0
+
+
+def test_concurrent_shared_membership_creation_precedes_last_membership_decision(
+    engine,
+) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation, *_ = _ready_promotion(
+            session, "ReconcileConcurrentMembership"
+        )
+        source_id, version_id, document_id, _ = _add_absent_legacy_source(
+            session, context, generation, path="documents/concurrent-shared.md"
+        )
+        other_space, other_scope = uuid4(), uuid4()
+        session.execute(
+            text(
+                "INSERT INTO knowledge_spaces (id,organization_id,name,slug) "
+                "VALUES (:id,:org,'Concurrent Shared',:slug)"
+            ),
+            {
+                "id": other_space,
+                "org": context[0],
+                "slug": f"concurrent-shared-{other_space}",
+            },
+        )
+        session.execute(
+            text(
+                "INSERT INTO connector_scopes "
+                "(id,organization_id,connector_id,knowledge_space_id,display_name,slug,"
+                "scope_type,external_scope_key,access_mode,status) VALUES "
+                "(:id,:org,:connector,:space,'Concurrent Shared',:slug,'repository',"
+                ":key,'platform_managed','active')"
+            ),
+            {
+                "id": other_scope,
+                "org": context[0],
+                "connector": context[1],
+                "space": other_space,
+                "slug": f"concurrent-shared-{other_scope}",
+                "key": f"github:repository:{other_scope.int}",
+            },
+        )
+        ConnectorSyncWorkLedgerRepository(session).promote_generation(
+            _promotion_request(generation), now=NOW + timedelta(hours=1)
+        )
+        session.commit()
+
+    source_locked = threading.Event()
+    allow_membership_commit = threading.Event()
+    reconciliation_started = threading.Event()
+    creator_errors: list[BaseException] = []
+    reconciliation_results: list[object] = []
+    reconciliation_errors: list[BaseException] = []
+
+    def create_membership() -> None:
+        with Session(engine, expire_on_commit=False) as session:
+            try:
+                assert ConnectorScopeRepository(session).lock_by_id(
+                    context[0], other_scope
+                ) is not None
+                sources = SourceItemRepository(session)
+                assert sources.lock_by_id(context[0], context[1], source_id) is not None
+                source_locked.set()
+                assert allow_membership_commit.wait(timeout=20)
+                sources.add_membership(
+                    context[0],
+                    context[1],
+                    SourceItemScopeMembership(
+                        id=uuid4(),
+                        organization_id=context[0],
+                        connector_id=context[1],
+                        source_item_id=source_id,
+                        connector_scope_id=other_scope,
+                        status="active",
+                        first_discovered_at=NOW + timedelta(hours=2),
+                        last_seen_at=NOW + timedelta(hours=2),
+                        removed_at=None,
+                    ),
+                )
+                session.commit()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                session.rollback()
+                creator_errors.append(exc)
+
+    def reconcile() -> None:
+        with Session(engine, expire_on_commit=False) as session:
+            try:
+                reconciliation_started.set()
+                result = ConnectorSyncWorkLedgerRepository(
+                    session
+                ).reconcile_generation(
+                    _reconciliation_request(generation),
+                    now=NOW + timedelta(hours=3),
+                )
+                session.commit()
+                reconciliation_results.append(result)
+            except BaseException as exc:  # pragma: no cover - asserted below
+                session.rollback()
+                reconciliation_errors.append(exc)
+
+    creator = threading.Thread(target=create_membership)
+    creator.start()
+    assert source_locked.wait(timeout=20)
+    reconciler = threading.Thread(target=reconcile)
+    reconciler.start()
+    assert reconciliation_started.wait(timeout=20)
+    time.sleep(0.1)
+    assert reconciler.is_alive()
+    allow_membership_commit.set()
+    creator.join(20)
+    reconciler.join(20)
+
+    assert not creator.is_alive() and not reconciler.is_alive()
+    assert creator_errors == reconciliation_errors == []
+    assert len(reconciliation_results) == 1
+    assert (
+        reconciliation_results[0].memberships_retired,
+        reconciliation_results[0].sources_retired,
+        reconciliation_results[0].documents_retired,
+    ) == (1, 0, 0)
+    with Session(engine) as session:
+        memberships = session.scalars(
+            select(SourceItemScopeMembership).where(
+                SourceItemScopeMembership.source_item_id == source_id
+            )
+        ).all()
+        assert {row.connector_scope_id: row.status for row in memberships} == {
+            context[2]: "removed",
+            other_scope: "active",
+        }
+        assert session.get(SourceItem, source_id).status == "active"
+        assert session.get(DocumentVersion, version_id).is_current is True
+        assert session.get(Document, document_id).deleted_at is None

@@ -20,9 +20,11 @@ from application.services.github_repository_content_service import (
     GitHubRepositorySnapshot,
 )
 from domain.connectors.sync_work_ledger import (
+    DiscoveryRegistrationResult,
     FileWorkManifestEntry,
+    GenerationObservationDisposition,
+    GenerationSourceObservation,
     MAX_MANIFEST_BATCH_SIZE,
-    ManifestRegistrationResult,
     RepositoryGenerationRegistration,
     RepositoryGenerationView,
 )
@@ -59,6 +61,8 @@ class GitHubManifestPlanningResult:
     eligible_count: int
     created_count: int
     existing_count: int
+    observed_count: int = 0
+    created_observation_count: int = 0
 
 
 class GitHubSyncWorkPlanningService:
@@ -138,6 +142,7 @@ class GitHubSyncWorkPlanningService:
             authorization,
             snapshot,
         )
+        observations = _observation_entries(snapshot, profile_fingerprint, entries)
         manifest = _manifest_entries(snapshot, profile_fingerprint, entries)
         generation, generation_created = self.ensure_generation(
             organization_id=organization_id,
@@ -149,7 +154,7 @@ class GitHubSyncWorkPlanningService:
             profile_fingerprint=profile_fingerprint,
             now=now,
         )
-        if not manifest:
+        if not observations:
             return GitHubManifestPlanningResult(
                 generation.generation_id,
                 generation_created,
@@ -157,19 +162,24 @@ class GitHubSyncWorkPlanningService:
                 0,
                 0,
             )
-        result = self._repository.register_manifest(
+        result = self._repository.register_discovery_batch(
             organization_id,
             generation.generation_id,
+            observations,
             manifest,
             now=now,
         )
-        _validate_registration_result(generation.generation_id, manifest, result)
+        _validate_registration_result(
+            generation.generation_id, observations, manifest, result
+        )
         return GitHubManifestPlanningResult(
             generation.generation_id,
             generation_created,
             len(manifest),
-            result.created_count,
-            result.existing_count,
+            result.created_work_count,
+            result.existing_work_count,
+            len(observations),
+            result.created_observation_count,
         )
 
     def mark_discovery_complete(
@@ -237,6 +247,47 @@ def _manifest_entries(
                 "GitHub planning source identity is duplicated"
             )
         keyed[source_item_key] = planned
+    return tuple(keyed.values())
+
+
+def _observation_entries(
+    snapshot: GitHubRepositorySnapshot,
+    profile_fingerprint: str,
+    entries: Sequence[GitHubRepositoryEntry],
+) -> tuple[GenerationSourceObservation, ...]:
+    keyed: dict[str, GenerationSourceObservation] = {}
+    for entry in entries:
+        _validate_entry(snapshot, entry)
+        extension = PurePosixPath(entry.path).suffix.casefold()
+        if entry.entry_type != "regular_blob":
+            disposition = GenerationObservationDisposition.UNSUPPORTED_OBJECT_TYPE
+        elif extension not in SUPPORTED_CONTENT_EXTENSIONS:
+            disposition = GenerationObservationDisposition.UNSUPPORTED_FORMAT
+        elif entry.size_bytes is not None and entry.size_bytes > MAX_GITHUB_BLOB_BYTES:
+            disposition = GenerationObservationDisposition.OVERSIZED
+        else:
+            disposition = GenerationObservationDisposition.ELIGIBLE
+        try:
+            observation = GenerationSourceObservation(
+                source_item_key=_source_identity(snapshot.repository_id, entry.path),
+                repository_path=entry.path,
+                provider_object_id=entry.object_id,
+                provider_revision_id=snapshot.commit_object_id,
+                profile_fingerprint=profile_fingerprint,
+                entry_type=entry.entry_type,
+                disposition=disposition,
+                file_size_bytes=entry.size_bytes,
+            )
+        except ValueError as exc:
+            raise InvalidGitHubSyncWorkPlanningRequest(
+                "GitHub planning observation is invalid"
+            ) from exc
+        previous = keyed.get(observation.source_item_key)
+        if previous is not None and previous != observation:
+            raise InvalidGitHubSyncWorkPlanningRequest(
+                "GitHub planning source identity is duplicated"
+            )
+        keyed[observation.source_item_key] = observation
     return tuple(keyed.values())
 
 
@@ -346,13 +397,17 @@ def _valid_object_id(value: object) -> bool:
 
 def _validate_registration_result(
     generation_id: UUID,
+    observations: tuple[GenerationSourceObservation, ...],
     manifest: tuple[FileWorkManifestEntry, ...],
-    result: ManifestRegistrationResult,
+    result: DiscoveryRegistrationResult,
 ) -> None:
     if (
-        not isinstance(result, ManifestRegistrationResult)
+        not isinstance(result, DiscoveryRegistrationResult)
         or result.generation_id != generation_id
-        or result.created_count + result.existing_count != len(manifest)
+        or result.created_observation_count + result.existing_observation_count
+        != len(observations)
+        or result.created_work_count + result.existing_work_count != len(manifest)
+        or len(result.observation_ids) != len(observations)
         or len(result.work_item_ids) != len(manifest)
     ):
         raise InvalidGitHubSyncWorkPlanningRequest(

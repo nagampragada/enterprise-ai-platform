@@ -682,7 +682,12 @@ class GitHubSynchronizationPreparationService:
                 )
                 continue
             if len(_source_identity(entry.repository_id, entry.path)) > MAX_SOURCE_IDENTITY_CHARACTERS:
-                continue
+                # Advancing the traversal cursor without representing this path
+                # would make a completed ledger manifest incomplete and could
+                # incorrectly turn that omission into deletion authority.
+                raise GitHubSynchronizationBudgetExceeded(
+                    "GitHub source identity budget was exceeded"
+                )
             extension = PurePosixPath(entry.path).suffix.casefold()
             skip_reason = None
             if entry.entry_type != "regular_blob":
@@ -1118,6 +1123,12 @@ class GitHubStagedSynchronizationService:
         _require_persistence_time(snapshot, now)
         self._require_context(snapshot)
         _validate_authorization_cursor(snapshot.authorization, prepared.cursor_after)
+        if self._scopes.lock_by_id(
+            lease.organization_id, lease.connector_scope_id
+        ) is None:
+            raise StalePreparedGitHubBatch(
+                "GitHub synchronization scope is unavailable"
+            )
         current_row = self._sync.get_active_cursor(
             lease.organization_id, lease.connector_id, lease.connector_scope_id, lock=True
         )
@@ -1181,6 +1192,12 @@ class GitHubStagedSynchronizationService:
         self._execution.validate_attempt(lease, snapshot.sync_run_id, worker_id=worker_id)
         self._require_context(snapshot)
         _require_persistence_time(snapshot, now)
+        if self._scopes.lock_by_id(
+            lease.organization_id, lease.connector_scope_id
+        ) is None:
+            raise StalePreparedGitHubBatch(
+                "GitHub reconciliation scope is unavailable"
+            )
         if (
             isinstance(limit, bool)
             or not isinstance(limit, int)

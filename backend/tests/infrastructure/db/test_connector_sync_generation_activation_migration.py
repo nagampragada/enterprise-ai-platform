@@ -18,7 +18,7 @@ from infrastructure.db.base import Base
 ROOT = Path(__file__).resolve().parents[3]
 PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
 INI = ROOT / "alembic.ini"
-REVISION = "20260904_000023"
+REVISION = "20260905_000024"
 PRIOR_REVISION = "20260902_000022"
 TABLE = "connector_sync_generation_activations"
 
@@ -123,9 +123,9 @@ def test_activation_revision_downgrade_upgrade_preserves_predecessor(engine, mon
         monkeypatch.setattr(db_health, "engine", downgraded)
         health = db_health.check_database_connection()
         assert health.healthy is True
-        assert health.schema_compatible is True
+        assert health.schema_compatible is False
         assert health.schema_current is False
-        assert health.migration_required is True
+        assert health.migration_required is False
     finally:
         downgraded.dispose()
     command.upgrade(_config(url), REVISION)

@@ -1270,6 +1270,40 @@ class ConnectorSyncGeneration(Base):
         CheckConstraint(
             "terminal_at IS NULL OR terminal_at >= created_at", name="terminal_after_created"
         ),
+        CheckConstraint(
+            "manifest_schema_version IN (1, 2)", name="manifest_schema_version_valid"
+        ),
+        CheckConstraint(
+            "NOT reconciliation_eligible OR "
+            "(manifest_schema_version = 2 AND status = 'completed')",
+            name="reconciliation_authority_valid",
+        ),
+        CheckConstraint(
+            "(NOT reconciliation_eligible AND reconciliation_started_at IS NULL "
+            "AND reconciliation_completed_at IS NULL "
+            "AND reconciled_membership_count = 0 AND reconciled_source_count = 0 "
+            "AND reconciled_document_count = 0) OR reconciliation_eligible",
+            name="reconciliation_progress_requires_authority",
+        ),
+        CheckConstraint(
+            "reconciliation_started_at IS NULL OR "
+            "(reconciliation_eligible_at IS NOT NULL "
+            "AND reconciliation_started_at >= reconciliation_eligible_at)",
+            name="reconciliation_start_order_valid",
+        ),
+        CheckConstraint(
+            "reconciliation_completed_at IS NULL OR "
+            "(reconciliation_started_at IS NOT NULL "
+            "AND reconciliation_completed_at >= reconciliation_started_at)",
+            name="reconciliation_completion_order_valid",
+        ),
+        CheckConstraint(
+            "reconciled_membership_count >= 0 AND reconciled_source_count >= 0 "
+            "AND reconciled_document_count >= 0 "
+            "AND reconciled_source_count <= reconciled_membership_count "
+            "AND reconciled_document_count <= reconciled_source_count",
+            name="reconciliation_counters_valid",
+        ),
         Index(
             "ix_sync_generations_org_scope_created",
             "organization_id", "connector_scope_id", "created_at", "id",
@@ -1310,6 +1344,120 @@ class ConnectorSyncGeneration(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     terminal_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    manifest_schema_version: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, server_default=text("1")
+    )
+    reconciliation_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    reconciliation_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    reconciled_membership_count: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("0")
+    )
+    reconciled_source_count: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("0")
+    )
+    reconciled_document_count: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("0")
+    )
+
+
+class ConnectorSyncGenerationObservation(Base):
+    """Immutable proof that one source path was present in a pinned traversal."""
+
+    __tablename__ = "connector_sync_generation_observations"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_connector_sync_generation_observations"),
+        ForeignKeyConstraint(
+            [
+                "organization_id",
+                "connector_id",
+                "connector_scope_id",
+                "generation_id",
+                "profile_fingerprint",
+            ],
+            [
+                "connector_sync_generations.organization_id",
+                "connector_sync_generations.connector_id",
+                "connector_sync_generations.connector_scope_id",
+                "connector_sync_generations.id",
+                "connector_sync_generations.profile_fingerprint",
+            ],
+            name="fk_sync_generation_observations_generation_tenant",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "organization_id",
+            "generation_id",
+            "id",
+            name="uq_sync_generation_observations_generation_id",
+        ),
+        UniqueConstraint(
+            "organization_id",
+            "generation_id",
+            "source_key_hash",
+            name="uq_sync_generation_observations_source",
+        ),
+        CheckConstraint("btrim(source_item_key) <> ''", name="source_item_key_not_blank"),
+        CheckConstraint("source_key_hash ~ '^[0-9a-f]{64}$'", name="source_key_hash_valid"),
+        CheckConstraint("btrim(repository_path) <> ''", name="repository_path_not_blank"),
+        CheckConstraint("btrim(provider_object_id) <> ''", name="provider_object_id_not_blank"),
+        CheckConstraint("btrim(provider_revision_id) <> ''", name="provider_revision_not_blank"),
+        CheckConstraint(
+            "profile_fingerprint ~ '^[a-z0-9][a-z0-9._:/-]*$'",
+            name="profile_fingerprint_valid",
+        ),
+        CheckConstraint(
+            "entry_type IN ('regular_blob', 'symlink', 'submodule')",
+            name="entry_type_valid",
+        ),
+        CheckConstraint(
+            "disposition IN ('eligible', 'unsupported_format', 'oversized', "
+            "'unsupported_object_type')",
+            name="disposition_valid",
+        ),
+        CheckConstraint(
+            "file_size_bytes IS NULL OR file_size_bytes BETWEEN 0 AND 1073741824",
+            name="file_size_bounded",
+        ),
+        CheckConstraint(
+            "(entry_type = 'submodule' AND file_size_bytes IS NULL) OR "
+            "(entry_type <> 'submodule' AND file_size_bytes IS NOT NULL)",
+            name="size_matches_entry_type",
+        ),
+        CheckConstraint(
+            "(disposition = 'eligible' AND entry_type = 'regular_blob') OR "
+            "disposition <> 'eligible'",
+            name="eligible_regular_blob",
+        ),
+        Index(
+            "ix_sync_generation_observations_scope_path",
+            "organization_id",
+            "connector_scope_id",
+            "generation_id",
+            "repository_path",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_scope_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    generation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    source_item_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    source_key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    repository_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    provider_object_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    provider_revision_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    profile_fingerprint: Mapped[str] = mapped_column(String(255), nullable=False)
+    entry_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    disposition: Mapped[str] = mapped_column(String(32), nullable=False)
+    file_size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class ConnectorSyncOrganizationClaimSchedule(Base):

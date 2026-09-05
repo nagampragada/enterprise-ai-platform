@@ -285,6 +285,28 @@ def test_entry_and_tree_request_limits_return_resumable_progress_without_looping
     assert content.list_tree.call_count == 1
 
 
+def test_unrepresentable_source_identity_fails_before_cursor_can_advance():
+    authorization = _authorization()
+    snapshot = _snapshot(authorization)
+    content = Mock()
+    path = "/".join(("a" * 250, "b" * 250, "c" * 250, "d" * 250, "file.txt"))
+    assert len(path.encode("utf-8")) <= 1024
+    assert len(f"github:repository:{snapshot.repository_id}:path:{path}") > 1024
+    content.list_tree.return_value = GitHubTreePage(
+        snapshot.root_tree(), (_entry(snapshot, path),)
+    )
+    service, *_ = _preparation(content)
+    cursor = _cursor(authorization, snapshot)
+
+    with pytest.raises(
+        GitHubSynchronizationBudgetExceeded, match="source identity"
+    ):
+        service.discover_batch(authorization, cursor)
+
+    assert cursor.frames[0].next_entry_index == 0
+    assert cursor.totals.entries_examined == 0
+
+
 def test_depth_and_total_run_budgets_fail_safely_and_finitely():
     authorization = _authorization()
     snapshot = _snapshot(authorization)
@@ -776,7 +798,13 @@ def test_persistence_rejects_missing_or_stale_cursor_before_writes():
     sync_snapshot = GitHubSynchronizationSnapshot(authorization, uuid4(), now, cursor, profile)
     prepared = PreparedGitHubBatch((), replace(cursor, scan_complete=True, frames=()), 0, 0)
     with pytest.raises(StalePreparedGitHubBatch, match="cursor is unavailable"):
-        service.persist_batch(Mock(), sync_snapshot, prepared, worker_id="worker", now=now)
+        service.persist_batch(
+            _lease(authorization),
+            sync_snapshot,
+            prepared,
+            worker_id="worker",
+            now=now,
+        )
 
 
 def test_reconciliation_accepts_exact_maximum_batch_and_rejects_larger_limit():

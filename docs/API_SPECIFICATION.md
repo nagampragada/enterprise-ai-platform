@@ -47,10 +47,11 @@ The operations never expose organization ID, requester identity, priority, worke
 
 `GET /health` is public process liveness and returns the fixed payload `{"status":"healthy"}` while the process can serve requests. It performs no database, GitHub, OpenAI, Secret Manager, or other provider operation.
 
-`GET /api/v1/health` is public strict readiness. Success is HTTP 200 only when runtime configuration, bounded database connectivity, an explicitly compatible Alembic revision, and strict-runtime GitHub/Secret Manager composition are ready. During the Slice 4 expand-migration transition, the exact compatible revisions are `20260902_000022` and `20260904_000023`; no other older, newer, malformed, missing, or branched revision is accepted. The fixed response distinguishes Boolean `schema_compatible`, `schema_current`, and `migration_required` values while retaining the `schema` ready/not-ready check. Revision `20260902_000022` is compatible but not current and requires migration; `20260904_000023` is compatible and current. Any failed check returns HTTP 503. The contract never returns an exception, database URL, SQL, project identifier, secret reference, credential, or provider detail, and never retrieves secret values or contacts GitHub/OpenAI.
+`GET /api/v1/health` is public strict readiness. Success is HTTP 200 only when runtime configuration, bounded database connectivity, an explicitly compatible Alembic revision, and strict-runtime GitHub/Secret Manager composition are ready. During the Slice 5 expand-migration transition, the exact compatible revisions are `20260904_000023` and `20260905_000024`; no other older, newer, malformed, missing, or branched revision is accepted. The fixed response distinguishes Boolean `schema_compatible`, `schema_current`, and `migration_required` values while retaining the `schema` ready/not-ready check. Revision `20260904_000023` is compatible but not current and requires migration; `20260905_000024` is compatible and current. Any failed check returns HTTP 503. The contract never returns an exception, database URL, SQL, project identifier, secret reference, credential, or provider detail, and never retrieves secret values or contacts GitHub/OpenAI.
 
-Slice 4 adds no public promotion, query, search, chat, or administration route.
-Generation promotion is an internal default-off application contract. A future
+Slices 4 and 5 add no public promotion, reconciliation, query, search, chat, or
+administration route. Generation promotion and deletion reconciliation are
+independent internal default-off application contracts. A future
 API/UI must add authenticated administration, transaction ownership, conflict
 mapping, and audit policy without accepting tenant/repository attribution from
 an untrusted client.

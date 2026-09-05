@@ -29,6 +29,26 @@ retirement, and generation completion in one transaction. Its structured
 event is explicitly `promotion_prepared`; it does not claim durability before
 the caller commits.
 
+`GITHUB_SYNC_LEDGER_RECONCILIATION_ENABLED` is the independent Slice 5 gate.
+It defaults to `false`, accepts only exact lowercase `true` or `false`, and is
+not consumed by any API, scheduler, or worker host. An explicitly authorized
+caller may compose `GitHubSyncGenerationReconciliationService` only after a
+manifest-schema-v2 generation is promoted. Each caller-owned transaction
+selects at most 500 absent memberships and records their lifecycle mutations
+and monotonic progress atomically; projection eligibility is revalidated with
+bounded application memory before the first committed batch. Resumed batches
+recheck authority and synchronization freshness without rescanning the frozen
+generation. Present
+unsupported, oversized, symlink, and submodule observations remain deletion
+evidence even though they create no processing work. Shared active membership
+preserves the source and document; otherwise reconciliation writes a current
+deleted tombstone and soft-retires source/document state while retaining
+immutable history. No provider call, physical purge, cleanup, or automatic
+orchestration is included. Job enqueue and GitHub persistence use the same
+scope-first lock order, so a synchronization cannot start across a retirement
+decision. The migration downgrade removes reconciliation metadata but does not
+reverse already committed lifecycle retirement.
+
 Phase 3 Slice 2 adds a dedicated ledger-only host at
 `python -m infrastructure.workers.github_sync_ledger_worker_host`. It is
 independent of the legacy synchronization queue: it never claims a legacy job,
@@ -109,6 +129,6 @@ python -m infrastructure.bootstrap.sandbox
 
 The API launcher runs one Uvicorn process on `0.0.0.0` with a validated `PORT`; reload and debug behavior are absent. `APP_ENVIRONMENT` accepts only `development`, `test`, `sandbox`, and `production`. Its deliberate missing-value default is `development`, never production. Sandbox and production require a non-development PostgreSQL URL plus distinct strong JWT and refresh-token secrets. Validation is process-specific so provider credentials are not required by operations that do not consume them.
 
-`GET /health` is dependency-free liveness. `GET /api/v1/health` is readiness: it returns 200 only when configuration is valid, bounded database checks succeed, the schema is in the exact transition allowlist, and required GitHub/Secret Manager composition is available in a strict runtime. The Slice 4 application explicitly accepts only `20260902_000022` and `20260904_000023`; it reports compatibility, currentness, and migration requirement separately. Revision `20260902_000022` remains ready but is not represented as current. Unknown, missing, malformed, newer, older, or multiple heads fail closed. The endpoint uses only fixed values and never retrieves provider secrets.
+`GET /health` is dependency-free liveness. `GET /api/v1/health` is readiness: it returns 200 only when configuration is valid, bounded database checks succeed, the schema is in the exact transition allowlist, and required GitHub/Secret Manager composition is available in a strict runtime. The Slice 5 application explicitly accepts only `20260904_000023` and `20260905_000024`; it reports compatibility, currentness, and migration requirement separately. Revision `20260904_000023` remains ready but is not represented as current. Unknown, missing, malformed, newer, older, or multiple heads fail closed. The endpoint uses only fixed values and never retrieves provider secrets.
 
 The image and runbook are implemented and statically tested, but no image or cloud resource has been built or deployed. See `GCP_GITHUB_SANDBOX_RUNBOOK.md`.

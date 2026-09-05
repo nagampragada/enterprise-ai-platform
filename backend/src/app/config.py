@@ -138,6 +138,7 @@ class WorkerProcessSettings:
     github_sync_ledger_planning_enabled: bool = False
     github_sync_ledger_processing_enabled: bool = False
     github_sync_ledger_promotion_enabled: bool = False
+    github_sync_ledger_reconciliation_enabled: bool = False
 
 
 def load_runtime_environment(environ: Mapping[str, str] | None = None) -> str:
@@ -353,6 +354,11 @@ def validate_worker_process_environment(
         "GITHUB_SYNC_LEDGER_PROMOTION_ENABLED",
         default=False,
     )
+    ledger_reconciliation_enabled = _optional_strict_boolean(
+        values,
+        "GITHUB_SYNC_LEDGER_RECONCILIATION_ENABLED",
+        default=False,
+    )
     return WorkerProcessSettings(
         database,
         github,
@@ -360,6 +366,7 @@ def validate_worker_process_environment(
         ledger_planning_enabled,
         ledger_processing_enabled,
         ledger_promotion_enabled,
+        ledger_reconciliation_enabled,
     )
 
 

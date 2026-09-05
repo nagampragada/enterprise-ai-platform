@@ -124,9 +124,33 @@ scope and ranks only the single active generation. Failure rolls back to the
 previous authority and replay is idempotent. Telemetry is limited to UUIDs,
 counts, and fixed outcomes.
 
-Slice 5 retains deletion reconciliation and durable legacy lifecycle changes.
-Slice 6 retains staging cleanup/retention, automatic orchestration, and rollout
-hardening.
+Phase 3 Slice 5 adds a complete pinned-generation observation manifest and a
+separate internal reconciliation contract. New manifest-schema-v2 generations
+record every non-tree path, including unsupported formats, oversized files,
+symlinks, and submodules, so “not indexable” can never be confused with
+“deleted.” An unrepresentable canonical identity fails before cursor
+advancement, and only durable exhaustion of every pinned tree frame can mark an
+empty or nonempty manifest complete. Promotion validates the observation/work projection and grants
+reconciliation authority only to the fully successful active generation.
+Reconciliation rejects active/newer synchronization, stale generations,
+incomplete work or staging, mismatched attribution, and version-1 manifests.
+It selects at most 500 absent memberships per caller-owned transaction (each
+candidate can require several related lifecycle writes), uses bounded
+database-side projection validation before the first committed batch, and
+commits progress with those writes. Later batches recheck authority and
+synchronization freshness without repeatedly scanning immutable staging.
+Scope-first locking shared with job enqueue and legacy synchronization closes
+the between-batch start race. Shared
+active membership preserves the source and document; otherwise it writes a
+deleted tombstone and soft retirement while retaining immutable history and
+citations. Replay and concurrent calls are idempotent/serialized, and rollback
+preserves prior lifecycle state. `GITHUB_SYNC_LEDGER_RECONCILIATION_ENABLED`
+is strict, default-off, and has no API, scheduler, or worker caller.
+Downgrade drops Slice 5 manifest/progress metadata but cannot undo lifecycle
+retirement already committed by reconciliation.
+
+Slice 6 retains physical cleanup/retention, automatic reconciliation and
+promotion orchestration, operational rollback controls, and rollout hardening.
 
 Turn serialization is not an active-processing concurrency limit. Once a claim
 commits, another transaction may claim another item for the same organization
