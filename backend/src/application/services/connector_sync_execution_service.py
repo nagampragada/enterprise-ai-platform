@@ -125,6 +125,24 @@ class ConnectorSyncExecutionService:
         )
         return AcquiredSyncAttempt(lease, run.id)
 
+    def acquire_one_github(
+        self,
+        *,
+        worker_id: str,
+        lease_duration: timedelta,
+    ) -> AcquiredSyncAttempt | None:
+        """Acquire one GitHub attempt for the dedicated planner host."""
+        now = self._now()
+        lease = self._repository.acquire_next_github(
+            worker_id=worker_id,
+            lease_duration=lease_duration,
+            now=now,
+        )
+        if lease is None:
+            return None
+        run = self._repository.create_attempt_run(lease, worker_id=worker_id, now=now)
+        return AcquiredSyncAttempt(lease, run.id)
+
     def acquire_one_routed(
         self,
         *,
@@ -259,6 +277,14 @@ class ConnectorSyncExecutionService:
         """Recover expired Local Folder attempts across tenants for the internal host."""
         now = self._now()
         expired = self._repository.lock_expired_local_folder(now=now, limit=limit)
+        return self._recover_expired(expired, now)
+
+    def recover_expired_github(
+        self, *, limit: int
+    ) -> tuple[SyncJobHistoryItem, ...]:
+        """Recover only expired GitHub attempts for the dedicated planner."""
+        now = self._now()
+        expired = self._repository.lock_expired_github(now=now, limit=limit)
         return self._recover_expired(expired, now)
 
     def recover_expired_routed(

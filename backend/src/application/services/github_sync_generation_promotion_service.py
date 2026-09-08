@@ -6,6 +6,7 @@ from datetime import datetime
 import logging
 
 from domain.connectors.sync_work_ledger import (
+    GenerationCitationProjectionProfile,
     GenerationPromotionRequest,
     GenerationPromotionResult,
 )
@@ -61,6 +62,35 @@ class GitHubSyncGenerationPromotionService:
             request.generation_id,
             str(result.promoted).lower(),
             result.retired_generation_id,
+            result.materialization_count,
+            result.chunk_count,
+        )
+        return result
+
+    def project_and_promote(
+        self,
+        request: GenerationPromotionRequest,
+        profile: GenerationCitationProjectionProfile,
+        *,
+        now: datetime,
+    ) -> GenerationPromotionResult:
+        """Project provider-free citations and prepare one atomic cutover."""
+        if not self._enabled:
+            raise GitHubSyncGenerationPromotionDisabled(
+                "GitHub generation promotion is disabled"
+            )
+        result = self._repository.project_citations_and_promote_generation(
+            request, profile, now=now
+        )
+        self._logger.info(
+            "event=github_ledger_generation_projection_promotion_prepared "
+            "organization_id=%s connector_id=%s connector_scope_id=%s "
+            "generation_id=%s promoted=%s materializations=%d chunks=%d",
+            request.organization_id,
+            request.connector_id,
+            request.connector_scope_id,
+            request.generation_id,
+            str(result.promoted).lower(),
             result.materialization_count,
             result.chunk_count,
         )

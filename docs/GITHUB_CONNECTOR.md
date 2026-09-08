@@ -37,11 +37,15 @@ Selection first validates the tenant connector, active credential, connected org
 A new short write transaction re-locks the connector, credential, installation binding, and knowledge space, then compares all copied security-boundary identities before persistence. The canonical immutable identity is `github:repository:{repository_id}`. The existing unique `(organization_id, connector_id, external_scope_key)` constraint prevents duplicate or different-space selections, so no migration was required. Connector locking serializes create/reactivate/deselect races. Exact duplicates return one scope; a removed same-space scope is reactivated; a different-space assignment conflicts and is never moved implicitly.
 
 Migration `20260828_000020` provides an isolated repository-generation and
-independently leased file-work ledger for a future horizontally scaled GitHub
-execution path. The current worker can shadow its existing pinned discovery into
-that ledger only when `GITHUB_SYNC_LEDGER_PLANNING_ENABLED=true`; the variable is
-optional, defaults to false, and startup accepts only exact lowercase `true` or
-`false`. Existing repository-wide synchronization remains authoritative. A
+independently leased file-work ledger for a horizontally scaled GitHub
+execution path. The dedicated planner entry point is
+`python -m infrastructure.workers.github_sync_ledger_planner_host --once`.
+It claims only GitHub synchronization jobs and reuses the existing authorization,
+pinned snapshot, iterative tree traversal, observation, and cursor contracts.
+`GITHUB_SYNC_LEDGER_PLANNING_ENABLED` is optional, defaults to false, and startup
+accepts only exact lowercase `true` or `false`. The planner persists no legacy
+source/document/indexing rows and never enters legacy reconciliation; it needs
+GitHub but not OpenAI configuration. A
 separate worker-only `GITHUB_SYNC_LEDGER_PROCESSING_ENABLED` gate, also strict
 and default-false, enables the first bounded processing slice. Only after the
 legacy job queue is empty does it claim one completed-discovery GitHub item,
@@ -63,6 +67,26 @@ legacy-first connector host, this process can claim only eligible GitHub ledger
 file work. It neither reads nor claims the legacy job queue and cannot plan,
 promote, reconcile, clean up, or switch retrieval. The default-off gate is
 checked before composition and every claim.
+
+The planner has an execution budget distinct from traversal limits: by default
+it stops after 5,000 committed manifest batches or 20 minutes. Strict settings
+`GITHUB_LEDGER_PLANNER_MAX_BATCHES` (maximum 100,000) and
+`GITHUB_LEDGER_PLANNER_MAX_SECONDS` (maximum 3,600) may tune those bounds. A
+budget stop is reported as resumable and never marks discovery or the job
+complete; the durable cursor is continued only after normal fenced lease
+expiry/recovery. Each batch still obeys the 500-row ledger cap and each provider
+continuation still obeys the tree/request limits below.
+
+Exclusive ownership is enforced in process routing when the planning flag is
+consistent across worker templates: `true` makes the legacy connector host
+recover and claim Local Folder jobs only, while the dedicated planner recovers
+and claims GitHub jobs only. Cloud Run environments are independent, so rollout
+must set exact lowercase `true` on both templates before executing either, or
+keep the legacy worker idle. A legacy template left at `false` retains its old
+GitHub claim surface and must not run concurrently with the planner. Claim
+leases, attempts, fences, heartbeats, cancellation, and durable retry semantics
+remain the same. Planner composition validates no OpenAI setting and constructs
+no OpenAI client.
 
 One execution drains at most 25 items for at most 20 minutes by default. It
 requires 12 minutes of safe runway before another claim, uses a 15-minute
@@ -115,10 +139,18 @@ vectors, provider payloads, URLs, credentials, or tokens.
 
 Phase 3 Slice 4 adds an internal atomic promotion contract. It remains
 default-off and is not invoked by an API, scheduler, legacy worker, or dedicated
-processing host. Promotion locks the exact active repository scope and rejects
+processing/planning host. Promotion locks the exact active repository scope and rejects
 incomplete, unsuccessful, stale, mismatched, or cross-tenant state. One
-transaction retires the previous activation and activates the complete staged
-generation. Permission-aware retrieval preserves organization, knowledge-space,
+caller-owned transaction derives provider-free citation state from validated
+staged materialization, then retires the previous activation and activates the
+complete staged generation. The projection reuses identical available versions
+and indexing states and creates changed/new/restored history only when needed.
+It never copies staged vectors into or replaces legacy chunks; activated retrieval
+uses staging directly, while an active shared scope retains its committed legacy
+current link and chunk authority.
+A savepoint prevents partial citation writes even if a caller catches a rejected
+operation and commits its surrounding transaction. Permission-aware retrieval
+preserves organization, knowledge-space,
 scope, membership, and ACL checks; it excludes legacy chunks for an activated
 scope and ranks only the single active generation. Failure rolls back to the
 previous authority and replay is idempotent. Telemetry is limited to UUIDs,
@@ -205,16 +237,18 @@ Per continuation, the configurable defaults and hard maxima are 25 tree requests
 
 An incomplete, failed, cancelled, budget-exhausted, malformed, stale-lease, or provider-failed traversal never reaches deletion authority. Empty batches and continuation limits are not authority. GitHub worker-host claiming/routing and heartbeat choreography, webhooks, ACLs, arbitrary refs, Git LFS object fetching, clone/archive access, and public synchronization/content APIs remain separate work.
 
-With ledger planning enabled, snapshot pinning creates or idempotently resolves
-one tenant/job/scope/repository/branch/commit/tree/profile-bound generation.
-Every observed legacy discovery batch registers only supported regular files in
-a separate caller-owned transaction before content preparation. The ledger API
-caps manifest calls at 500 entries; the current worker's stricter ten-file
-continuation bound means production calls are smaller. Replaying a durable cursor
-re-registers the same identities without duplication. Heartbeat cancellation is
-checked before and after registration, and a later failure leaves the committed
-generation resumable but incomplete. Discovery completion is written only with
-the legacy cursor's durable transition into reconciliation.
+With ledger planning enabled, the dedicated planner's snapshot pin creates or
+idempotently resolves one tenant/job/scope/repository/branch/commit/tree/profile-
+bound generation. Every non-tree discovery page registers its complete
+observation projection and eligible work before advancing the durable cursor in
+the same caller-owned transaction. The ledger API caps a manifest batch at 500;
+GitHub tree responses remain capped at 1,000 entries and the established run
+limits remain hard. Replay re-registers identical identities without duplication.
+Cancellation is checked across provider and transaction boundaries. Only actual
+tree exhaustion marks discovery complete and completes the source job; a partial
+or interrupted run stays resumable and non-authoritative. The planner never
+calls legacy persistence, content preparation, embedding, promotion, or either
+reconciliation implementation.
 
 This shadow slice is bounded, but it is not yet a true million-file discovery
 implementation. GitHub Git Trees has no pagination in this usage: each

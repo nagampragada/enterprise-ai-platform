@@ -141,6 +141,16 @@ class WorkerProcessSettings:
     github_sync_ledger_reconciliation_enabled: bool = False
 
 
+@dataclass(frozen=True, repr=False)
+class GitHubPlannerProcessSettings:
+    """Provider configuration for ledger discovery without OpenAI credentials."""
+
+    database: DatabaseSettings
+    github: GitHubWorkerSettings
+    secret_manager: GoogleSecretManagerSettings
+    github_sync_ledger_planning_enabled: bool = False
+
+
 def load_runtime_environment(environ: Mapping[str, str] | None = None) -> str:
     values = os.environ if environ is None else environ
     value = values.get(APP_ENVIRONMENT_VARIABLE, "development")
@@ -367,6 +377,32 @@ def validate_worker_process_environment(
         ledger_processing_enabled,
         ledger_promotion_enabled,
         ledger_reconciliation_enabled,
+    )
+
+
+def validate_github_planner_process_environment(
+    environ: Mapping[str, str] | None = None,
+) -> GitHubPlannerProcessSettings:
+    """Validate the dedicated planner without reading or requiring OpenAI."""
+    values = os.environ if environ is None else environ
+    database = load_database_settings(values)
+    github = load_github_worker_settings_from_environment(values)
+    secret_manager = load_google_secret_manager_settings_from_environment(values)
+    if (
+        database.runtime_environment in STRICT_RUNTIME_ENVIRONMENTS
+        and secret_manager.environment != database.runtime_environment
+    ):
+        raise InvalidRuntimeConfiguration("Runtime configuration is invalid")
+    _validate_google_reference(github.private_key_reference, secret_manager)
+    return GitHubPlannerProcessSettings(
+        database,
+        github,
+        secret_manager,
+        _optional_strict_boolean(
+            values,
+            "GITHUB_SYNC_LEDGER_PLANNING_ENABLED",
+            default=False,
+        ),
     )
 
 

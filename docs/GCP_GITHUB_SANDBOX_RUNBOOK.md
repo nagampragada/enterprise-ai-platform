@@ -146,12 +146,33 @@ promote, reconcile, or activate retrieval. Slice 3 organization fairness is an
 intrinsic claim property with no additional environment flag; deploy it only
 after migration `20260902_000022` and a separate controlled authorization.
 
+The dedicated planner-only entry point is
+`python -m infrastructure.workers.github_sync_ledger_planner_host --once`.
+It uses the existing strict `GITHUB_SYNC_LEDGER_PLANNING_ENABLED` gate and
+requires the database plus GitHub App/private-key configuration, but it must not
+receive `OPENAI_API_KEY` or the GitHub OAuth client secret. It creates no legacy
+source/document/indexing state and completes a synchronization job only after
+the pinned manifest-schema-v2 traversal is exhausted. A stopped or partial run
+retains its durable cursor and incomplete generation for fenced lease recovery.
+One execution defaults to 5,000 committed batches and 20 minutes; configure
+`GITHUB_LEDGER_PLANNER_MAX_BATCHES` and `GITHUB_LEDGER_PLANNER_MAX_SECONDS`
+within their 100,000-batch and 3,600-second hard caps. A budget stop is a truthful
+resumable outcome, not completion. Before executing the planner, set
+`GITHUB_SYNC_LEDGER_PLANNING_ENABLED=true` on both the planner and legacy worker
+templates so the legacy worker becomes Local-Folder-only, or keep the legacy
+worker idle. Do not run a legacy template still set to `false` concurrently;
+Cloud Run templates do not share environment state. Verify both normalized
+templates and zero active executions as a rollout gate.
+No Cloud Run Job, scheduler, or trigger for this host is provisioned by the
+current implementation.
+
 Slice 4 adds `GITHUB_SYNC_LEDGER_PROMOTION_ENABLED`, defaulting to lowercase
 `false`. Do not add or enable it on an existing worker: no deployed host consumes
 the promotion contract yet. A later controlled promotion operator must use the
 same immutable application image, schema `20260904_000023`, one caller-owned
 transaction, and read-only before/after retrieval verification. Promotion makes
-no provider call. Slice 5 separately addresses deletion reconciliation; Slice 6
+no provider call; its citation projection and cutover must share the same single
+caller-owned commit. Slice 5 separately addresses deletion reconciliation; Slice 6
 retains staging retention, automation, and rollback operations.
 
 Slice 5 adds `GITHUB_SYNC_LEDGER_RECONCILIATION_ENABLED`, also strict and

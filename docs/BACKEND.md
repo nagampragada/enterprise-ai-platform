@@ -2,11 +2,34 @@
 
 Run the API, scheduler, and connector synchronization worker as separate processes. Start the connector worker with `python -m infrastructure.workers.connector_sync_worker_host`; add `--once` for one bounded claim attempt. Production requires database, OpenAI embedding, GitHub App, and Google Secret Manager configuration. Worker identity, lease, heartbeat, polling, shutdown, and expired-recovery bounds use the `CONNECTOR_WORKER_*` settings documented in `GITHUB_CONNECTOR.md`. An entry point does not by itself mean the worker is deployed or monitored.
 
-`GITHUB_SYNC_LEDGER_PLANNING_ENABLED` is an optional worker-only rollout flag.
+`GITHUB_SYNC_LEDGER_PLANNING_ENABLED` is an optional planner-only rollout flag.
 It defaults to `false` and accepts only exact lowercase `true` or `false`.
-Enabled mode shadows bounded GitHub discovery metadata into the durable work
-ledger while the established GitHub path remains the only processor and
-indexer. It does not enable ledger claims, embeddings, promotion, or retrieval.
+The dedicated `github_sync_ledger_planner_host` resolves and traverses one
+pinned GitHub commit/tree and persists complete manifest-schema-v2 observation
+and eligible-work batches without invoking legacy persistence or reconciliation.
+It requires database and GitHub configuration but neither requires nor
+constructs OpenAI credentials. Each provider page is followed by one short
+caller-owned cursor/manifest transaction. A host execution additionally stops
+after 5,000 committed batches or 20 minutes by default; the strict
+`GITHUB_LEDGER_PLANNER_MAX_BATCHES` and `GITHUB_LEDGER_PLANNER_MAX_SECONDS`
+settings cap those values at 100,000 and 3,600 respectively. Reaching either
+host budget reports a resumable partial outcome, preserves the durable
+non-authoritative cursor, and never completes discovery or the job. The next
+authorized execution resumes only through normal fenced lease expiry/recovery.
+The established per-continuation tree/entry/file/byte bounds and per-run depth,
+cursor, entry, file, byte, and chunk limits remain independent hard limits. The
+planner does not download blobs, extract, embed, process, promote, reconcile,
+or change retrieval authority.
+
+Planning also changes legacy-worker routing: when the same strict planning flag
+is `true`, `connector_sync_worker_host` recovers and claims Local Folder jobs
+only, while the dedicated planner claims GitHub jobs only. Since Cloud Run Job
+templates have independent environments, a rollout must set the flag to `true`
+on both templates before either is executed, or keep the legacy worker idle.
+Never execute a legacy template with the flag `false` concurrently with an
+enabled planner; that older routing still permits the legacy host to claim a
+GitHub job. Leases, attempt ownership, fencing, cancellation, and database retry
+authority are otherwise unchanged.
 
 `GITHUB_SYNC_LEDGER_PROCESSING_ENABLED` is a separate optional worker-only
 rollout flag. It also defaults to `false` and accepts only exact lowercase
@@ -24,10 +47,29 @@ The API, scheduler, migration, and bootstrap processes do not consume the flag.
 defaults to `false` and accepts only exact lowercase `true` or `false`. No
 existing host or API route invokes it: a future authorized orchestrator must
 explicitly compose `GitHubSyncGenerationPromotionService` and own its database
-commit. The service performs no provider call and stages activation, prior
-retirement, and generation completion in one transaction. Its structured
+commit. For a ledger-only generation, `project_and_promote` validates all
+staged inputs and projects source membership, immutable version, indexing, and
+document citation identities from already embedded staging before the existing
+activation cutover. Projection, prior retirement, new activation, and generation
+completion share one savepoint-protected caller transaction and make no provider
+call or internal commit. Existing legacy current-version links and legacy chunks
+remain untouched for active retained sources, including shared-scope sources. Its structured
 event is explicitly `promotion_prepared`; it does not claim durability before
 the caller commits.
+
+Activated retrieval preserves every tenant, user grant/ACL, active knowledge
+space, connector, membership, and scope gate. It branches by authorized scope
+before legacy source deduplication: a valid active scope resolves one unique
+historical citation version bound to the generation commit, staged blob and
+checksum, GitHub attribution, profile, canonical document identity, and
+materialization. The mutable one-to-one `document_version_documents` pointer is
+not citation authority: a fabricated pointer cannot redirect the
+organization-unique GitHub `source_document_key`, and a later scope projection
+cannot invalidate a retained historical activation. Invalid
+active state fails closed without legacy fallback for that scope; retirement
+removes active authority and restores ordinary legacy eligibility. Legacy scopes
+retain their current-version and indexing-state checks, and two activated scopes
+sharing one source/document retain independent exact citation identities.
 
 `GITHUB_SYNC_LEDGER_RECONCILIATION_ENABLED` is the independent Slice 5 gate.
 It defaults to `false`, accepts only exact lowercase `true` or `false`, and is
@@ -121,6 +163,7 @@ Cancellation is database-only and cooperative. Queued and retry-waiting jobs bec
 ```text
 python -m app.server
 python -m infrastructure.workers.connector_sync_worker_host --once
+python -m infrastructure.workers.github_sync_ledger_planner_host --once
 python -m infrastructure.workers.github_sync_ledger_worker_host
 python -m infrastructure.workers.connector_sync_scheduler_host --once
 python -m alembic -c alembic.ini upgrade head

@@ -367,6 +367,22 @@ class ConnectorSyncJobRepository:
         )
         return routed.lease if routed is not None else None
 
+    def acquire_next_github(
+        self,
+        *,
+        worker_id: str,
+        lease_duration: timedelta,
+        now: datetime,
+    ) -> SyncJobLease | None:
+        """Claim one GitHub job without consuming other connector work."""
+        routed = self._acquire_next_routed(
+            worker_id=worker_id,
+            lease_duration=lease_duration,
+            now=now,
+            connector_type="github",
+        )
+        return routed.lease if routed is not None else None
+
     def acquire_next_routed(
         self,
         *,
@@ -745,6 +761,12 @@ class ConnectorSyncJobRepository:
     ) -> tuple[ExpiredSyncJobLease, ...]:
         """Lock expired Local Folder jobs across tenants for internal recovery."""
         return self._lock_expired_routed(now=now, limit=limit, connector_type="local_folder")
+
+    def lock_expired_github(
+        self, *, now: datetime, limit: int
+    ) -> tuple[ExpiredSyncJobLease, ...]:
+        """Lock expired GitHub attempts without consuming other connector work."""
+        return self._lock_expired_routed(now=now, limit=limit, connector_type="github")
 
     def lock_expired_routed(
         self, *, now: datetime, limit: int

@@ -95,6 +95,29 @@ def test_one_shot_no_work_exits_successfully():
     session.close.assert_called_once()
 
 
+def test_legacy_host_excludes_github_claim_and_recovery_when_planner_owns_lane():
+    execution = Mock()
+    execution.recover_expired_local_folder.return_value = ()
+    execution.acquire_one_local_folder.return_value = None
+    session = Mock()
+    host = ConnectorSyncWorkerHost(
+        lambda: session,
+        lambda _session: execution,
+        Mock(),
+        Mock(),
+        _settings(),
+        github_jobs_enabled=False,
+    )
+
+    assert host.run_cycle() == "no_work"
+    execution.recover_expired_local_folder.assert_called_once_with(limit=10)
+    execution.acquire_one_local_folder.assert_called_once_with(
+        worker_id="worker-1", lease_duration=timedelta(minutes=5)
+    )
+    execution.recover_expired_routed.assert_not_called()
+    execution.acquire_one_routed.assert_not_called()
+
+
 def test_ledger_file_work_is_considered_only_after_legacy_queue_is_empty():
     execution = Mock()
     execution.recover_expired_routed.return_value = ()
@@ -185,12 +208,13 @@ def test_composition_propagates_disabled_and_enabled_ledger_planning(monkeypatch
         github_worker.reset_mock()
         process_settings = Mock()
         process_settings.github_sync_ledger_planning_enabled = enabled
-        worker_host_module.compose_connector_sync_worker_host(
+        host = worker_host_module.compose_connector_sync_worker_host(
             _settings(), session_factory=Mock(), process_settings=process_settings
         )
         assert (
             github_worker.call_args.kwargs["ledger_planning_enabled"] is enabled
         )
+        assert host._github_jobs_enabled is (not enabled)
         staged_factory = github_worker.call_args.args[2]
         staged_factory(Mock())
         assert (

@@ -767,6 +767,113 @@ def test_completion_barrier_opens_only_after_legacy_cursor_is_durably_advanced()
     service._planner.mark_discovery_complete.assert_called_once()
 
 
+def test_planner_only_batch_completes_job_without_legacy_persistence() -> None:
+    authorization = _authorization()
+    cursor = _cursor(authorization)
+    complete = replace(
+        cursor,
+        frames=(),
+        scan_complete=True,
+        totals=GitHubRunBudget(entries_examined=1),
+    )
+    now = datetime(2026, 8, 28, tzinfo=timezone.utc)
+    run_id = uuid4()
+    lease = _planning_lease(authorization)
+    discovered = GitHubDiscoveredFile(
+        _entry(cursor.snapshot, "document.md"), cursor, complete, None
+    )
+    service = GitHubStagedSynchronizationService(
+        Mock(), Mock(), Mock(), _profile(), ledger_planning_enabled=True
+    )
+    service._require_context = Mock()  # type: ignore[method-assign]
+    service._replace_cursor = Mock()  # type: ignore[method-assign]
+    service._persist_file = Mock()  # type: ignore[method-assign]
+    service._scopes = Mock()
+    service._scopes.lock_by_id.return_value = Mock()
+    service._planner = Mock()
+    service._sync = Mock()
+    service._sync.get_active_cursor.return_value = SimpleNamespace(
+        created_by_run_id=run_id,
+        cursor_type="github_repository_progress",
+        safe_cursor=cursor.to_safe_json(),
+    )
+    service._sync.get_run.return_value = SimpleNamespace(
+        status="running", started_at=now
+    )
+    snapshot = GitHubSynchronizationSnapshot(
+        authorization, run_id, now, cursor, _profile()
+    )
+
+    result = service.persist_planning_batch(
+        lease,
+        snapshot,
+        GitHubDiscoveryBatch((discovered,), complete, 1, 1),
+        worker_id="worker",
+        now=now,
+    )
+
+    assert result.outcome == "completed"
+    assert result.phase == "planning_complete"
+    service._planner.register_manifest_batch.assert_called_once()
+    service._planner.mark_discovery_complete.assert_called_once()
+    service._execution.complete_success.assert_called_once_with(
+        lease, worker_id="worker"
+    )
+    service._sync.set_run_state.assert_called_once()
+    service._persist_file.assert_not_called()
+
+
+def test_planner_only_partial_batch_is_resumable_and_does_not_complete_job() -> None:
+    authorization = _authorization()
+    cursor = _cursor(authorization)
+    advanced = replace(
+        cursor,
+        frames=(GitHubTraversalFrame("", cursor.snapshot.root_tree_object_id, 1),),
+        totals=GitHubRunBudget(entries_examined=1),
+    )
+    now = datetime(2026, 8, 28, tzinfo=timezone.utc)
+    run_id = uuid4()
+    lease = _planning_lease(authorization)
+    discovered = GitHubDiscoveredFile(
+        _entry(cursor.snapshot, "document.md"), cursor, advanced, None
+    )
+    service = GitHubStagedSynchronizationService(
+        Mock(), Mock(), Mock(), _profile(), ledger_planning_enabled=True
+    )
+    service._require_context = Mock()  # type: ignore[method-assign]
+    service._replace_cursor = Mock()  # type: ignore[method-assign]
+    service._persist_file = Mock()  # type: ignore[method-assign]
+    service._scopes = Mock()
+    service._scopes.lock_by_id.return_value = Mock()
+    service._planner = Mock()
+    service._sync = Mock()
+    service._sync.get_active_cursor.return_value = SimpleNamespace(
+        created_by_run_id=run_id,
+        cursor_type="github_repository_progress",
+        safe_cursor=cursor.to_safe_json(),
+    )
+    snapshot = GitHubSynchronizationSnapshot(
+        authorization, run_id, now, cursor, _profile()
+    )
+
+    result = service.persist_planning_batch(
+        lease,
+        snapshot,
+        GitHubDiscoveryBatch((discovered,), advanced, 1, 1),
+        worker_id="worker",
+        now=now,
+    )
+
+    assert result.outcome == "in_progress"
+    assert result.phase == "traversal"
+    service._replace_cursor.assert_called_once()
+    service._planner.register_manifest_batch.assert_called_once()
+    service._planner.mark_discovery_complete.assert_not_called()
+    service._execution.complete_success.assert_not_called()
+    service._sync.set_run_state.assert_not_called()
+    service._persist_file.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("error", "kind", "retryable"),
     (

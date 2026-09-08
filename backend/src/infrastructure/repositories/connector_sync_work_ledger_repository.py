@@ -6,6 +6,7 @@ import hashlib
 import math
 from collections.abc import Sequence
 from datetime import datetime, timedelta
+from pathlib import PurePosixPath
 from typing import Callable
 from uuid import UUID, uuid4
 
@@ -28,6 +29,7 @@ from domain.connectors.sync_work_ledger import (
     GenerationActivationStatus,
     GenerationActivationView,
     GenerationBarrierSummary,
+    GenerationCitationProjectionProfile,
     GenerationObservationDisposition,
     GenerationPromotionRequest,
     GenerationPromotionResult,
@@ -1442,8 +1444,487 @@ class ConnectorSyncWorkLedgerRepository:
             chunk_count,
         )
 
+    def project_citations_and_promote_generation(
+        self,
+        request: GenerationPromotionRequest,
+        profile: GenerationCitationProjectionProfile,
+        *,
+        now: datetime,
+    ) -> GenerationPromotionResult:
+        """Project staged citations and activate without committing internally."""
+        if not isinstance(request, GenerationPromotionRequest):
+            raise InvalidSyncWorkLedgerRequest("generation promotion request is invalid")
+        if not isinstance(profile, GenerationCitationProjectionProfile):
+            raise InvalidSyncWorkLedgerRequest("generation projection profile is invalid")
+        now = _aware("now", now)
+        if profile.profile_fingerprint != request.profile_fingerprint:
+            raise SyncWorkLedgerConflict("generation projection profile changed")
+
+        # A savepoint makes the operation safe even if a caller catches a
+        # validation conflict and later commits its surrounding transaction.
+        with self._session.begin_nested():
+            scope = self._one(
+                select(ConnectorScope)
+                .where(
+                    ConnectorScope.organization_id == request.organization_id,
+                    ConnectorScope.connector_id == request.connector_id,
+                    ConnectorScope.id == request.connector_scope_id,
+                )
+                .with_for_update(),
+                "generation projection scope lock failed",
+            )
+            existing = self._one(
+                select(ConnectorSyncGenerationActivation)
+                .where(
+                    ConnectorSyncGenerationActivation.organization_id
+                    == request.organization_id,
+                    ConnectorSyncGenerationActivation.connector_id
+                    == request.connector_id,
+                    ConnectorSyncGenerationActivation.connector_scope_id
+                    == request.connector_scope_id,
+                    ConnectorSyncGenerationActivation.generation_id
+                    == request.generation_id,
+                    ConnectorSyncGenerationActivation.status
+                    == GenerationActivationStatus.ACTIVE.value,
+                )
+                .with_for_update(),
+                "generation activation replay lookup failed",
+            )
+            if existing is not None:
+                return self.promote_generation(request, now=now)
+            generation = self._locked_generation(
+                request.organization_id, request.generation_id
+            )
+            if (
+                scope is None
+                or generation is None
+                or scope.status != "active"
+                or scope.scope_type != "repository"
+                or scope.external_scope_key != request.repository_identity
+                or not _generation_promotion_matches(generation, request)
+            ):
+                raise SyncWorkLedgerConflict("generation projection attribution changed")
+            job = self._one(
+                select(ConnectorSyncJob)
+                .where(
+                    ConnectorSyncJob.organization_id == request.organization_id,
+                    ConnectorSyncJob.connector_id == request.connector_id,
+                    ConnectorSyncJob.connector_scope_id == request.connector_scope_id,
+                    ConnectorSyncJob.id == request.sync_job_id,
+                )
+                .with_for_update(),
+                "generation projection job lock failed",
+            )
+            if job is None or job.status != "succeeded" or job.cancel_requested_at:
+                raise SyncWorkLedgerConflict("generation promotion job is not successful")
+            newer = self._one(
+                select(ConnectorSyncGeneration.id)
+                .where(
+                    ConnectorSyncGeneration.organization_id
+                    == request.organization_id,
+                    ConnectorSyncGeneration.connector_id == request.connector_id,
+                    ConnectorSyncGeneration.connector_scope_id
+                    == request.connector_scope_id,
+                    ConnectorSyncGeneration.id != request.generation_id,
+                    or_(
+                        ConnectorSyncGeneration.created_at > generation.created_at,
+                        and_(
+                            ConnectorSyncGeneration.created_at
+                            == generation.created_at,
+                            ConnectorSyncGeneration.id > generation.id,
+                        ),
+                    ),
+                )
+                .limit(1)
+                .with_for_update(),
+                "newer generation projection lookup failed",
+            )
+            if newer is not None:
+                raise SyncWorkLedgerConflict("stale generation cannot be promoted")
+
+            self._validate_promotion_projection(
+                generation, allow_completed=False, require_citations=False
+            )
+            self._project_generation_citations(generation, profile, now)
+            self._flush("generation citation projection failed")
+            return self.promote_generation(request, now=now)
+
+    def _project_generation_citations(
+        self,
+        generation: ConnectorSyncGeneration,
+        profile: GenerationCitationProjectionProfile,
+        now: datetime,
+    ) -> None:
+        materializations = self._all(
+            select(ConnectorSyncFileMaterialization)
+            .where(
+                ConnectorSyncFileMaterialization.organization_id
+                == generation.organization_id,
+                ConnectorSyncFileMaterialization.generation_id == generation.id,
+            )
+            .order_by(ConnectorSyncFileMaterialization.source_item_key)
+            .with_for_update(),
+            "generation materialization projection lookup failed",
+        )
+        work_by_id = {
+            row.id: row
+            for row in self._all(
+                select(ConnectorSyncFileWorkItem)
+                .where(
+                    ConnectorSyncFileWorkItem.organization_id
+                    == generation.organization_id,
+                    ConnectorSyncFileWorkItem.generation_id == generation.id,
+                )
+                .with_for_update(),
+                "generation work projection lookup failed",
+            )
+        }
+        repository_id = _github_repository_id(generation.repository_identity)
+        for materialization in materializations:
+            work = work_by_id.get(materialization.work_item_id)
+            if (
+                work is None
+                or materialization.profile_fingerprint != profile.profile_fingerprint
+                or materialization.embedding_model != profile.embedding_model
+                or work.file_size_bytes is None
+                or work.mime_type != materialization.mime_type
+            ):
+                raise SyncWorkLedgerConflict("generation projection profile changed")
+            chunks = self._all(
+                select(ConnectorSyncFileMaterializationChunk)
+                .where(
+                    ConnectorSyncFileMaterializationChunk.organization_id
+                    == generation.organization_id,
+                    ConnectorSyncFileMaterializationChunk.generation_id
+                    == generation.id,
+                    ConnectorSyncFileMaterializationChunk.materialization_id
+                    == materialization.id,
+                )
+                .order_by(ConnectorSyncFileMaterializationChunk.chunk_index)
+                .with_for_update(),
+                "generation chunk projection lookup failed",
+            )
+            if len(chunks) != materialization.chunk_count:
+                raise SyncWorkLedgerConflict("generation materialization chunks are incomplete")
+
+            source = self._one(
+                select(SourceItem)
+                .where(
+                    SourceItem.organization_id == generation.organization_id,
+                    SourceItem.connector_id == generation.connector_id,
+                    SourceItem.source_item_key == materialization.source_item_key,
+                )
+                .with_for_update(),
+                "generation source projection lookup failed",
+            )
+            metadata = {
+                "provider": "github",
+                "repository_id": repository_id,
+                "repository_identity": generation.repository_identity,
+                "repository_path": materialization.repository_path,
+                "blob_object_id": materialization.provider_blob_id,
+                "snapshot_commit_id": generation.commit_object_id,
+                "file_extension": PurePosixPath(materialization.repository_path).suffix.casefold(),
+                "size_bytes": work.file_size_bytes,
+            }
+            restored = source is not None and source.status != "active"
+            if source is None:
+                source = SourceItem(
+                    id=self._new_uuid("source_item_id", uuid4),
+                    organization_id=generation.organization_id,
+                    connector_id=generation.connector_id,
+                    source_item_key=materialization.source_item_key,
+                    parent_source_item_key=None,
+                    source_item_type="file",
+                    title=materialization.title,
+                    source_url=None,
+                    mime_type=materialization.mime_type,
+                    source_checksum=materialization.content_checksum,
+                    source_version=materialization.provider_blob_id,
+                    size_bytes=work.file_size_bytes,
+                    source_created_at=None,
+                    source_modified_at=None,
+                    first_seen_at=now,
+                    last_seen_at=now,
+                    status="active",
+                    deleted_at=None,
+                    source_metadata=metadata,
+                    metadata_schema_version=1,
+                )
+                self._session.add(source)
+                self._flush("generation source projection failed")
+            else:
+                if source.source_item_type != "file":
+                    raise SyncWorkLedgerConflict("generation source type changed")
+                # An active source can be authorized by another scope.  Its
+                # mutable legacy projection remains authoritative there until
+                # that scope is independently activated.  Activated ledger
+                # retrieval binds the immutable staged version directly, so
+                # changing the shared legacy source is neither required nor
+                # safe here.
+                if restored:
+                    source.title = materialization.title
+                    source.mime_type = materialization.mime_type
+                    source.source_checksum = materialization.content_checksum
+                    source.source_version = materialization.provider_blob_id
+                    source.size_bytes = work.file_size_bytes
+                    source.last_seen_at = now
+                    source.status = "active"
+                    source.deleted_at = None
+                    source.source_metadata = metadata
+                    source.metadata_schema_version = 1
+                    source.updated_at = now
+
+            memberships = self._all(
+                select(SourceItemScopeMembership)
+                .where(
+                    SourceItemScopeMembership.organization_id
+                    == generation.organization_id,
+                    SourceItemScopeMembership.connector_id == generation.connector_id,
+                    SourceItemScopeMembership.source_item_id == source.id,
+                )
+                .order_by(SourceItemScopeMembership.connector_scope_id)
+                .with_for_update(),
+                "generation membership projection lookup failed",
+            )
+            membership = next(
+                (row for row in memberships if row.connector_scope_id == generation.connector_scope_id),
+                None,
+            )
+            if membership is None:
+                self._session.add(
+                    SourceItemScopeMembership(
+                        id=self._new_uuid("source_membership_id", uuid4),
+                        organization_id=generation.organization_id,
+                        connector_id=generation.connector_id,
+                        source_item_id=source.id,
+                        connector_scope_id=generation.connector_scope_id,
+                        status="active",
+                        first_discovered_at=now,
+                        last_seen_at=now,
+                        removed_at=None,
+                    )
+                )
+            else:
+                if membership.status != "active" or membership.removed_at is not None:
+                    membership.status = "active"
+                    membership.last_seen_at = now
+                    membership.removed_at = None
+                    membership.updated_at = now
+
+            versions = self._all(
+                select(DocumentVersion)
+                .where(
+                    DocumentVersion.organization_id == generation.organization_id,
+                    DocumentVersion.source_item_id == source.id,
+                )
+                .order_by(DocumentVersion.version_number)
+                .with_for_update(),
+                "generation version projection lookup failed",
+            )
+            current = next((row for row in versions if row.is_current), None)
+            matching_versions = [
+                row
+                for row in versions
+                if row.provider_version_id == materialization.provider_blob_id
+                and row.content_checksum == materialization.content_checksum
+                and row.lifecycle == "available"
+            ]
+            if len(matching_versions) > 1:
+                raise SyncWorkLedgerConflict("generation citation version is duplicated")
+            version = matching_versions[0] if matching_versions else None
+            if version is None:
+                if restored and current is not None:
+                    current.is_current = False
+                version = DocumentVersion(
+                    id=self._new_uuid("document_version_id", uuid4),
+                    organization_id=generation.organization_id,
+                    connector_id=generation.connector_id,
+                    source_item_id=source.id,
+                    version_number=1 + max((row.version_number for row in versions), default=0),
+                    provider_version_id=materialization.provider_blob_id,
+                    content_checksum=materialization.content_checksum,
+                    checksum_algorithm="sha256",
+                    source_modified_at=None,
+                    source_size_bytes=work.file_size_bytes,
+                    content_type=materialization.mime_type,
+                    file_extension=PurePosixPath(materialization.repository_path).suffix.casefold(),
+                    version_cause=("restored" if restored else "content_changed" if versions else "discovered"),
+                    lifecycle="available",
+                    is_current=current is None or restored,
+                    discovered_at=now,
+                    version_metadata={
+                        "provider": "github",
+                        "repository_id": repository_id,
+                        "commit_object_id": generation.commit_object_id,
+                        "blob_object_id": materialization.provider_blob_id,
+                    },
+                    metadata_schema_version=1,
+                )
+                self._session.add(version)
+                self._flush("generation version projection failed")
+            elif (
+                version.version_metadata.get("provider") != "github"
+                or version.version_metadata.get("commit_object_id")
+                != generation.commit_object_id
+                or version.version_metadata.get("blob_object_id")
+                != materialization.provider_blob_id
+            ):
+                raise SyncWorkLedgerConflict("generation citation version attribution changed")
+            elif restored and not version.is_current:
+                if current is not None:
+                    current.is_current = False
+                version.is_current = True
+
+            document = self._one(
+                select(Document)
+                .where(
+                    Document.organization_id == generation.organization_id,
+                    Document.source_type == "github",
+                    Document.source_document_key == materialization.source_item_key,
+                )
+                .with_for_update(),
+                "generation document projection lookup failed",
+            )
+            if document is None:
+                document = Document(
+                    id=self._new_uuid("document_id", uuid4),
+                    organization_id=generation.organization_id,
+                    source_type="github",
+                    source_document_key=materialization.source_item_key,
+                    title=materialization.title,
+                    source_url=None,
+                    mime_type=materialization.mime_type,
+                    checksum_latest=materialization.content_checksum,
+                    status="ready",
+                    source_created_at=None,
+                    source_updated_at=None,
+                    deleted_at=None,
+                )
+                self._session.add(document)
+                self._flush("generation document projection failed")
+            else:
+                if restored:
+                    document.title = materialization.title
+                    document.mime_type = materialization.mime_type
+                    document.checksum_latest = materialization.content_checksum
+                    document.status = "ready"
+                    document.deleted_at = None
+                    document.updated_at = now
+
+            links = self._all(
+                select(DocumentVersionDocument)
+                .where(
+                    DocumentVersionDocument.organization_id == generation.organization_id,
+                    or_(
+                        DocumentVersionDocument.document_id == document.id,
+                        DocumentVersionDocument.document_version_id == version.id,
+                    ),
+                )
+                .with_for_update(),
+                "generation citation link lookup failed",
+            )
+            version_link = next(
+                (row for row in links if row.document_version_id == version.id), None
+            )
+            document_link = next(
+                (row for row in links if row.document_id == document.id), None
+            )
+            if version_link is not None and version_link.document_id != document.id:
+                raise SyncWorkLedgerConflict("generation citation document changed")
+            if restored:
+                for link in links:
+                    self._session.delete(link)
+                if links:
+                    self._flush("generation citation link replacement failed")
+                version_link = None
+                document_link = None
+            # The legacy one-to-one link denotes its current projection.  A
+            # changed active source keeps that link intact for other scopes;
+            # ledger retrieval resolves the immutable staged version without
+            # rewriting the legacy pointer.  New/restored sources establish
+            # the link normally.
+            if version_link is None and document_link is None:
+                self._session.add(
+                    DocumentVersionDocument(
+                        id=self._new_uuid("document_version_document_id", uuid4),
+                        organization_id=generation.organization_id,
+                        document_version_id=version.id,
+                        document_id=document.id,
+                        linked_at=now,
+                    )
+                )
+
+            states = self._all(
+                select(DocumentIndexingState)
+                .where(
+                    DocumentIndexingState.organization_id == generation.organization_id,
+                    DocumentIndexingState.document_version_id == version.id,
+                    DocumentIndexingState.profile_fingerprint == profile.profile_fingerprint,
+                )
+                .with_for_update(),
+                "generation indexing projection lookup failed",
+            )
+            if len(states) > 1:
+                raise SyncWorkLedgerConflict("generation indexing projection is duplicated")
+            state = states[0] if states else None
+            if state is None:
+                self._session.add(
+                    DocumentIndexingState(
+                        id=self._new_uuid("indexing_state_id", uuid4),
+                        organization_id=generation.organization_id,
+                        document_version_id=version.id,
+                        extraction_profile=profile.extraction_profile,
+                        extraction_version=profile.extraction_version,
+                        chunking_profile=profile.chunking_profile,
+                        chunking_version=profile.chunking_version,
+                        embedding_provider=profile.embedding_provider,
+                        embedding_model=profile.embedding_model,
+                        embedding_dimensions=profile.embedding_dimensions,
+                        profile_fingerprint=profile.profile_fingerprint,
+                        desired_generation=1,
+                        indexed_generation=1,
+                        status="indexed",
+                        reason="new_version" if not versions else "content_changed",
+                        attempt_count=0,
+                        requested_at=now,
+                        started_at=now,
+                        completed_at=now,
+                    )
+                )
+            elif (
+                state.embedding_model != profile.embedding_model
+                or state.embedding_dimensions != profile.embedding_dimensions
+                or state.extraction_profile != profile.extraction_profile
+                or state.extraction_version != profile.extraction_version
+                or state.chunking_profile != profile.chunking_profile
+                or state.chunking_version != profile.chunking_version
+                or state.embedding_provider != profile.embedding_provider
+            ):
+                raise SyncWorkLedgerConflict("generation indexing profile changed")
+            elif not (
+                state.status == "indexed"
+                and state.indexed_generation == state.desired_generation
+                and state.last_error_category is None
+                and state.last_error_code is None
+                and state.next_retry_at is None
+            ):
+                state.desired_generation = max(1, state.desired_generation)
+                state.indexed_generation = state.desired_generation
+                state.status = "indexed"
+                state.last_error_category = None
+                state.last_error_code = None
+                state.next_retry_at = None
+                state.started_at = state.started_at or now
+                state.completed_at = now
+                state.updated_at = now
+
     def _validate_promotion_projection(
-        self, generation: ConnectorSyncGeneration, *, allow_completed: bool
+        self,
+        generation: ConnectorSyncGeneration,
+        *,
+        allow_completed: bool,
+        require_citations: bool = True,
     ) -> tuple[int, int]:
         allowed_statuses = {RepositoryGenerationStatus.PROCESSING.value}
         if allow_completed:
@@ -1554,8 +2035,11 @@ class ConnectorSyncWorkLedgerRepository:
         ):
             raise SyncWorkLedgerConflict("generation materialization chunks are incomplete")
 
+        if not require_citations:
+            return len(materializations), len(chunk_rows)
+
         projection_count = self._one(
-            select(func.count(func.distinct(ConnectorSyncFileMaterialization.id)))
+            select(func.count(ConnectorSyncFileMaterialization.id))
             .select_from(ConnectorSyncFileMaterialization)
             .join(
                 SourceItem,
@@ -1588,18 +2072,12 @@ class ConnectorSyncWorkLedgerRepository:
                 ),
             )
             .join(
-                DocumentVersionDocument,
-                and_(
-                    DocumentVersionDocument.organization_id
-                    == DocumentVersion.organization_id,
-                    DocumentVersionDocument.document_version_id == DocumentVersion.id,
-                ),
-            )
-            .join(
                 Document,
                 and_(
-                    Document.organization_id == DocumentVersionDocument.organization_id,
-                    Document.id == DocumentVersionDocument.document_id,
+                    Document.organization_id == DocumentVersion.organization_id,
+                    Document.source_type == "github",
+                    Document.source_document_key
+                    == ConnectorSyncFileMaterialization.source_item_key,
                 ),
             )
             .join(
@@ -1618,31 +2096,20 @@ class ConnectorSyncWorkLedgerRepository:
                 ConnectorSyncFileMaterialization.generation_id == generation.id,
                 SourceItem.status == "active",
                 SourceItem.deleted_at.is_(None),
-                SourceItem.source_version
-                == ConnectorSyncFileMaterialization.provider_blob_id,
-                SourceItem.source_checksum
-                == ConnectorSyncFileMaterialization.content_checksum,
-                SourceItem.source_metadata["repository_identity"].as_string()
-                == generation.repository_identity,
-                SourceItem.source_metadata["repository_path"].as_string()
-                == ConnectorSyncFileMaterialization.repository_path,
-                SourceItem.source_metadata["blob_object_id"].as_string()
-                == ConnectorSyncFileMaterialization.provider_blob_id,
-                SourceItem.source_metadata["snapshot_commit_id"].as_string()
-                == generation.commit_object_id,
                 SourceItemScopeMembership.status == "active",
                 SourceItemScopeMembership.removed_at.is_(None),
-                DocumentVersion.is_current.is_(True),
                 DocumentVersion.lifecycle == "available",
                 DocumentVersion.provider_version_id
                 == ConnectorSyncFileMaterialization.provider_blob_id,
                 DocumentVersion.content_checksum
                 == ConnectorSyncFileMaterialization.content_checksum,
+                DocumentVersion.version_metadata["provider"].as_string() == "github",
+                DocumentVersion.version_metadata["commit_object_id"].as_string()
+                == generation.commit_object_id,
+                DocumentVersion.version_metadata["blob_object_id"].as_string()
+                == ConnectorSyncFileMaterialization.provider_blob_id,
                 Document.status == "ready",
                 Document.deleted_at.is_(None),
-                Document.source_type == "github",
-                Document.source_document_key
-                == ConnectorSyncFileMaterialization.source_item_key,
                 DocumentIndexingState.status == "indexed",
                 DocumentIndexingState.indexed_generation
                 == DocumentIndexingState.desired_generation,
@@ -1874,7 +2341,7 @@ class ConnectorSyncWorkLedgerRepository:
 
     def _promotion_projection_count(self, generation: ConnectorSyncGeneration) -> int:
         return self._one(
-            select(func.count(func.distinct(ConnectorSyncFileMaterialization.id)))
+            select(func.count(ConnectorSyncFileMaterialization.id))
             .select_from(ConnectorSyncFileMaterialization)
             .join(
                 SourceItem,
@@ -1907,19 +2374,12 @@ class ConnectorSyncWorkLedgerRepository:
                 ),
             )
             .join(
-                DocumentVersionDocument,
-                and_(
-                    DocumentVersionDocument.organization_id
-                    == DocumentVersion.organization_id,
-                    DocumentVersionDocument.document_version_id == DocumentVersion.id,
-                ),
-            )
-            .join(
                 Document,
                 and_(
-                    Document.organization_id
-                    == DocumentVersionDocument.organization_id,
-                    Document.id == DocumentVersionDocument.document_id,
+                    Document.organization_id == DocumentVersion.organization_id,
+                    Document.source_type == "github",
+                    Document.source_document_key
+                    == ConnectorSyncFileMaterialization.source_item_key,
                 ),
             )
             .join(
@@ -1938,31 +2398,20 @@ class ConnectorSyncWorkLedgerRepository:
                 ConnectorSyncFileMaterialization.generation_id == generation.id,
                 SourceItem.status == "active",
                 SourceItem.deleted_at.is_(None),
-                SourceItem.source_version
-                == ConnectorSyncFileMaterialization.provider_blob_id,
-                SourceItem.source_checksum
-                == ConnectorSyncFileMaterialization.content_checksum,
-                SourceItem.source_metadata["repository_identity"].as_string()
-                == generation.repository_identity,
-                SourceItem.source_metadata["repository_path"].as_string()
-                == ConnectorSyncFileMaterialization.repository_path,
-                SourceItem.source_metadata["blob_object_id"].as_string()
-                == ConnectorSyncFileMaterialization.provider_blob_id,
-                SourceItem.source_metadata["snapshot_commit_id"].as_string()
-                == generation.commit_object_id,
                 SourceItemScopeMembership.status == "active",
                 SourceItemScopeMembership.removed_at.is_(None),
-                DocumentVersion.is_current.is_(True),
                 DocumentVersion.lifecycle == "available",
                 DocumentVersion.provider_version_id
                 == ConnectorSyncFileMaterialization.provider_blob_id,
                 DocumentVersion.content_checksum
                 == ConnectorSyncFileMaterialization.content_checksum,
+                DocumentVersion.version_metadata["provider"].as_string() == "github",
+                DocumentVersion.version_metadata["commit_object_id"].as_string()
+                == generation.commit_object_id,
+                DocumentVersion.version_metadata["blob_object_id"].as_string()
+                == ConnectorSyncFileMaterialization.provider_blob_id,
                 Document.status == "ready",
                 Document.deleted_at.is_(None),
-                Document.source_type == "github",
-                Document.source_document_key
-                == ConnectorSyncFileMaterialization.source_item_key,
                 DocumentIndexingState.status == "indexed",
                 DocumentIndexingState.indexed_generation
                 == DocumentIndexingState.desired_generation,
@@ -2946,6 +3395,16 @@ def _source_key_hash(source_item_key: str, repository_path: str) -> str:
     digest.update(b"\x00")
     digest.update(repository_path.encode("utf-8"))
     return digest.hexdigest()
+
+
+def _github_repository_id(repository_identity: str) -> int:
+    prefix = "github:repository:"
+    if not repository_identity.startswith(prefix):
+        raise SyncWorkLedgerConflict("generation repository identity is invalid")
+    value = repository_identity[len(prefix) :]
+    if not value.isdigit() or int(value) < 1:
+        raise SyncWorkLedgerConflict("generation repository identity is invalid")
+    return int(value)
 
 
 def _materialization_matches_context(

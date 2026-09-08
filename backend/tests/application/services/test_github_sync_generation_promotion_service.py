@@ -12,6 +12,7 @@ from application.services.github_sync_generation_promotion_service import (
     GitHubSyncGenerationPromotionService,
 )
 from domain.connectors.sync_work_ledger import (
+    GenerationCitationProjectionProfile,
     GenerationActivationStatus,
     GenerationActivationView,
     GenerationPromotionRequest,
@@ -65,6 +66,19 @@ def _result(request: GenerationPromotionRequest) -> GenerationPromotionResult:
     )
 
 
+def _profile(request: GenerationPromotionRequest) -> GenerationCitationProjectionProfile:
+    return GenerationCitationProjectionProfile(
+        "content_extraction",
+        "v1",
+        "deterministic_text_chunker",
+        "v2",
+        "openai",
+        "openai:text-embedding-3-small:1536",
+        1536,
+        request.profile_fingerprint,
+    )
+
+
 def test_promotion_is_default_off_and_does_not_touch_repository() -> None:
     repository = Mock(spec=ConnectorSyncWorkLedgerRepository)
     service = GitHubSyncGenerationPromotionService(repository)
@@ -86,6 +100,30 @@ def test_enabled_promotion_delegates_once_and_logs_only_safe_identity(caplog) ->
     assert request.repository_identity not in caplog.text
     assert request.commit_object_id not in caplog.text
     assert request.profile_fingerprint not in caplog.text
+
+
+def test_enabled_projection_and_promotion_delegates_once() -> None:
+    request = _request()
+    profile = _profile(request)
+    result = _result(request)
+    repository = Mock(spec=ConnectorSyncWorkLedgerRepository)
+    repository.project_citations_and_promote_generation.return_value = result
+    service = GitHubSyncGenerationPromotionService(repository, enabled=True)
+
+    assert service.project_and_promote(request, profile, now=NOW) == result
+
+    repository.project_citations_and_promote_generation.assert_called_once_with(
+        request, profile, now=NOW
+    )
+
+
+def test_disabled_projection_and_promotion_does_not_touch_repository() -> None:
+    request = _request()
+    repository = Mock(spec=ConnectorSyncWorkLedgerRepository)
+    service = GitHubSyncGenerationPromotionService(repository)
+    with pytest.raises(GitHubSyncGenerationPromotionDisabled):
+        service.project_and_promote(request, _profile(request), now=NOW)
+    repository.project_citations_and_promote_generation.assert_not_called()
 
 
 def test_promotion_constructor_rejects_nonboolean_gate() -> None:

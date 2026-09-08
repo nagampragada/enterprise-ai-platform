@@ -65,6 +65,8 @@ class ConnectorWorkerSettings:
     shutdown_timeout: timedelta
     recovery_limit: int
     one_shot: bool = False
+    planner_max_batches_per_execution: int = 5_000
+    planner_max_execution_duration: timedelta = timedelta(minutes=20)
 
     def __post_init__(self) -> None:
         if not self.worker_id or len(self.worker_id) > 255:
@@ -81,6 +83,17 @@ class ConnectorWorkerSettings:
             raise ValueError("heartbeat interval must leave one full renewal margin")
         if isinstance(self.recovery_limit, bool) or not 1 <= self.recovery_limit <= 100:
             raise ValueError("recovery_limit is outside the allowed range")
+        if (
+            isinstance(self.planner_max_batches_per_execution, bool)
+            or not isinstance(self.planner_max_batches_per_execution, int)
+            or not 1 <= self.planner_max_batches_per_execution <= 100_000
+        ):
+            raise ValueError("planner batch limit is outside the allowed range")
+        if (
+            not isinstance(self.planner_max_execution_duration, timedelta)
+            or not 0 < self.planner_max_execution_duration.total_seconds() <= 3600
+        ):
+            raise ValueError("planner execution duration is outside the allowed range")
 
     @classmethod
     def from_environment(cls, argv: Sequence[str] | None = None,
@@ -91,25 +104,34 @@ class ConnectorWorkerSettings:
         values = os.environ if environ is None else environ
         duration = lambda name, default: timedelta(seconds=float(values.get(name, default)))
         return cls(
-            values.get("CONNECTOR_WORKER_ID", f"connector-{uuid4().hex}"),
-            duration("CONNECTOR_WORKER_LEASE_SECONDS", 900),
-            duration("CONNECTOR_WORKER_HEARTBEAT_SECONDS", 60),
-            duration("CONNECTOR_WORKER_IDLE_SECONDS", 5),
-            duration("CONNECTOR_WORKER_SHUTDOWN_SECONDS", 300),
-            int(values.get("CONNECTOR_WORKER_RECOVERY_LIMIT", "10")),
-            args.once,
+            worker_id=values.get("CONNECTOR_WORKER_ID", f"connector-{uuid4().hex}"),
+            lease_duration=duration("CONNECTOR_WORKER_LEASE_SECONDS", 900),
+            heartbeat_interval=duration("CONNECTOR_WORKER_HEARTBEAT_SECONDS", 60),
+            idle_interval=duration("CONNECTOR_WORKER_IDLE_SECONDS", 5),
+            shutdown_timeout=duration("CONNECTOR_WORKER_SHUTDOWN_SECONDS", 300),
+            recovery_limit=int(values.get("CONNECTOR_WORKER_RECOVERY_LIMIT", "10")),
+            one_shot=args.once,
+            planner_max_batches_per_execution=int(
+                values.get("GITHUB_LEDGER_PLANNER_MAX_BATCHES", "5000")
+            ),
+            planner_max_execution_duration=duration(
+                "GITHUB_LEDGER_PLANNER_MAX_SECONDS", 1200
+            ),
         )
 
 
 class ConnectorSyncWorkerHost:
     def __init__(self, session_factory, execution_factory, local_worker, github_worker,
                  settings, *, github_file_work_worker=None, shutdown_event=None,
-                 wait=None, logger=LOGGER):
+                 github_jobs_enabled=True, wait=None, logger=LOGGER):
+        if not isinstance(github_jobs_enabled, bool):
+            raise ValueError("GitHub job routing flag is invalid")
         self._sessions = session_factory
         self._execution = execution_factory
         self._local = local_worker
         self._github = github_worker
         self._github_file_work = github_file_work_worker
+        self._github_jobs_enabled = github_jobs_enabled
         self._settings = settings
         self._shutdown = shutdown_event or threading.Event()
         self._wait = wait or self._shutdown.wait
@@ -176,15 +198,34 @@ class ConnectorSyncWorkerHost:
         session = self._sessions()
         try:
             execution = self._execution(session)
-            recovered = execution.recover_expired_routed(limit=self._settings.recovery_limit)
+            recovered = (
+                execution.recover_expired_routed(limit=self._settings.recovery_limit)
+                if self._github_jobs_enabled
+                else execution.recover_expired_local_folder(
+                    limit=self._settings.recovery_limit
+                )
+            )
             if recovered:
                 self._logger.info("event=expired_jobs_recovered count=%d", len(recovered))
             acquired = None
             if not self._shutdown.is_set():
-                acquired = execution.acquire_one_routed(
-                    worker_id=self._settings.worker_id,
-                    lease_duration=self._settings.lease_duration,
-                )
+                if self._github_jobs_enabled:
+                    acquired = execution.acquire_one_routed(
+                        worker_id=self._settings.worker_id,
+                        lease_duration=self._settings.lease_duration,
+                    )
+                else:
+                    local = execution.acquire_one_local_folder(
+                        worker_id=self._settings.worker_id,
+                        lease_duration=self._settings.lease_duration,
+                    )
+                    acquired = (
+                        AcquiredRoutedSyncAttempt(
+                            local.lease, local.sync_run_id, "local_folder"
+                        )
+                        if local is not None
+                        else None
+                    )
             session.commit()
             return acquired
         except Exception:
@@ -279,6 +320,7 @@ def compose_connector_sync_worker_host(settings: ConnectorWorkerSettings,
         settings,
         github_file_work_worker=github_file_work,
         shutdown_event=shutdown_event,
+        github_jobs_enabled=not runtime.github_sync_ledger_planning_enabled,
     )
 
 

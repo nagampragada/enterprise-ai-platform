@@ -40,12 +40,21 @@ from application.services.github_staged_synchronization_service import (
 from application.services.github_sync_work_processing_service import (
     GitHubSyncWorkProcessingService,
 )
+from application.services.github_sync_generation_reconciliation_service import (
+    GitHubSyncGenerationReconciliationService,
+)
+from application.services.github_sync_work_planning_service import (
+    GitHubSyncWorkPlanningService,
+)
 from application.services.local_document_indexing_service import LocalDocumentIndexingProfile
 from domain.embeddings.models import EmbeddingProfile
 from infrastructure.db.models import (
     ConnectorSyncFileMaterialization,
     ConnectorSyncFileMaterializationChunk,
     ConnectorSyncFileWorkItem,
+    ConnectorSyncGeneration,
+    ConnectorSyncGenerationActivation,
+    ConnectorSyncGenerationObservation,
     ConnectorSyncItem,
     ConnectorSyncJob,
     ConnectorSyncCursor,
@@ -62,7 +71,13 @@ from infrastructure.db.models import (
 )
 from domain.connectors.sync_work_ledger import (
     FileWorkManifestEntry,
+    FileWorkCounters,
+    FileWorkMaterialization,
+    FileWorkMaterializationChunk,
     FileWorkStatus,
+    GenerationCitationProjectionProfile,
+    GenerationPromotionRequest,
+    GenerationReconciliationRequest,
     RepositoryGenerationRegistration,
 )
 from infrastructure.repositories.connector_sync_job_repository import ConnectorSyncJobRepository
@@ -2638,3 +2653,446 @@ def test_permission_aware_retrieval_sql_uses_only_activated_ledger_materializati
     assert "connector_sync_file_materialization_chunks" in normalized
     assert "status = 'active'" in normalized
     assert "status = 'completed'" in normalized
+
+
+def _citation_projection_profile(
+    profile: LocalDocumentIndexingProfile,
+) -> GenerationCitationProjectionProfile:
+    return GenerationCitationProjectionProfile(
+        profile.extraction_profile,
+        profile.extraction_version,
+        profile.chunking_profile,
+        profile.chunking_version,
+        profile.embedding_provider,
+        profile.embedding_model,
+        profile.embedding_dimensions,
+        profile.fingerprint,
+    )
+
+
+def _generation_promotion_request(
+    generation: ConnectorSyncGeneration,
+) -> GenerationPromotionRequest:
+    return GenerationPromotionRequest(
+        generation.organization_id,
+        generation.connector_id,
+        generation.connector_scope_id,
+        generation.id,
+        generation.sync_job_id,
+        generation.provider_key,
+        generation.repository_identity,
+        generation.branch_name,
+        generation.commit_object_id,
+        generation.root_tree_object_id,
+        generation.profile_fingerprint,
+    )
+
+
+def _generation_reconciliation_request(
+    generation: ConnectorSyncGeneration,
+) -> GenerationReconciliationRequest:
+    return GenerationReconciliationRequest(
+        generation.organization_id,
+        generation.connector_id,
+        generation.connector_scope_id,
+        generation.id,
+        generation.sync_job_id,
+        generation.provider_key,
+        generation.repository_identity,
+        generation.branch_name,
+        generation.commit_object_id,
+        generation.root_tree_object_id,
+        generation.profile_fingerprint,
+    )
+
+
+def _stage_work_item(
+    factory,
+    organization_id,
+    generation_id,
+    *,
+    worker_id,
+    now,
+    content,
+):
+    checksum = hashlib.sha256(content.encode()).hexdigest()
+    with factory() as session:
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        lease = repository.claim_next(
+            organization_id,
+            generation_id,
+            worker_id=worker_id,
+            now=now,
+            lease_duration=timedelta(minutes=15),
+        )
+        assert lease is not None
+        session.commit()
+    with factory() as session:
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        generation = session.get(ConnectorSyncGeneration, generation_id)
+        work = session.get(ConnectorSyncFileWorkItem, lease.work_item_id)
+        assert generation is not None and work is not None
+        repository.stage_materialization_and_complete(
+            lease,
+            worker_id=worker_id,
+            generation=repository.get_generation(organization_id, generation_id),
+            work_item=repository.get_work_item(
+                organization_id, generation_id, lease.work_item_id
+            ),
+            materialization=FileWorkMaterialization(
+                generation.repository_identity,
+                generation.branch_name,
+                generation.root_tree_object_id,
+                work.source_item_key,
+                work.repository_path,
+                work.provider_blob_id,
+                work.provider_revision_id,
+                work.profile_fingerprint,
+                checksum,
+                work.repository_path.rsplit("/", 1)[-1],
+                work.mime_type,
+                "fake:model:1536",
+                (
+                    FileWorkMaterializationChunk(
+                        0,
+                        content,
+                        checksum,
+                        (1.0,) * 1536,
+                        "fake:model:1536",
+                    ),
+                ),
+            ),
+            counters=FileWorkCounters(
+                len(content.encode()), len(content), 1, 1
+            ),
+            now=now,
+        )
+        session.commit()
+
+
+def test_ledger_only_discovery_projection_promotion_and_reconciliation_preserve_retrieval(
+    engine,
+):
+    """Prove the corrected controlled Slice 5 lifecycle end to end."""
+    factory = _factory(engine)
+    organization_id, connector_id, scope_id = _seed(factory)
+    profile = _profile()
+    user_id, _space_id = _grant_and_search_context(
+        factory, organization_id, scope_id
+    )
+    retained_path = "documents/incremental-sync-verification.md"
+    removed_path = "README.md"
+
+    legacy_attempt, legacy_snapshot = _persist_file_set_traversal(
+        factory,
+        organization_id,
+        connector_id,
+        scope_id,
+        profile,
+        now=NOW,
+        paths=(removed_path, retained_path),
+    )
+    with factory() as session:
+        outcome = _staged(session, profile).reconcile(
+            legacy_attempt.lease,
+            legacy_snapshot,
+            worker_id="github-worker",
+            now=NOW,
+        )
+        assert outcome.outcome == "completed"
+        session.commit()
+
+    with factory() as session:
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        planner = GitHubSyncWorkPlanningService(repository)
+        historical_snapshot = GitHubRepositorySnapshot(
+            connector_id,
+            scope_id,
+            501,
+            "github:repository:501",
+            "main",
+            COMMIT,
+            TREE,
+        )
+        planned = planner.register_manifest_batch(
+            organization_id=organization_id,
+            connector_id=connector_id,
+            connector_scope_id=scope_id,
+            sync_job_id=legacy_attempt.lease.job_id,
+            authorization=legacy_snapshot.authorization,
+            snapshot=historical_snapshot,
+            profile_fingerprint=profile.fingerprint,
+            entries=tuple(
+                GitHubRepositoryEntry(
+                    connector_id,
+                    scope_id,
+                    501,
+                    "github:repository:501",
+                    COMMIT,
+                    TREE,
+                    TREE,
+                    path.rsplit("/", 1)[-1],
+                    path,
+                    "regular_blob",
+                    BLOB,
+                    len(CONTENT),
+                    False,
+                )
+                for path in (removed_path, retained_path)
+            ),
+            now=NOW,
+        )
+        historical = planner.mark_discovery_complete(
+            organization_id=organization_id,
+            connector_id=connector_id,
+            connector_scope_id=scope_id,
+            sync_job_id=legacy_attempt.lease.job_id,
+            authorization=legacy_snapshot.authorization,
+            snapshot=historical_snapshot,
+            profile_fingerprint=profile.fingerprint,
+            now=NOW,
+        )
+        assert planned.created_count == 2
+        session.commit()
+    _stage_work_item(
+        factory,
+        organization_id,
+        historical.generation_id,
+        worker_id="historical-ledger-worker",
+        now=NOW,
+        content="alpha",
+    )
+    _stage_work_item(
+        factory,
+        organization_id,
+        historical.generation_id,
+        worker_id="historical-ledger-worker",
+        now=NOW,
+        content="alpha",
+    )
+    with factory() as session:
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        historical_row = session.get(
+            ConnectorSyncGeneration, historical.generation_id
+        )
+        assert historical_row is not None
+        repository.promote_generation(
+            _generation_promotion_request(historical_row),
+            now=NOW + timedelta(minutes=1),
+        )
+        session.commit()
+
+    before = _search(factory, organization_id, user_id)
+    assert len(before) == 2
+    old_ids = {row.chunk_id for row in before}
+
+    later = NOW + timedelta(hours=1)
+    planned_attempt = _acquire(
+        factory, organization_id, connector_id, scope_id, now=later
+    )
+    with factory() as session:
+        planning_service = GitHubStagedSynchronizationService(
+            session,
+            _execution(session, later),
+            GitHubRepositoryContentService(session, Client()),
+            profile,
+            ledger_planning_enabled=True,
+        )
+        planning_snapshot = planning_service.snapshot(
+            planned_attempt.lease,
+            planned_attempt.sync_run_id,
+            worker_id="github-worker",
+        )
+        session.rollback()
+    pinned = GitHubRepositorySnapshot(
+        connector_id,
+        scope_id,
+        501,
+        "github:repository:501",
+        "main",
+        "d" * 40,
+        "e" * 40,
+    )
+    cursor = GitHubTraversalCursor.initial(pinned, planning_snapshot.authorization)
+    with factory() as session:
+        GitHubStagedSynchronizationService(
+            session,
+            _execution(session, later),
+            GitHubRepositoryContentService(session, Client()),
+            profile,
+            ledger_planning_enabled=True,
+        ).pin_snapshot(
+            planned_attempt.lease,
+            planning_snapshot,
+            cursor,
+            worker_id="github-worker",
+            now=later,
+        )
+        session.commit()
+    with factory() as session:
+        planning_snapshot = GitHubStagedSynchronizationService(
+            session,
+            _execution(session, later),
+            GitHubRepositoryContentService(session, Client()),
+            profile,
+            ledger_planning_enabled=True,
+        ).snapshot(
+            planned_attempt.lease,
+            planned_attempt.sync_run_id,
+            worker_id="github-worker",
+        )
+        session.rollback()
+    assert {row.chunk_id for row in _search(factory, organization_id, user_id)} == old_ids
+
+    retained_entry = GitHubRepositoryEntry(
+        connector_id,
+        scope_id,
+        501,
+        "github:repository:501",
+        pinned.commit_object_id,
+        pinned.root_tree_object_id,
+        pinned.root_tree_object_id,
+        retained_path.rsplit("/", 1)[-1],
+        retained_path,
+        "regular_blob",
+        "f" * 40,
+        len(b"new retained content"),
+        False,
+    )
+    terminal = replace(
+        cursor,
+        frames=(),
+        totals=GitHubRunBudget(entries_examined=1),
+        scan_complete=True,
+    )
+    with factory() as session:
+        result = GitHubStagedSynchronizationService(
+            session,
+            _execution(session, later),
+            GitHubRepositoryContentService(session, Client()),
+            profile,
+            ledger_planning_enabled=True,
+        ).persist_planning_batch(
+            planned_attempt.lease,
+            planning_snapshot,
+            GitHubDiscoveryBatch(
+                (GitHubDiscoveredFile(retained_entry, cursor, terminal, None),),
+                terminal,
+                1,
+                1,
+            ),
+            worker_id="github-worker",
+            now=later,
+        )
+        assert result.outcome == "completed"
+        generation = session.scalar(
+            select(ConnectorSyncGeneration).where(
+                ConnectorSyncGeneration.sync_job_id == planned_attempt.lease.job_id
+            )
+        )
+        assert generation is not None and generation.manifest_schema_version == 2
+        new_generation_id = generation.id
+        session.commit()
+    assert {row.chunk_id for row in _search(factory, organization_id, user_id)} == old_ids
+
+    _stage_work_item(
+        factory,
+        organization_id,
+        new_generation_id,
+        worker_id="ledger-worker",
+        now=later,
+        content="new retained content",
+    )
+    assert {row.chunk_id for row in _search(factory, organization_id, user_id)} == old_ids
+
+    promotion_session = factory()
+    try:
+        repository = ConnectorSyncWorkLedgerRepository(promotion_session)
+        generation = promotion_session.get(ConnectorSyncGeneration, new_generation_id)
+        assert generation is not None
+        promoted = repository.project_citations_and_promote_generation(
+            _generation_promotion_request(generation),
+            _citation_projection_profile(profile),
+            now=later + timedelta(minutes=1),
+        )
+        assert promoted.promoted
+        # A separate reader still sees the complete prior committed authority.
+        assert {
+            row.chunk_id for row in _search(factory, organization_id, user_id)
+        } == old_ids
+        promotion_session.commit()
+    finally:
+        promotion_session.close()
+
+    after = _search(factory, organization_id, user_id)
+    assert len(after) == 1
+    assert after[0].chunk_text == "new retained content"
+    assert after[0].source_document_key == (
+        f"github:repository:501:path:{retained_path}"
+    )
+    assert after[0].chunk_id not in old_ids
+
+    with factory() as session:
+        generation = session.get(ConnectorSyncGeneration, new_generation_id)
+        assert generation is not None
+        request = _generation_reconciliation_request(generation)
+        service = GitHubSyncGenerationReconciliationService(
+            ConnectorSyncWorkLedgerRepository(session), enabled=True
+        )
+        reconciled = service.reconcile(
+            request, now=later + timedelta(minutes=2), limit=1
+        )
+        session.commit()
+        assert reconciled.completed
+        assert (
+            reconciled.memberships_retired,
+            reconciled.sources_retired,
+            reconciled.documents_retired,
+        ) == (1, 1, 1)
+        replayed = service.reconcile(
+            request, now=later + timedelta(minutes=3), limit=1
+        )
+        session.commit()
+        assert replayed.replayed
+        assert (
+            replayed.total_memberships_retired,
+            replayed.total_sources_retired,
+            replayed.total_documents_retired,
+        ) == (1, 1, 1)
+
+        activations = session.scalars(
+            select(ConnectorSyncGenerationActivation).order_by(
+                ConnectorSyncGenerationActivation.activated_at
+            )
+        ).all()
+        assert [(row.generation_id, row.status) for row in activations] == [
+            (historical.generation_id, "retired"),
+            (new_generation_id, "active"),
+        ]
+        removed = session.scalar(
+            select(SourceItem).where(
+                SourceItem.source_item_key
+                == f"github:repository:501:path:{removed_path}"
+            )
+        )
+        assert removed is not None and removed.status == "deleted"
+        assert session.scalar(
+            select(func.count()).select_from(DocumentVersion).where(
+                DocumentVersion.source_item_id == removed.id,
+                DocumentVersion.version_cause == "tombstone",
+            )
+        ) == 1
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncGenerationObservation)
+        ) == 3
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncFileMaterialization)
+        ) == 3
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncFileMaterializationChunk)
+        ) == 3
+
+    final = _search(factory, organization_id, user_id)
+    assert [(row.chunk_id, row.chunk_text) for row in final] == [
+        (after[0].chunk_id, "new retained content")
+    ]

@@ -174,7 +174,16 @@ def _activate_staged_generation(session: Session, org: UUID, path: dict[str, UUI
     ).scalar_one()
     session.execute(text("UPDATE connectors SET connector_type='github' WHERE id=:id"), {"id": path["connector"]})
     session.execute(text("UPDATE documents SET source_type='github',source_document_key=:key WHERE id=:id"), {"id": path["document"], "key": source_key})
-    session.execute(text("UPDATE document_versions SET provider_version_id=:blob,content_checksum=:checksum,checksum_algorithm='sha256' WHERE id=:id"), {"id": path["version"], "blob": blob, "checksum": checksum})
+    session.execute(
+        text(
+            "UPDATE document_versions SET provider_version_id=:blob,"
+            "content_checksum=:checksum,checksum_algorithm='sha256',"
+            "metadata=jsonb_build_object('provider','github',"
+            "'commit_object_id',CAST(:commit AS varchar),"
+            "'blob_object_id',CAST(:blob AS varchar)) WHERE id=:id"
+        ),
+        {"id": path["version"], "blob": blob, "checksum": checksum, "commit": commit},
+    )
     session.execute(text("UPDATE connector_scopes SET external_scope_key='github:repository:123' WHERE id=:id"), {"id": path["scope"]})
     session.execute(text("""UPDATE source_items
         SET source_version=:blob,source_checksum=:checksum,
@@ -244,6 +253,39 @@ def _activate_staged_generation(session: Session, org: UUID, path: dict[str, UUI
          "generation": generation, "commit": commit, "profile": profile, "now": NOW})
     session.flush()
     return chunk, generation, activation
+
+
+def _activate_shared_source_in_second_scope(
+    session: Session, org: UUID, user: UUID, path: dict[str, UUID]
+):
+    space, scope, job, generation, work, materialization, chunk, activation = (
+        uuid.uuid4() for _ in range(8)
+    )
+    version, state = uuid.uuid4(), uuid.uuid4()
+    repository = "github:repository:456"
+    commit, tree, blob, checksum = "7" * 40, "8" * 40, "9" * 40, "a" * 64
+    source_key = session.execute(
+        text("SELECT source_item_key FROM source_items WHERE id=:source"),
+        {"source": path["source"]},
+    ).scalar_one()
+    profile = session.execute(
+        text("SELECT profile_fingerprint FROM document_indexing_states WHERE document_version_id=:version"),
+        {"version": path["version"]},
+    ).scalar_one()
+    _exec(session, "INSERT INTO knowledge_spaces (id,organization_id,name,slug,status) VALUES (:id,:org,'Second active ledger scope',:slug,'active')", id=space, org=org, slug=f"space-{space}")
+    _exec(session, "INSERT INTO connector_scopes (id,organization_id,connector_id,knowledge_space_id,display_name,slug,scope_type,external_scope_key,access_mode,status) VALUES (:id,:org,:connector,:space,'Second scope',:slug,'repository',:repository,'platform_managed','active')", id=scope, org=org, connector=path["connector"], space=space, slug=f"scope-{scope}", repository=repository)
+    _exec(session, "INSERT INTO source_item_scope_memberships (id,organization_id,connector_id,source_item_id,connector_scope_id,status,first_discovered_at,last_seen_at) VALUES (:id,:org,:connector,:source,:scope,'active',:now,:now)", id=uuid.uuid4(), org=org, connector=path["connector"], source=path["source"], scope=scope, now=NOW)
+    _grant(session, org, user, space)
+    _exec(session, "INSERT INTO document_versions (id,organization_id,connector_id,source_item_id,version_number,provider_version_id,content_checksum,checksum_algorithm,version_cause,lifecycle,is_current,discovered_at,metadata) VALUES (:id,:org,:connector,:source,2,:blob,:checksum,'sha256','content_changed','available',false,:now,jsonb_build_object('provider','github','commit_object_id',CAST(:commit AS varchar),'blob_object_id',CAST(:blob AS varchar)))", id=version, org=org, connector=path["connector"], source=path["source"], blob=blob, checksum=checksum, commit=commit, now=NOW)
+    _exec(session, "INSERT INTO document_indexing_states (id,organization_id,document_version_id,extraction_profile,extraction_version,chunking_profile,chunking_version,embedding_provider,embedding_model,embedding_dimensions,profile_fingerprint,desired_generation,indexed_generation,status,reason,attempt_count,requested_at,started_at,completed_at) VALUES (:id,:org,:version,'default','v1','deterministic','v1','openai',:model,1536,:profile,1,1,'indexed','content_changed',0,:now,:now,:now)", id=state, org=org, version=version, model=MODEL, profile=profile, now=NOW)
+    _exec(session, "INSERT INTO connector_sync_jobs (id,organization_id,connector_id,connector_scope_id,mode,trigger_type,status,attempt_count,fencing_token,next_attempt_at,completed_at,created_at,updated_at) VALUES (:id,:org,:connector,:scope,'incremental','manual','succeeded',1,1,NULL,:now,:now,:now)", id=job, org=org, connector=path["connector"], scope=scope, now=NOW)
+    _exec(session, "INSERT INTO connector_sync_generations (id,organization_id,connector_id,connector_scope_id,sync_job_id,provider_key,repository_identity,branch_name,commit_object_id,root_tree_object_id,profile_fingerprint,status,discovery_complete,discovery_completed_at,reconciliation_eligible,resync_required,items_discovered,items_registered,declared_bytes,created_at,updated_at,terminal_at) VALUES (:id,:org,:connector,:scope,:job,'github',:repository,'main',:commit,:tree,:profile,'completed',true,:now,false,false,1,1,10,:now,:now,:now)", id=generation, org=org, connector=path["connector"], scope=scope, job=job, repository=repository, commit=commit, tree=tree, profile=profile, now=NOW)
+    _exec(session, "INSERT INTO connector_sync_file_work_items (id,organization_id,connector_id,connector_scope_id,generation_id,source_item_key,source_key_hash,repository_path,provider_blob_id,provider_revision_id,profile_fingerprint,status,attempt_count,max_attempts,fencing_token,downloaded_bytes,extracted_characters,chunk_count,embedding_batch_count,created_at,updated_at,terminal_at) VALUES (:id,:org,:connector,:scope,:generation,:key,:hash,'file.md',:blob,:commit,:profile,'succeeded',1,3,1,10,10,1,1,:now,:now,:now)", id=work, org=org, connector=path["connector"], scope=scope, generation=generation, key=source_key, hash="b" * 64, blob=blob, commit=commit, profile=profile, now=NOW)
+    _exec(session, "INSERT INTO connector_sync_file_materializations (id,organization_id,connector_id,connector_scope_id,generation_id,work_item_id,repository_identity,branch_name,root_tree_object_id,source_item_key,source_key_hash,repository_path,provider_blob_id,provider_revision_id,profile_fingerprint,content_checksum,title,mime_type,embedding_model,chunk_count,created_at) VALUES (:id,:org,:connector,:scope,:generation,:work,:repository,'main',:tree,:key,:hash,'file.md',:blob,:commit,:profile,:checksum,'Second staged','text/markdown',:model,1,:now)", id=materialization, org=org, connector=path["connector"], scope=scope, generation=generation, work=work, repository=repository, tree=tree, key=source_key, hash="b" * 64, blob=blob, commit=commit, profile=profile, checksum=checksum, model=MODEL, now=NOW)
+    _exec(session, "INSERT INTO connector_sync_file_materialization_chunks (id,organization_id,generation_id,materialization_id,chunk_index,chunk_text,content_hash,embedding,embedding_model,created_at) VALUES (:id,:org,:generation,:materialization,0,'second-activated-ledger-chunk',:hash,CAST(:embedding AS vector),:model,:now)", id=chunk, org=org, generation=generation, materialization=materialization, hash="c" * 64, embedding="[" + ",".join(str(v) for v in _vector(0.8, 0.2)) + "]", model=MODEL, now=NOW)
+    _exec(session, "INSERT INTO connector_sync_generation_activations (id,organization_id,connector_id,connector_scope_id,generation_id,repository_identity,commit_object_id,profile_fingerprint,status,activated_at,created_at,updated_at) VALUES (:id,:org,:connector,:scope,:generation,:repository,:commit,:profile,'active',:now,:now,:now)", id=activation, org=org, connector=path["connector"], scope=scope, generation=generation, repository=repository, commit=commit, profile=profile, now=NOW)
+    session.flush()
+    return {"space": space, "scope": scope, "version": version, "chunk": chunk, "activation": activation}
 
 
 @pytest.mark.parametrize("grant_kind", ["organization", "department", "team", "user"])
@@ -432,6 +474,221 @@ def test_atomic_activation_switches_one_scope_without_mixing_legacy_chunks(sessi
     assert len([row for row in after if row.connector_scope_id == activated["scope"]]) == 1
     denied_user = _user_without_grant(session, org)
     assert _search(session, org, denied_user) == ()
+
+
+def test_activated_retrieval_honors_real_grant_revocation_and_lifecycle(session: Session):
+    org, user = _tenant(session, "LedgerRevocation")
+    path = _content_path(
+        session, org, mode="platform_managed", chunk_vector=_vector(1.0)
+    )
+    _grant(session, org, user, path["space"])
+    staged_chunk, _generation, activation = _activate_staged_generation(
+        session, org, path
+    )
+    session.flush()
+    assert [row.chunk_id for row in _search(session, org, user)] == [staged_chunk]
+
+    session.execute(
+        text(
+            "UPDATE knowledge_space_user_grants SET revoked_at=:now "
+            "WHERE organization_id=:org AND knowledge_space_id=:space AND user_id=:user"
+        ),
+        {"now": NOW, "org": org, "space": path["space"], "user": user},
+    )
+    session.flush()
+    assert _search(session, org, user) == ()
+
+    session.execute(
+        text(
+            "UPDATE knowledge_space_user_grants SET revoked_at=NULL "
+            "WHERE organization_id=:org AND knowledge_space_id=:space AND user_id=:user"
+        ),
+        {"org": org, "space": path["space"], "user": user},
+    )
+    lifecycle_changes = (
+        ("UPDATE source_item_scope_memberships SET status='removed',removed_at=:now WHERE connector_scope_id=:id", path["scope"]),
+        ("UPDATE source_items SET status='unavailable' WHERE id=:id", path["source"]),
+        ("UPDATE connectors SET status='paused' WHERE id=:id", path["connector"]),
+        ("UPDATE knowledge_spaces SET status='inactive' WHERE id=:id", path["space"]),
+        ("UPDATE documents SET status='failed' WHERE id=:id", path["document"]),
+    )
+    for statement, identity in lifecycle_changes:
+        with session.begin_nested() as savepoint:
+            session.execute(text(statement), {"id": identity, "now": NOW})
+            session.flush()
+            assert _search(session, org, user) == ()
+            savepoint.rollback()
+        assert [row.chunk_id for row in _search(session, org, user)] == [staged_chunk]
+
+    session.execute(
+        text(
+            "UPDATE connector_sync_generation_activations "
+            "SET status='retired',retired_at=:now WHERE id=:id"
+        ),
+        {"id": activation, "now": NOW},
+    )
+    session.flush()
+    retired_results = _search(session, org, user)
+    assert [row.chunk_id for row in retired_results] == [path["chunk"]]
+    assert staged_chunk not in {row.chunk_id for row in retired_results}
+
+
+def test_activated_retrieval_uses_exact_historical_version_and_rejects_duplicate(
+    session: Session,
+):
+    org, user = _tenant(session, "LedgerHistoricalVersion")
+    path = _content_path(
+        session, org, mode="platform_managed", chunk_vector=_vector(1.0)
+    )
+    _grant(session, org, user, path["space"])
+    staged_chunk, generation, _activation = _activate_staged_generation(
+        session, org, path
+    )
+    session.execute(
+        text("UPDATE document_versions SET is_current=false WHERE id=:id"),
+        {"id": path["version"]},
+    )
+    session.flush()
+    result = _search(session, org, user)
+    assert [(row.chunk_id, row.document_version_id) for row in result] == [
+        (staged_chunk, path["version"])
+    ]
+
+    identity = session.execute(
+        text(
+            "SELECT provider_version_id,content_checksum,metadata,connector_id,source_item_id "
+            "FROM document_versions WHERE id=:id"
+        ),
+        {"id": path["version"]},
+    ).mappings().one()
+    duplicate = uuid.uuid4()
+    session.execute(
+        text(
+            "INSERT INTO document_versions "
+            "(id,organization_id,connector_id,source_item_id,version_number,"
+            "provider_version_id,content_checksum,checksum_algorithm,version_cause,"
+            "lifecycle,is_current,discovered_at,metadata) VALUES "
+            "(:id,:org,:connector,:source,2,:blob,:checksum,'sha256',"
+            "'content_changed','available',false,:now,CAST(:metadata AS jsonb))"
+        ),
+        {
+            "id": duplicate,
+            "org": org,
+            "connector": identity["connector_id"],
+            "source": identity["source_item_id"],
+            "blob": identity["provider_version_id"],
+            "checksum": identity["content_checksum"],
+            "now": NOW,
+            "metadata": __import__("json").dumps(identity["metadata"]),
+        },
+    )
+    profile = session.execute(
+        text("SELECT profile_fingerprint FROM connector_sync_generations WHERE id=:id"),
+        {"id": generation},
+    ).scalar_one()
+    session.execute(
+        text(
+            "INSERT INTO document_indexing_states "
+            "(id,organization_id,document_version_id,extraction_profile,extraction_version,"
+            "chunking_profile,chunking_version,embedding_provider,embedding_model,"
+            "embedding_dimensions,profile_fingerprint,desired_generation,indexed_generation,"
+            "status,reason,attempt_count,requested_at,started_at,completed_at) VALUES "
+            "(:id,:org,:version,'default','v1','deterministic','v1','openai',:model,"
+            "1536,:profile,1,1,'indexed','content_changed',0,:now,:now,:now)"
+        ),
+        {
+            "id": uuid.uuid4(), "org": org, "version": duplicate,
+            "model": MODEL, "profile": profile, "now": NOW,
+        },
+    )
+    session.flush()
+    assert _search(session, org, user) == ()
+
+
+def test_activated_retrieval_ignores_fabricated_mutable_version_document_link(
+    session: Session,
+):
+    org, user = _tenant(session, "LedgerCitationLink")
+    path = _content_path(
+        session, org, mode="platform_managed", chunk_vector=_vector(1.0)
+    )
+    unrelated = _content_path(
+        session, org, mode="platform_managed", chunk_vector=_vector(0.8, 0.2)
+    )
+    _grant(session, org, user, path["space"])
+    staged_chunk, _generation, _activation = _activate_staged_generation(
+        session, org, path
+    )
+    session.flush()
+    assert [row.chunk_id for row in _search(session, org, user)] == [staged_chunk]
+
+    session.execute(
+        text(
+            "DELETE FROM document_version_documents "
+            "WHERE organization_id=:org "
+            "AND (document_version_id IN (:version,:other_version) "
+            "OR document_id=:other_document)"
+        ),
+        {
+            "org": org,
+            "version": path["version"],
+            "other_version": unrelated["version"],
+            "other_document": unrelated["document"],
+        },
+    )
+    _exec(
+        session,
+        "INSERT INTO document_version_documents "
+        "(id,organization_id,document_version_id,document_id) "
+        "VALUES (:id,:org,:version,:document)",
+        id=uuid.uuid4(),
+        org=org,
+        version=path["version"],
+        document=unrelated["document"],
+    )
+    session.flush()
+    result = _search(session, org, user)
+    assert [(row.chunk_id, row.document_id, row.document_version_id) for row in result] == [
+        (staged_chunk, path["document"], path["version"])
+    ]
+    assert result[0].document_id != unrelated["document"]
+
+
+def test_two_activated_scopes_sharing_source_keep_distinct_immutable_citations(
+    session: Session,
+):
+    org, user = _tenant(session, "TwoActivatedScopes")
+    first = _content_path(
+        session, org, mode="platform_managed", chunk_vector=_vector(1.0)
+    )
+    _grant(session, org, user, first["space"])
+    first_chunk, _generation, _activation = _activate_staged_generation(
+        session, org, first
+    )
+    second = _activate_shared_source_in_second_scope(session, org, user, first)
+
+    results = _search(session, org, user, limit=10)
+    identities = {
+        (row.connector_scope_id, row.document_version_id, row.chunk_id)
+        for row in results
+    }
+    assert identities == {
+        (first["scope"], first["version"], first_chunk),
+        (second["scope"], second["version"], second["chunk"]),
+    }
+    assert first["chunk"] not in {row.chunk_id for row in results}
+
+    session.execute(
+        text(
+            "UPDATE knowledge_space_user_grants SET revoked_at=:now "
+            "WHERE organization_id=:org AND knowledge_space_id=:space AND user_id=:user"
+        ),
+        {"now": NOW, "org": org, "space": first["space"], "user": user},
+    )
+    session.flush()
+    after_revoke = _search(session, org, user, limit=10)
+    assert [row.connector_scope_id for row in after_revoke] == [second["scope"]]
+    assert after_revoke[0].chunk_id == second["chunk"]
 
 
 def test_activation_attribution_drift_fails_closed_without_legacy_fallback(

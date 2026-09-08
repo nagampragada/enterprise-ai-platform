@@ -212,18 +212,23 @@ authorized_paths AS (
             AND (e.expires_at IS NULL OR e.expires_at > CURRENT_TIMESTAMP)
        ))
 ),
-authorized_sources AS (
-    SELECT DISTINCT ON (source_item_id) source_item_id, connector_scope_id,
-           knowledge_space_id, connector_id, external_scope_key, source_item_key,
-           source_version, source_checksum, source_metadata
-    FROM authorized_paths
-    ORDER BY source_item_id, connector_scope_id
-),
 active_ledger_scopes AS (
     SELECT organization_id, connector_id, connector_scope_id, generation_id,
            repository_identity, commit_object_id, profile_fingerprint
     FROM connector_sync_generation_activations
     WHERE organization_id = :organization_id AND status = 'active'
+),
+legacy_authorized_sources AS (
+    SELECT DISTINCT ON (source_item_id) source_item_id, connector_scope_id,
+           knowledge_space_id, connector_id, external_scope_key, source_item_key,
+           source_version, source_checksum, source_metadata
+    FROM authorized_paths a
+    WHERE NOT EXISTS (
+        SELECT 1 FROM active_ledger_scopes als
+        WHERE als.connector_id = a.connector_id
+          AND als.connector_scope_id = a.connector_scope_id
+    )
+    ORDER BY source_item_id, connector_scope_id
 ),
 legacy_authorized_chunks AS (
     SELECT dc.id AS chunk_id, dc.document_id, dv.id AS document_version_id,
@@ -231,7 +236,7 @@ legacy_authorized_chunks AS (
            dc.chunk_index, dc.chunk_text, d.title AS document_title,
            d.source_type, d.source_document_key, dc.embedding_model,
            dc.embedding <=> CAST(:query_embedding AS vector) AS distance
-    FROM authorized_sources a
+    FROM legacy_authorized_sources a
     JOIN document_versions dv ON dv.organization_id = :organization_id
       AND dv.source_item_id = a.source_item_id AND dv.is_current AND dv.lifecycle = 'available'
     JOIN document_version_documents dvd ON dvd.organization_id = dv.organization_id
@@ -240,11 +245,7 @@ legacy_authorized_chunks AS (
       AND d.status = 'ready' AND d.deleted_at IS NULL
     JOIN document_chunks dc ON dc.organization_id = d.organization_id AND dc.document_id = d.id
       AND dc.embedding IS NOT NULL AND dc.embedding_model = :embedding_model
-    WHERE NOT EXISTS (
-        SELECT 1 FROM active_ledger_scopes als
-        WHERE als.connector_id = a.connector_id
-          AND als.connector_scope_id = a.connector_scope_id
-    ) AND EXISTS (
+    WHERE EXISTS (
         SELECT 1 FROM document_indexing_states dis
         WHERE dis.organization_id = dv.organization_id
           AND dis.document_version_id = dv.id AND dis.status = 'indexed'
@@ -259,7 +260,7 @@ ledger_authorized_chunks AS (
            smc.chunk_index, smc.chunk_text, d.title AS document_title,
            d.source_type, d.source_document_key, smc.embedding_model,
            smc.embedding <=> CAST(:query_embedding AS vector) AS distance
-    FROM authorized_sources a
+    FROM authorized_paths a
     JOIN active_ledger_scopes als ON als.connector_id = a.connector_id
       AND als.connector_scope_id = a.connector_scope_id
     JOIN connector_sync_generations sg ON sg.organization_id = :organization_id
@@ -279,12 +280,6 @@ ledger_authorized_chunks AS (
       AND sm.repository_identity = sg.repository_identity
       AND sm.provider_revision_id = sg.commit_object_id
       AND sm.source_item_key = a.source_item_key
-      AND sm.provider_blob_id = a.source_version
-      AND sm.content_checksum = a.source_checksum
-      AND a.source_metadata->>'repository_identity' = sg.repository_identity
-      AND a.source_metadata->>'repository_path' = sm.repository_path
-      AND a.source_metadata->>'blob_object_id' = sm.provider_blob_id
-      AND a.source_metadata->>'snapshot_commit_id' = sg.commit_object_id
     JOIN connector_sync_file_materialization_chunks smc
       ON smc.organization_id = sm.organization_id
       AND smc.generation_id = sm.generation_id
@@ -293,13 +288,42 @@ ledger_authorized_chunks AS (
       AND smc.embedding_model = sm.embedding_model
       AND smc.embedding_model = :embedding_model
     JOIN document_versions dv ON dv.organization_id = :organization_id
+      AND dv.connector_id = sg.connector_id
       AND dv.source_item_id = a.source_item_id
       AND dv.provider_version_id = sm.provider_blob_id
       AND dv.content_checksum = sm.content_checksum
-      AND dv.is_current AND dv.lifecycle = 'available'
-    JOIN document_version_documents dvd ON dvd.organization_id = dv.organization_id
-      AND dvd.document_version_id = dv.id
-    JOIN documents d ON d.organization_id = dvd.organization_id AND d.id = dvd.document_id
+      AND dv.lifecycle = 'available'
+      AND dv.metadata ->> 'provider' = 'github'
+      AND dv.metadata ->> 'commit_object_id' = sg.commit_object_id
+      AND dv.metadata ->> 'blob_object_id' = sm.provider_blob_id
+      AND dv.id = (
+          SELECT dv2.id
+          FROM document_versions dv2
+          WHERE dv2.organization_id = dv.organization_id
+            AND dv2.source_item_id = dv.source_item_id
+            AND dv2.provider_version_id = sm.provider_blob_id
+            AND dv2.content_checksum = sm.content_checksum
+            AND dv2.lifecycle = 'available'
+            AND dv2.metadata ->> 'provider' = 'github'
+            AND dv2.metadata ->> 'commit_object_id' = sg.commit_object_id
+            AND dv2.metadata ->> 'blob_object_id' = sm.provider_blob_id
+          ORDER BY dv2.version_number DESC, dv2.id DESC
+          LIMIT 1
+      )
+      AND 1 = (
+          SELECT count(*)
+          FROM document_versions dv3
+          WHERE dv3.organization_id = dv.organization_id
+            AND dv3.connector_id = dv.connector_id
+            AND dv3.source_item_id = dv.source_item_id
+            AND dv3.provider_version_id = sm.provider_blob_id
+            AND dv3.content_checksum = sm.content_checksum
+            AND dv3.lifecycle = 'available'
+            AND dv3.metadata ->> 'provider' = 'github'
+            AND dv3.metadata ->> 'commit_object_id' = sg.commit_object_id
+            AND dv3.metadata ->> 'blob_object_id' = sm.provider_blob_id
+      )
+    JOIN documents d ON d.organization_id = dv.organization_id
       AND d.status = 'ready' AND d.deleted_at IS NULL
       AND d.source_type = 'github' AND d.source_document_key = sm.source_item_key
     WHERE EXISTS (

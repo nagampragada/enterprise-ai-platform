@@ -1179,6 +1179,137 @@ class GitHubStagedSynchronizationService:
             target.phase,
         )
 
+    def persist_planning_batch(
+        self,
+        lease: SyncJobLease,
+        snapshot: GitHubSynchronizationSnapshot,
+        batch: GitHubDiscoveryBatch,
+        *,
+        worker_id: str,
+        now: datetime,
+    ) -> GitHubPersistenceOutcome:
+        """Durably advance only the immutable ledger discovery projection."""
+        if not self._ledger_planning_enabled or self._planner is None:
+            raise InvalidGitHubStagedSynchronizationRequest(
+                "GitHub ledger planning is disabled"
+            )
+        self._execution.validate_attempt(
+            lease, snapshot.sync_run_id, worker_id=worker_id
+        )
+        _require_persistence_time(snapshot, now)
+        self._require_context(snapshot)
+        if (
+            not isinstance(batch, GitHubDiscoveryBatch)
+            or snapshot.cursor is None
+            or batch.cursor_after.snapshot != snapshot.cursor.snapshot
+            or len(batch.files) > HARD_MAX_FILES
+        ):
+            raise InvalidGitHubStagedSynchronizationRequest(
+                "GitHub planning batch is invalid"
+            )
+        for discovered in batch.files:
+            _validate_discovered_file(discovered, snapshot.cursor.snapshot)
+        if self._scopes.lock_by_id(
+            lease.organization_id, lease.connector_scope_id
+        ) is None:
+            raise StalePreparedGitHubBatch("GitHub planning scope is unavailable")
+        current_row = self._sync.get_active_cursor(
+            lease.organization_id,
+            lease.connector_id,
+            lease.connector_scope_id,
+            lock=True,
+        )
+        if (
+            current_row is None
+            or current_row.created_by_run_id != snapshot.sync_run_id
+            or current_row.cursor_type != CURSOR_TYPE
+            or current_row.safe_cursor is None
+        ):
+            raise StalePreparedGitHubBatch("GitHub planning cursor is unavailable")
+        current = GitHubTraversalCursor.from_safe_json(
+            current_row.safe_cursor,
+            connector_id=lease.connector_id,
+            scope_id=lease.connector_scope_id,
+        )
+        if current != snapshot.cursor:
+            raise StalePreparedGitHubBatch("GitHub planning cursor is stale")
+        eligible_bytes = sum(
+            discovered.entry.size_bytes or 0
+            for discovered in batch.files
+            if discovered.skip_reason is None
+        )
+        target = replace(
+            batch.cursor_after,
+            totals=replace(
+                batch.cursor_after.totals,
+                supported_files=current.totals.supported_files + len(batch.files),
+                downloaded_bytes=current.totals.downloaded_bytes + eligible_bytes,
+            ),
+        )
+        _enforce_run_totals(target.totals)
+        _require_forward_progress(current, target, bool(batch.files))
+
+        self._planner.register_manifest_batch(
+            organization_id=lease.organization_id,
+            connector_id=lease.connector_id,
+            connector_scope_id=lease.connector_scope_id,
+            sync_job_id=lease.job_id,
+            authorization=snapshot.authorization,
+            snapshot=current.snapshot,
+            profile_fingerprint=snapshot.profile.fingerprint,
+            entries=tuple(discovered.entry for discovered in batch.files),
+            now=now,
+        )
+        completed = target.scan_complete
+        if completed:
+            target = replace(
+                target,
+                phase="reconciliation",
+                authoritative_traversal_complete=True,
+                reconciliation_cursor=None,
+                reconciled_items=0,
+                reconciliation_batches=0,
+                reconciliation_started_at=now,
+                completion_marker=False,
+            )
+            self._planner.mark_discovery_complete(
+                organization_id=lease.organization_id,
+                connector_id=lease.connector_id,
+                connector_scope_id=lease.connector_scope_id,
+                sync_job_id=lease.job_id,
+                authorization=snapshot.authorization,
+                snapshot=target.snapshot,
+                profile_fingerprint=snapshot.profile.fingerprint,
+                now=now,
+            )
+        self._replace_cursor(snapshot, target, current_row, now)
+        if completed:
+            run = self._sync.get_run(
+                lease.organization_id,
+                lease.connector_id,
+                lease.connector_scope_id,
+                snapshot.sync_run_id,
+            )
+            if run is None or run.status != "running" or run.started_at is None:
+                raise StalePreparedGitHubBatch("GitHub synchronization run is unavailable")
+            self._sync.set_run_state(
+                lease.organization_id,
+                lease.connector_id,
+                lease.connector_scope_id,
+                snapshot.sync_run_id,
+                status="completed",
+                started_at=run.started_at,
+                heartbeat_at=now,
+                finished_at=now,
+            )
+            self._execution.complete_success(lease, worker_id=worker_id)
+        return GitHubPersistenceOutcome(
+            "completed" if completed else "in_progress",
+            len(batch.files),
+            completed,
+            "planning_complete" if completed else target.phase,
+        )
+
     def reconcile(
         self,
         lease: SyncJobLease,

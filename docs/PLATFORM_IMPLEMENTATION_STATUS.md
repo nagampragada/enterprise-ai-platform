@@ -449,13 +449,23 @@ intent, and a read-only all-terminal barrier. Real-PostgreSQL tests cover 32
 concurrent claimers, tenant isolation, stale mutation rejection, index plans,
 and a 10,000-item synthetic workload.
 
-The worker now has an optional shadow-planning integration. The strictly parsed
-`GITHUB_SYNC_LEDGER_PLANNING_ENABLED` flag defaults to false; disabled mode makes
-no ledger calls or writes. Enabled GitHub runs bind one generation to the legacy
-cursor's single pinned commit/tree/profile, register supported file metadata in
-short idempotent batches, and mark discovery complete only with the cursor's
-durable transition to reconciliation. Cancellation is checked between batches,
-and interruption replays from the existing cursor without duplicating work.
+The dedicated planner host now owns optional ledger-only discovery. The strictly
+parsed `GITHUB_SYNC_LEDGER_PLANNING_ENABLED` flag defaults to false; disabled
+mode composes no GitHub or ledger service and claims nothing. Enabled runs bind
+one generation to an immutable commit/tree/profile, atomically register complete
+version-2 observation/work batches with cursor progress, and complete discovery
+and the synchronization job only after tree exhaustion. It never performs
+legacy persistence/reconciliation, blob download, extraction, embedding,
+processing, promotion, or Slice 5 reconciliation, and it does not require an
+OpenAI credential. Interruption leaves durable resumable non-authoritative state.
+One planner execution is additionally bounded to 5,000 committed batches or
+20 minutes by default (hard maxima 100,000 and 3,600 seconds). Reaching either
+limit reports resumable rather than complete. With the planning flag true, the
+legacy connector host is Local-Folder-only and the dedicated host is GitHub-only;
+because deployed templates have independent environments, both must carry the
+same true flag before concurrent execution, or the legacy host must remain idle.
+A legacy template at false retains its historical GitHub claim route. Lease,
+fence, cancellation, and retry authority remain database-backed.
 
 Migration `20260831_000021` adds retrieval-isolated materialization and chunk
 tables for the default-off Phase 3 processor. When
@@ -463,9 +473,20 @@ tables for the default-off Phase 3 processor. When
 eligible GitHub file is claimed, fetched by its pinned blob, extracted, chunked,
 embedded, and atomically staged with fenced work completion. The staging schema
 has no mutable legacy source/document/version/indexing/chunk relationship.
-Slice 4 validates stable legacy citation identities and exposes staged chunks
-only through one active tenant/scope generation; unpromoted output remains
-absent from permission-aware results. Slice 5 records all observed non-tree
+Slice 4 can provider-freely project the exact staged source/membership/version/
+indexing/document/chunk citation graph and promote it in one savepoint-protected
+caller-owned transaction. Old retrieval stays authoritative until commit;
+activated retrieval preserves the full tenant/user/grant/space/connector/scope/
+membership authorization gates and binds exactly one historical version to the
+generation commit, staged blob/checksum, GitHub attribution, profile, document,
+and materialization. The mutable current `document_version_documents` pointer
+cannot redirect the organization-unique canonical GitHub document and is not
+required for retained historical activation. Active-scope branching happens before legacy source
+deduplication, so two activated shared scopes remain independent and an active
+scope cannot hide a separate authorized legacy scope. Invalid active state fails
+closed without legacy fallback; a retired activation restores normal legacy
+eligibility. Unpromoted output
+remains absent from permission-aware results. Slice 5 records all observed non-tree
 paths, grants deletion authority only to a promoted all-success schema-v2
 generation, and retires absent legacy membership/source/document state in
 transactions selecting at most 500 memberships, with scope-serialized sync
@@ -499,7 +520,9 @@ expired lease keeps its original consumed turn.
 Retry-wait, cancelled, quarantined, terminal, incomplete-discovery, and
 profile-incompatible work is excluded until or unless it becomes eligible.
 Legacy synchronization ordering is unchanged. Slice 4 adds a default-off
-promotion transaction and generation-aware retrieval cutover. Slice 5 adds a
+provider-free citation-projection/promotion transaction and generation-aware
+retrieval cutover without rewriting retained legacy chunks or active shared-scope
+legacy pointers. Slice 5 adds a
 separate default-off bounded reconciliation transaction; no existing host calls
 it. Staging cleanup remains Slice 6.
 

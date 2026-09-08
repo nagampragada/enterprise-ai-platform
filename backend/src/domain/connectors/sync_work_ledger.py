@@ -468,6 +468,40 @@ class GenerationPromotionRequest:
 
 
 @dataclass(frozen=True)
+class GenerationCitationProjectionProfile:
+    """Trusted runtime profile used to project staged indexing citations."""
+
+    extraction_profile: str
+    extraction_version: str
+    chunking_profile: str
+    chunking_version: str
+    embedding_provider: str
+    embedding_model: str
+    embedding_dimensions: int
+    profile_fingerprint: str
+
+    def __post_init__(self) -> None:
+        for name, maximum in (
+            ("extraction_profile", 128),
+            ("extraction_version", 64),
+            ("chunking_profile", 128),
+            ("chunking_version", 64),
+            ("embedding_provider", 128),
+            ("embedding_model", 255),
+            ("profile_fingerprint", MAX_PROFILE_FINGERPRINT_LENGTH),
+        ):
+            _require_identifier(name, getattr(self, name), maximum)
+        if (
+            isinstance(self.embedding_dimensions, bool)
+            or not isinstance(self.embedding_dimensions, int)
+            or self.embedding_dimensions != FILE_WORK_EMBEDDING_DIMENSION
+        ):
+            raise ValueError(
+                f"embedding_dimensions must equal {FILE_WORK_EMBEDDING_DIMENSION}"
+            )
+
+
+@dataclass(frozen=True)
 class GenerationActivationView:
     activation_id: UUID
     organization_id: UUID

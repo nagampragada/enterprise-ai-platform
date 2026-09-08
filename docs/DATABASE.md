@@ -25,8 +25,21 @@ drift, budget exhaustion, or any failed batch leaves the generation
 non-authoritative. Migration defaults every historical generation to manifest
 schema version 1 and therefore manufactures no deletion authority.
 
-Promotion revalidates the complete schema-v2 observation/work projection and
-atomically marks the successful active generation as reconciliation authority.
+Promotion revalidates the complete schema-v2 observation/work projection. For
+ledger-only discovery it then projects required source, exact-scope membership,
+document version, indexing-state, and document citation identities from the
+already validated staged materialization. Staged vectors remain the activated
+retrieval payload; active retained sources keep their legacy current link and
+legacy chunks intact, including across explicit shared memberships. This provider-free
+projection and activation cutover use one scope-first, savepoint-protected,
+caller-owned transaction with no internal commit. Prior retrieval authority
+therefore remains valid at every earlier commit and for concurrent readers until
+the single cutover commit. Identical versions and indexing states are reused.
+Changed active files add a non-current immutable version for ledger citation
+without moving the global legacy pointer; new or reappearing files create only
+the required state.
+The successful active generation becomes reconciliation authority only with
+that atomic commit.
 `GitHubSyncGenerationReconciliationService` is separately gated, default-off,
 and has no automatic caller. Reconciliation locks the exact scope first,
 requires its one matching active activation, the successful source job, no
@@ -172,23 +185,38 @@ the exact `20260904_000023`/`20260905_000024` pair documented above.
 `GitHubSyncGenerationPromotionService` requires explicit
 `GITHUB_SYNC_LEDGER_PROMOTION_ENABLED=true`. The flag defaults to `false` and
 uses exact lowercase Boolean parsing. No current API, scheduler, legacy worker,
-or dedicated processing host invokes promotion automatically. Generation
+or dedicated processing/planning host invokes promotion automatically. Generation
 registration and promotion lock the tenant-qualified repository scope first,
 so creation of a newer generation cannot cross the stale-generation decision.
 Promotion then verifies the exact generation and successful source job,
 completed discovery, absence of a newer generation, all registered items
 in `succeeded`, one immutable materialization per item, complete ordered chunks,
-and matching active legacy citation/indexing identities. Pending, retrying,
+and matching staged citation/indexing inputs. `project_and_promote` can create
+the missing citation projection from immutable staged rows without a provider
+call; the original validation-only promotion remains available for an already
+projected generation. Pending, retrying,
 skipped, quarantined, failed, cancelled, missing, duplicate, stale, mismatched,
 and cross-tenant state fails closed.
 
-Permission-aware retrieval still authorizes tenant, knowledge space, scope,
-source membership, and ACLs before ranking. Without an activation it reads the
-legacy chunks. With an activation it excludes legacy chunks for that scope and
-reads only the single active generation's staged chunks; invalid activated state
-returns no rows rather than falling back. Stable citation IDs come from the
-validated current legacy projection, but promotion does not mutate legacy
-source, version, indexing, document, or chunk rows. Deletion reconciliation,
+Permission-aware retrieval still authorizes tenant, active user grant/ACL,
+active knowledge space, active connector, active membership, and exact scope
+before ranking. Legacy candidates exclude actively ledger-authoritative scopes
+before source deduplication and retain their current-version/indexing rules.
+Each activated scope instead reads only its single active generation; invalid
+active state returns no row rather than silently falling back, while a retired
+activation restores ordinary legacy eligibility because no active authority
+remains. Stable citations deliberately may identify a historical version, but
+the query requires exactly one version bound to the projected source item with
+matching GitHub provider, generation commit, staged blob and checksum, profile,
+generation-owned materialization, and the organization-unique canonical GitHub
+document key. The mutable one-to-one `document_version_documents` pointer is
+not ledger citation authority: fabricating it cannot redirect the canonical
+document, while replacing it for a later scope cannot invalidate retained
+historical authority. Multiple activated scopes sharing one source/document keep
+independent authorization paths and exact staged versions/chunks. Connector-
+scope uniqueness prevents two scopes for one connector and repository identity;
+explicit shared memberships remain permission paths and are never retired by
+projection. Deletion reconciliation,
 physical legacy retirement, staging cleanup/retention, scheduling, and API/UI
 controls remain Slices 5 and 6.
 
@@ -196,10 +224,18 @@ controls remain Slices 5 and 6.
 
 Migration `20260828_000020` adds the feature-gated `connector_sync_generations`
 and `connector_sync_file_work_items` control-plane tables. When the optional
-worker flag `GITHUB_SYNC_LEDGER_PLANNING_ENABLED=true` is set, the existing
-GitHub traversal shadows each pinned snapshot into these tables in bounded
-transactions. The flag defaults to false and accepts only lowercase `true` or
-`false`. Local Folder synchronization does not consume the ledger. A separate strict worker-only
+planner flag `GITHUB_SYNC_LEDGER_PLANNING_ENABLED=true` is set, the dedicated
+GitHub planner records each pinned snapshot and complete observation batches in
+bounded transactions without legacy writes or OpenAI configuration. The flag
+defaults to false and accepts only lowercase `true` or `false`. Local Folder
+synchronization does not consume the ledger. A planner execution defaults to
+5,000 committed batches and 20 minutes, with strict hard caps of 100,000 batches
+and 3,600 seconds; a limit stop persists only resumable non-authoritative cursor
+state. When the same planning flag is true on the legacy host, that host claims
+Local Folder jobs only. Because deployment environments are independent, an
+operator must update both worker templates consistently or keep the legacy host
+idle; a legacy host left at false still has its historical GitHub claim route.
+A separate strict worker-only
 `GITHUB_SYNC_LEDGER_PROCESSING_ENABLED=true` gate enables one-at-a-time GitHub
 file-work claiming only after discovery is complete and only when the legacy
 job queue is empty. Its default is false. The processing slice reuses the

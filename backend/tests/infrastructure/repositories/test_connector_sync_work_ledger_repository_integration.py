@@ -33,6 +33,7 @@ from domain.connectors.sync_work_ledger import (
     FileWorkMaterializationChunk,
     FileWorkStatus,
     GenerationObservationDisposition,
+    GenerationCitationProjectionProfile,
     GenerationPromotionRequest,
     GenerationReconciliationRequest,
     GenerationSourceObservation,
@@ -376,6 +377,19 @@ def _promotion_request(generation) -> GenerationPromotionRequest:
     )
 
 
+def _projection_profile(generation) -> GenerationCitationProjectionProfile:
+    return GenerationCitationProjectionProfile(
+        "github",
+        "v1",
+        "deterministic",
+        "v2",
+        "test",
+        "fake:model:1536",
+        1536,
+        generation.profile_fingerprint,
+    )
+
+
 def _reconciliation_request(generation) -> GenerationReconciliationRequest:
     return GenerationReconciliationRequest(
         generation.organization_id,
@@ -649,12 +663,17 @@ def _ready_promotion(session: Session, label: str = "Promotion"):
     session.execute(text("""INSERT INTO document_versions
         (id,organization_id,connector_id,source_item_id,version_number,provider_version_id,
          content_checksum,checksum_algorithm,source_size_bytes,content_type,file_extension,
-         version_cause,lifecycle,is_current,discovered_at)
+         version_cause,lifecycle,is_current,discovered_at,metadata)
         VALUES (:id,:org,:connector,:source,1,:blob,:checksum,'sha256',101,:mime,'.md',
-                'discovered','available',true,:now)"""), {
+                'discovered','available',true,:now,CAST(:metadata AS jsonb))"""), {
         "id": version_id, "org": context[0], "connector": context[1], "source": source_id,
         "blob": work.provider_blob_id, "checksum": materialization.content_checksum,
         "mime": work.mime_type, "now": NOW,
+        "metadata": json.dumps({
+            "provider": "github",
+            "commit_object_id": generation.commit_object_id,
+            "blob_object_id": work.provider_blob_id,
+        }),
     })
     session.execute(text("""INSERT INTO documents
         (id,organization_id,source_type,source_document_key,title,mime_type,checksum_latest,status)
@@ -2006,6 +2025,337 @@ def test_complete_generation_promotion_is_atomic_and_idempotent(engine) -> None:
         assert persisted.status.value == "completed"
 
 
+def test_projection_builds_missing_citations_and_promotes_in_one_commit(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation, _work, source_id, _version_id, document_id = (
+            _ready_promotion(session, "ProjectedPromotion")
+        )
+        session.execute(
+            text("DELETE FROM source_items WHERE organization_id=:org AND id=:id"),
+            {"org": context[0], "id": source_id},
+        )
+        session.execute(
+            text("DELETE FROM documents WHERE organization_id=:org AND id=:id"),
+            {"org": context[0], "id": document_id},
+        )
+        session.commit()
+        repository = ConnectorSyncWorkLedgerRepository(session)
+
+        result = repository.project_citations_and_promote_generation(
+            _promotion_request(generation),
+            _projection_profile(generation),
+            now=NOW + timedelta(minutes=1),
+        )
+        session.commit()
+
+        assert result.promoted is True
+        assert (result.materialization_count, result.chunk_count) == (1, 1)
+        assert session.scalar(
+            select(func.count()).select_from(SourceItem).where(
+                SourceItem.organization_id == context[0],
+                SourceItem.source_item_key == _entry(1).source_item_key,
+            )
+        ) == 1
+        assert session.scalar(
+            select(func.count()).select_from(DocumentChunk).where(
+                DocumentChunk.organization_id == context[0]
+            )
+        ) == 0
+        replay = repository.project_citations_and_promote_generation(
+            _promotion_request(generation),
+            _projection_profile(generation),
+            now=NOW + timedelta(minutes=2),
+        )
+        session.commit()
+        assert replay.promoted is False
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncGenerationActivation)
+        ) == 1
+
+
+def test_projection_failure_savepoint_prevents_partial_commit(engine, monkeypatch) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation, _work, source_id, _version_id, document_id = (
+            _ready_promotion(session, "ProjectionRollback")
+        )
+        session.execute(
+            text("DELETE FROM source_items WHERE organization_id=:org AND id=:id"),
+            {"org": context[0], "id": source_id},
+        )
+        session.execute(
+            text("DELETE FROM documents WHERE organization_id=:org AND id=:id"),
+            {"org": context[0], "id": document_id},
+        )
+        session.commit()
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        monkeypatch.setattr(
+            repository,
+            "promote_generation",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                SyncWorkLedgerConflict("forced activation failure")
+            ),
+        )
+
+        with pytest.raises(SyncWorkLedgerConflict, match="forced activation"):
+            repository.project_citations_and_promote_generation(
+                _promotion_request(generation),
+                _projection_profile(generation),
+                now=NOW + timedelta(minutes=1),
+            )
+        # The caller deliberately catches the validation error and commits.
+        session.commit()
+
+        assert session.scalar(
+            select(func.count()).select_from(SourceItem).where(
+                SourceItem.organization_id == context[0]
+            )
+        ) == 0
+        assert session.scalar(
+            select(func.count()).select_from(Document).where(
+                Document.organization_id == context[0]
+            )
+        ) == 0
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncGenerationActivation)
+        ) == 0
+
+
+def test_concurrent_projection_and_promotion_converges_without_duplicate_citations(
+    engine,
+) -> None:
+    with Session(engine, expire_on_commit=False) as setup:
+        context, generation, _work, source_id, _version_id, document_id = (
+            _ready_promotion(setup, "ConcurrentProjection")
+        )
+        setup.execute(
+            text("DELETE FROM source_items WHERE organization_id=:org AND id=:id"),
+            {"org": context[0], "id": source_id},
+        )
+        setup.execute(
+            text("DELETE FROM documents WHERE organization_id=:org AND id=:id"),
+            {"org": context[0], "id": document_id},
+        )
+        setup.commit()
+        request = _promotion_request(generation)
+        profile = _projection_profile(generation)
+
+    barrier = threading.Barrier(2)
+    outcomes: list[bool] = []
+    errors: list[BaseException] = []
+
+    def project() -> None:
+        with Session(engine) as session:
+            try:
+                barrier.wait(timeout=10)
+                result = ConnectorSyncWorkLedgerRepository(
+                    session
+                ).project_citations_and_promote_generation(
+                    request, profile, now=NOW + timedelta(minutes=1)
+                )
+                session.commit()
+                outcomes.append(result.promoted)
+            except BaseException as exc:  # pragma: no cover - asserted below
+                session.rollback()
+                errors.append(exc)
+
+    workers = [threading.Thread(target=project) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(20)
+        assert not worker.is_alive()
+
+    assert errors == []
+    assert sorted(outcomes) == [False, True]
+    with Session(engine) as verification:
+        assert verification.scalar(
+            select(func.count()).select_from(ConnectorSyncGenerationActivation)
+        ) == 1
+        assert verification.scalar(
+            select(func.count()).select_from(SourceItem).where(
+                SourceItem.organization_id == context[0]
+            )
+        ) == 1
+        assert verification.scalar(
+            select(func.count()).select_from(DocumentVersion).where(
+                DocumentVersion.organization_id == context[0]
+            )
+        ) == 1
+        assert verification.scalar(
+            select(func.count()).select_from(DocumentIndexingState).where(
+                DocumentIndexingState.organization_id == context[0]
+            )
+        ) == 1
+        assert verification.scalar(
+            select(func.count()).select_from(DocumentChunk).where(
+                DocumentChunk.organization_id == context[0]
+            )
+        ) == 0
+
+
+def test_projection_preserves_shared_membership_retrieval_and_scope_uniqueness(
+    engine,
+) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation, work, source_id, version_id, document_id = (
+            _ready_promotion(session, "SharedProjection")
+        )
+        repository = ConnectorSyncWorkLedgerRepository(session)
+
+        other_space, other_scope = uuid4(), uuid4()
+        session.execute(
+            text(
+                "INSERT INTO knowledge_spaces (id,organization_id,name,slug) "
+                "VALUES (:id,:org,'Shared',:slug)"
+            ),
+            {"id": other_space, "org": context[0], "slug": f"space-{other_space}"},
+        )
+        session.execute(
+            text(
+                """INSERT INTO connector_scopes
+                (id,organization_id,connector_id,knowledge_space_id,display_name,slug,
+                 scope_type,external_scope_key,access_mode,status)
+                VALUES (:id,:org,:connector,:space,'Shared',:slug,'repository',
+                        :key,'platform_managed','active')"""
+            ),
+            {
+                "id": other_scope,
+                "org": context[0],
+                "connector": context[1],
+                "space": other_space,
+                "slug": f"scope-{other_scope}",
+                "key": f"github:repository:{other_scope.int}",
+            },
+        )
+        session.add(
+            SourceItemScopeMembership(
+                id=uuid4(),
+                organization_id=context[0],
+                connector_id=context[1],
+                source_item_id=source_id,
+                connector_scope_id=other_scope,
+                status="active",
+                first_discovered_at=NOW,
+                last_seen_at=NOW,
+                removed_at=None,
+            )
+        )
+        legacy_chunk_id = uuid4()
+        session.add(
+            DocumentChunk(
+                id=legacy_chunk_id,
+                organization_id=context[0],
+                document_id=document_id,
+                chunk_index=0,
+                chunk_text="shared legacy content",
+                content_hash="7" * 64,
+                token_count=None,
+                embedding=[1.0] * 1536,
+                embedding_model="fake:model:1536",
+            )
+        )
+        session.commit()
+        other_user = _retrieval_user(session, context[0], other_scope)
+        assert _retrieval_chunk_ids(session, context[0], other_user) == {
+            legacy_chunk_id
+        }
+
+        # The staged generation now carries changed content. Projection for
+        # the target scope must not rewrite the global legacy current/link or
+        # chunk state observed through the independent shared scope.
+        changed_blob = "f" * 40
+        changed_checksum = "8" * 64
+        session.execute(
+            text(
+                "UPDATE connector_sync_file_work_items "
+                "SET provider_blob_id=:blob WHERE id=:work"
+            ),
+            {"blob": changed_blob, "work": work.work_item_id},
+        )
+        session.execute(
+            text(
+                "UPDATE connector_sync_file_materializations "
+                "SET provider_blob_id=:blob,content_checksum=:checksum "
+                "WHERE work_item_id=:work"
+            ),
+            {
+                "blob": changed_blob,
+                "checksum": changed_checksum,
+                "work": work.work_item_id,
+            },
+        )
+        session.execute(
+            text(
+                "UPDATE connector_sync_generation_observations "
+                "SET provider_object_id=:blob WHERE generation_id=:generation"
+            ),
+            {"blob": changed_blob, "generation": generation.generation_id},
+        )
+        session.commit()
+
+        result = repository.project_citations_and_promote_generation(
+            _promotion_request(generation),
+            _projection_profile(generation),
+            now=NOW + timedelta(minutes=1),
+        )
+        session.commit()
+        assert result.promoted is True
+        assert _retrieval_chunk_ids(session, context[0], other_user) == {
+            legacy_chunk_id
+        }
+        source = session.get(SourceItem, source_id)
+        assert source is not None
+        assert source.source_version == _entry(1).provider_blob_id
+        assert source.source_checksum == "c" * 64
+        assert session.get(DocumentVersion, version_id).is_current is True
+        assert session.scalar(
+            select(func.count()).select_from(DocumentVersion).where(
+                DocumentVersion.source_item_id == source_id
+            )
+        ) == 2
+        assert session.scalar(
+            select(func.count()).select_from(DocumentChunk).where(
+                DocumentChunk.document_id == document_id
+            )
+        ) == 1
+
+        # One connector cannot represent the same repository as two scopes;
+        # the database invariant rules out two active generations sharing this
+        # source identity while the explicit shared membership remains safe.
+        duplicate_scope = uuid4()
+        with pytest.raises(IntegrityError):
+            with session.begin_nested():
+                session.execute(
+                    text(
+                        """INSERT INTO connector_scopes
+                        (id,organization_id,connector_id,knowledge_space_id,
+                         display_name,slug,scope_type,external_scope_key,
+                         access_mode,status)
+                        VALUES (:id,:org,:connector,:space,'Duplicate',:slug,
+                                'repository',:key,'platform_managed','active')"""
+                    ),
+                    {
+                        "id": duplicate_scope,
+                        "org": context[0],
+                        "connector": context[1],
+                        "space": other_space,
+                        "slug": f"scope-{duplicate_scope}",
+                        "key": generation.repository_identity,
+                    },
+                )
+
+        replay = repository.project_citations_and_promote_generation(
+            _promotion_request(generation),
+            _projection_profile(generation),
+            now=NOW + timedelta(minutes=2),
+        )
+        session.commit()
+        assert replay.promoted is False
+        assert _retrieval_chunk_ids(session, context[0], other_user) == {
+            legacy_chunk_id
+        }
+
+
 @pytest.mark.parametrize(
     "status",
     ("pending", "retry_wait", "failed", "cancelled", "quarantined"),
@@ -2174,7 +2524,26 @@ def test_successful_cutover_retires_previous_generation_atomically(engine) -> No
             "snapshot_commit_id": second.commit_object_id,
         })
         session.execute(text("UPDATE source_items SET source_version=:blob,source_checksum=:checksum,metadata=CAST(:metadata AS jsonb) WHERE id=:id"), {"blob": blob, "checksum": checksum, "metadata": metadata, "id": source_id})
-        session.execute(text("UPDATE document_versions SET provider_version_id=:blob,content_checksum=:checksum WHERE id=:id"), {"blob": blob, "checksum": checksum, "id": version_id})
+        version_metadata = json.dumps(
+            {
+                "provider": "github",
+                "commit_object_id": second.commit_object_id,
+                "blob_object_id": blob,
+            }
+        )
+        session.execute(
+            text(
+                "UPDATE document_versions SET provider_version_id=:blob,"
+                "content_checksum=:checksum,metadata=CAST(:metadata AS jsonb) "
+                "WHERE id=:id"
+            ),
+            {
+                "blob": blob,
+                "checksum": checksum,
+                "metadata": version_metadata,
+                "id": version_id,
+            },
+        )
         session.commit()
 
         result = repository.promote_generation(

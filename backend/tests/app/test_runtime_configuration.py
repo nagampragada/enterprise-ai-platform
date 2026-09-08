@@ -10,6 +10,7 @@ from app.config import (
     load_application_settings,
     load_database_settings,
     validate_api_process_environment,
+    validate_github_planner_process_environment,
     validate_migration_process_environment,
     validate_scheduler_process_environment,
     validate_worker_process_environment,
@@ -204,6 +205,23 @@ def test_api_and_worker_require_only_their_relevant_sandbox_inputs() -> None:
     values.pop("OPENAI_API_KEY")
     with pytest.raises(InvalidRuntimeConfiguration):
         validate_worker_process_environment(values)
+
+    planner = validate_github_planner_process_environment(values)
+    assert planner.github_sync_ledger_planning_enabled is False
+
+
+def test_github_planner_requires_no_openai_credential_and_parses_gate_strictly() -> None:
+    values = _sandbox()
+    values.pop("OPENAI_API_KEY")
+    values.pop("GITHUB_APP_CLIENT_SECRET_REFERENCE")
+    values["GITHUB_SYNC_LEDGER_PLANNING_ENABLED"] = "true"
+    planner = validate_github_planner_process_environment(values)
+    assert planner.github_sync_ledger_planning_enabled is True
+    assert planner.github.private_key_reference.value.endswith("/versions/2")
+
+    values["GITHUB_SYNC_LEDGER_PLANNING_ENABLED"] = "TRUE"
+    with pytest.raises(InvalidRuntimeConfiguration):
+        validate_github_planner_process_environment(values)
 
 
 def test_scheduler_and_migration_require_database_only() -> None:
