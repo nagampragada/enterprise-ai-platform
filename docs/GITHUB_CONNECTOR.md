@@ -148,6 +148,18 @@ and indexing states and creates changed/new/restored history only when needed.
 It never copies staged vectors into or replaces legacy chunks; activated retrieval
 uses staging directly, while an active shared scope retains its committed legacy
 current link and chunk authority.
+New manifest-v2 citation projection creates or reuses one version carrying the
+exact generation commit even when the immutable Git blob/checksum was already
+indexed at an earlier commit. Historical manifest-v1 activations remain
+compatible with unchanged-file reuse: retrieval prefers one exact-commit
+version, otherwise accepts only one unambiguous available GitHub version for the
+same source, blob, and checksum. Duplicate exact or fallback candidates fail
+closed, and manifest-v2 retrieval has no historical-commit fallback.
+During the `20260904_000023` to `20260905_000024` expand window, retrieval uses
+row-to-JSON field detection instead of directly reading the new manifest column:
+an absent predecessor field is v1, and the current schema admits only v1/v2.
+Citation output keeps the actual immutable version ID while the activation and
+materialization retain the active repository-snapshot identity.
 A savepoint prevents partial citation writes even if a caller catches a rejected
 operation and commits its surrounding transaction. Permission-aware retrieval
 preserves organization, knowledge-space,

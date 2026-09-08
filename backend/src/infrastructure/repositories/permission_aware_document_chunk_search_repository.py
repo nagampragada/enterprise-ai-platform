@@ -272,6 +272,10 @@ ledger_authorized_chunks AS (
       AND sg.commit_object_id = als.commit_object_id
       AND sg.profile_fingerprint = als.profile_fingerprint
       AND sg.status = 'completed' AND sg.discovery_complete
+      AND COALESCE(
+          (to_jsonb(sg) ->> 'manifest_schema_version')::integer,
+          1
+      ) IN (1, 2)
     JOIN connector_sync_file_materializations sm ON sm.organization_id = sg.organization_id
       AND sm.connector_id = sg.connector_id
       AND sm.connector_scope_id = sg.connector_scope_id
@@ -294,34 +298,63 @@ ledger_authorized_chunks AS (
       AND dv.content_checksum = sm.content_checksum
       AND dv.lifecycle = 'available'
       AND dv.metadata ->> 'provider' = 'github'
-      AND dv.metadata ->> 'commit_object_id' = sg.commit_object_id
       AND dv.metadata ->> 'blob_object_id' = sm.provider_blob_id
-      AND dv.id = (
-          SELECT dv2.id
-          FROM document_versions dv2
-          WHERE dv2.organization_id = dv.organization_id
-            AND dv2.source_item_id = dv.source_item_id
-            AND dv2.provider_version_id = sm.provider_blob_id
-            AND dv2.content_checksum = sm.content_checksum
-            AND dv2.lifecycle = 'available'
-            AND dv2.metadata ->> 'provider' = 'github'
-            AND dv2.metadata ->> 'commit_object_id' = sg.commit_object_id
-            AND dv2.metadata ->> 'blob_object_id' = sm.provider_blob_id
-          ORDER BY dv2.version_number DESC, dv2.id DESC
-          LIMIT 1
-      )
-      AND 1 = (
-          SELECT count(*)
-          FROM document_versions dv3
-          WHERE dv3.organization_id = dv.organization_id
-            AND dv3.connector_id = dv.connector_id
-            AND dv3.source_item_id = dv.source_item_id
-            AND dv3.provider_version_id = sm.provider_blob_id
-            AND dv3.content_checksum = sm.content_checksum
-            AND dv3.lifecycle = 'available'
-            AND dv3.metadata ->> 'provider' = 'github'
-            AND dv3.metadata ->> 'commit_object_id' = sg.commit_object_id
-            AND dv3.metadata ->> 'blob_object_id' = sm.provider_blob_id
+      AND (
+          -- Manifest v2 projections create a commit-exact immutable version.
+          -- Historical manifest v1 activations can predate that rule because
+          -- unchanged Git blobs reused the earlier immutable version.  Permit
+          -- that shape only when it is the sole compatible candidate and no
+          -- commit-exact candidate exists; ambiguity remains fail closed.
+          (
+              dv.metadata ->> 'commit_object_id' = sg.commit_object_id
+              AND 1 = (
+                  SELECT count(*)
+                  FROM document_versions dv2
+                  WHERE dv2.organization_id = dv.organization_id
+                    AND dv2.connector_id = dv.connector_id
+                    AND dv2.source_item_id = dv.source_item_id
+                    AND dv2.provider_version_id = sm.provider_blob_id
+                    AND dv2.content_checksum = sm.content_checksum
+                    AND dv2.lifecycle = 'available'
+                    AND dv2.metadata ->> 'provider' = 'github'
+                    AND dv2.metadata ->> 'commit_object_id' = sg.commit_object_id
+                    AND dv2.metadata ->> 'blob_object_id' = sm.provider_blob_id
+              )
+          )
+          OR
+          (
+              -- to_jsonb(row) keeps this public retrieval path executable on
+              -- transition revision 000023, where the v1 column is absent.
+              COALESCE(
+                  (to_jsonb(sg) ->> 'manifest_schema_version')::integer,
+                  1
+              ) = 1
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM document_versions dv3
+                  WHERE dv3.organization_id = dv.organization_id
+                    AND dv3.connector_id = dv.connector_id
+                    AND dv3.source_item_id = dv.source_item_id
+                    AND dv3.provider_version_id = sm.provider_blob_id
+                    AND dv3.content_checksum = sm.content_checksum
+                    AND dv3.lifecycle = 'available'
+                    AND dv3.metadata ->> 'provider' = 'github'
+                    AND dv3.metadata ->> 'commit_object_id' = sg.commit_object_id
+                    AND dv3.metadata ->> 'blob_object_id' = sm.provider_blob_id
+              )
+              AND 1 = (
+                  SELECT count(*)
+                  FROM document_versions dv4
+                  WHERE dv4.organization_id = dv.organization_id
+                    AND dv4.connector_id = dv.connector_id
+                    AND dv4.source_item_id = dv.source_item_id
+                    AND dv4.provider_version_id = sm.provider_blob_id
+                    AND dv4.content_checksum = sm.content_checksum
+                    AND dv4.lifecycle = 'available'
+                    AND dv4.metadata ->> 'provider' = 'github'
+                    AND dv4.metadata ->> 'blob_object_id' = sm.provider_blob_id
+              )
+          )
       )
     JOIN documents d ON d.organization_id = dv.organization_id
       AND d.status = 'ready' AND d.deleted_at IS NULL

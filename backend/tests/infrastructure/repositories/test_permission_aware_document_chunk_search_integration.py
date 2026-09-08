@@ -533,8 +533,9 @@ def test_activated_retrieval_honors_real_grant_revocation_and_lifecycle(session:
     assert staged_chunk not in {row.chunk_id for row in retired_results}
 
 
-def test_activated_retrieval_uses_exact_historical_version_and_rejects_duplicate(
-    session: Session,
+@pytest.mark.parametrize("historical_fallback", [False, True])
+def test_activated_retrieval_rejects_exact_and_historical_duplicate_versions(
+    session: Session, historical_fallback: bool
 ):
     org, user = _tenant(session, "LedgerHistoricalVersion")
     path = _content_path(
@@ -544,10 +545,15 @@ def test_activated_retrieval_uses_exact_historical_version_and_rejects_duplicate
     staged_chunk, generation, _activation = _activate_staged_generation(
         session, org, path
     )
-    session.execute(
-        text("UPDATE document_versions SET is_current=false WHERE id=:id"),
-        {"id": path["version"]},
-    )
+    if historical_fallback:
+        session.execute(
+            text(
+                "UPDATE document_versions SET is_current=false,"
+                "metadata=jsonb_set(metadata,'{commit_object_id}',"
+                "to_jsonb(CAST(:commit AS text))) WHERE id=:id"
+            ),
+            {"id": path["version"], "commit": "0" * 40},
+        )
     session.flush()
     result = _search(session, org, user)
     assert [(row.chunk_id, row.document_version_id) for row in result] == [
@@ -600,6 +606,291 @@ def test_activated_retrieval_uses_exact_historical_version_and_rejects_duplicate
             "id": uuid.uuid4(), "org": org, "version": duplicate,
             "model": MODEL, "profile": profile, "now": NOW,
         },
+    )
+    session.flush()
+    assert _search(session, org, user) == ()
+
+
+def test_manifest_v1_prefers_one_exact_commit_version_over_historical_fallback(
+    session: Session,
+):
+    org, user = _tenant(session, "LedgerHistoricalPreference")
+    path = _content_path(
+        session, org, mode="platform_managed", chunk_vector=_vector(1.0)
+    )
+    _grant(session, org, user, path["space"])
+    staged_chunk, generation, _activation = _activate_staged_generation(
+        session, org, path
+    )
+    generation_commit = session.execute(
+        text("SELECT commit_object_id FROM connector_sync_generations WHERE id=:id"),
+        {"id": generation},
+    ).scalar_one()
+    session.execute(
+        text(
+            "UPDATE document_versions SET is_current=false,"
+            "metadata=jsonb_set(metadata,'{commit_object_id}',to_jsonb(CAST(:commit AS text))) "
+            "WHERE id=:id"
+        ),
+        {"id": path["version"], "commit": "0" * 40},
+    )
+    identity = session.execute(
+        text(
+            "SELECT provider_version_id,content_checksum,metadata,connector_id,source_item_id "
+            "FROM document_versions WHERE id=:id"
+        ),
+        {"id": path["version"]},
+    ).mappings().one()
+    exact = uuid.uuid4()
+    exact_metadata = dict(identity["metadata"])
+    exact_metadata["commit_object_id"] = generation_commit
+    session.execute(
+        text(
+            "INSERT INTO document_versions "
+            "(id,organization_id,connector_id,source_item_id,version_number,"
+            "provider_version_id,content_checksum,checksum_algorithm,version_cause,"
+            "lifecycle,is_current,discovered_at,metadata) VALUES "
+            "(:id,:org,:connector,:source,2,:blob,:checksum,'sha256',"
+            "'content_changed','available',false,:now,CAST(:metadata AS jsonb))"
+        ),
+        {
+            "id": exact,
+            "org": org,
+            "connector": identity["connector_id"],
+            "source": identity["source_item_id"],
+            "blob": identity["provider_version_id"],
+            "checksum": identity["content_checksum"],
+            "now": NOW,
+            "metadata": __import__("json").dumps(exact_metadata),
+        },
+    )
+    profile = session.execute(
+        text(
+            "SELECT profile_fingerprint FROM connector_sync_generations WHERE id=:id"
+        ),
+        {"id": generation},
+    ).scalar_one()
+    session.execute(
+        text(
+            "INSERT INTO document_indexing_states "
+            "(id,organization_id,document_version_id,extraction_profile,extraction_version,"
+            "chunking_profile,chunking_version,embedding_provider,embedding_model,"
+            "embedding_dimensions,profile_fingerprint,desired_generation,indexed_generation,"
+            "status,reason,attempt_count,requested_at,started_at,completed_at) VALUES "
+            "(:id,:org,:version,'default','v1','deterministic','v1','openai',:model,"
+            "1536,:profile,1,1,'indexed','content_changed',0,:now,:now,:now)"
+        ),
+        {
+            "id": uuid.uuid4(),
+            "org": org,
+            "version": exact,
+            "model": MODEL,
+            "profile": profile,
+            "now": NOW,
+        },
+    )
+    session.flush()
+
+    assert [
+        (row.chunk_id, row.document_version_id) for row in _search(session, org, user)
+    ] == [(staged_chunk, exact)]
+
+
+def test_manifest_v2_rejects_historical_commit_fallback(session: Session):
+    org, user = _tenant(session, "LedgerV2HistoricalFallback")
+    path = _content_path(
+        session, org, mode="platform_managed", chunk_vector=_vector(1.0)
+    )
+    _grant(session, org, user, path["space"])
+    _staged_chunk, generation, _activation = _activate_staged_generation(
+        session, org, path
+    )
+    session.execute(
+        text(
+            "UPDATE connector_sync_generations SET manifest_schema_version=2 WHERE id=:id"
+        ),
+        {"id": generation},
+    )
+    session.execute(
+        text(
+            "UPDATE document_versions SET "
+            "metadata=jsonb_set(metadata,'{commit_object_id}',to_jsonb(CAST(:commit AS text))) "
+            "WHERE id=:id"
+        ),
+        {"id": path["version"], "commit": "0" * 40},
+    )
+    session.flush()
+
+    assert _search(session, org, user) == ()
+
+
+@pytest.mark.parametrize(
+    "drift",
+    (
+        "provider",
+        "metadata_blob",
+        "provider_blob",
+        "checksum",
+        "unavailable_version",
+        "missing_index",
+        "index_profile",
+        "index_model",
+        "index_dimensions",
+        "document_identity",
+    ),
+)
+def test_manifest_v1_historical_fallback_rejects_other_attribution_drift(
+    session: Session, drift: str
+):
+    org, user = _tenant(session, f"LedgerHistoricalDrift-{drift}")
+    path = _content_path(
+        session, org, mode="platform_managed", chunk_vector=_vector(1.0)
+    )
+    _grant(session, org, user, path["space"])
+    staged_chunk, generation, _activation = _activate_staged_generation(
+        session, org, path
+    )
+    session.execute(
+        text(
+            "UPDATE connector_sync_generations SET manifest_schema_version=1 "
+            "WHERE id=:id"
+        ),
+        {"id": generation},
+    )
+    session.execute(
+        text(
+            "UPDATE document_versions SET is_current=false,"
+            "metadata=jsonb_set(metadata,'{commit_object_id}',"
+            "to_jsonb(CAST(:commit AS text))) WHERE id=:id"
+        ),
+        {"id": path["version"], "commit": "0" * 40},
+    )
+    session.flush()
+    assert [
+        (row.chunk_id, row.document_version_id)
+        for row in _search(session, org, user)
+    ] == [(staged_chunk, path["version"])]
+
+    if drift == "provider":
+        statement = (
+            "UPDATE document_versions SET metadata=jsonb_set(metadata,'{provider}',"
+            "to_jsonb(CAST('gitlab' AS text))) WHERE id=:id"
+        )
+        params = {"id": path["version"]}
+    elif drift == "metadata_blob":
+        statement = (
+            "UPDATE document_versions SET metadata=jsonb_set(metadata,'{blob_object_id}',"
+            "to_jsonb(CAST(:value AS text))) WHERE id=:id"
+        )
+        params = {"id": path["version"], "value": "e" * 40}
+    elif drift == "provider_blob":
+        statement = "UPDATE document_versions SET provider_version_id=:value WHERE id=:id"
+        params = {"id": path["version"], "value": "e" * 40}
+    elif drift == "checksum":
+        statement = "UPDATE document_versions SET content_checksum=:value WHERE id=:id"
+        params = {"id": path["version"], "value": "0" * 64}
+    elif drift == "unavailable_version":
+        statement = "UPDATE document_versions SET lifecycle='unavailable' WHERE id=:id"
+        params = {"id": path["version"]}
+    elif drift == "missing_index":
+        statement = "DELETE FROM document_indexing_states WHERE document_version_id=:id"
+        params = {"id": path["version"]}
+    elif drift == "index_profile":
+        statement = (
+            "UPDATE document_indexing_states SET profile_fingerprint='other:profile' "
+            "WHERE document_version_id=:id"
+        )
+        params = {"id": path["version"]}
+    elif drift == "index_model":
+        statement = (
+            "UPDATE document_indexing_states SET embedding_model='other:model' "
+            "WHERE document_version_id=:id"
+        )
+        params = {"id": path["version"]}
+    elif drift == "index_dimensions":
+        statement = (
+            "UPDATE document_indexing_states SET embedding_dimensions=1024 "
+            "WHERE document_version_id=:id"
+        )
+        params = {"id": path["version"]}
+    else:
+        statement = "UPDATE documents SET source_document_key=:value WHERE id=:id"
+        params = {"id": path["document"], "value": f"wrong-{path['document']}"}
+
+    session.execute(text(statement), params)
+    session.flush()
+    assert _search(session, org, user) == ()
+
+
+def test_activated_historical_citations_are_tenant_isolated(session: Session):
+    first_org, first_user = _tenant(session, "LedgerHistoricalTenantOne")
+    first = _content_path(
+        session, first_org, mode="platform_managed", chunk_vector=_vector(1.0)
+    )
+    _grant(session, first_org, first_user, first["space"])
+    first_chunk, _first_generation, _first_activation = _activate_staged_generation(
+        session, first_org, first
+    )
+    second_org, second_user = _tenant(session, "LedgerHistoricalTenantTwo")
+    second = _content_path(
+        session, second_org, mode="platform_managed", chunk_vector=_vector(1.0)
+    )
+    _grant(session, second_org, second_user, second["space"])
+    second_chunk, _second_generation, _second_activation = _activate_staged_generation(
+        session, second_org, second
+    )
+    session.flush()
+
+    assert [row.chunk_id for row in _search(session, first_org, first_user)] == [
+        first_chunk
+    ]
+    assert [row.chunk_id for row in _search(session, second_org, second_user)] == [
+        second_chunk
+    ]
+
+    session.execute(
+        text(
+            "UPDATE document_versions SET metadata=jsonb_set(metadata,'{provider}',"
+            "to_jsonb(CAST('gitlab' AS text))) WHERE id=:id"
+        ),
+        {"id": first["version"]},
+    )
+    session.flush()
+    assert _search(session, first_org, first_user) == ()
+    assert [row.chunk_id for row in _search(session, second_org, second_user)] == [
+        second_chunk
+    ]
+
+
+def test_unsupported_manifest_version_cannot_enter_activated_retrieval(
+    session: Session,
+):
+    org, user = _tenant(session, "LedgerUnsupportedManifest")
+    path = _content_path(
+        session, org, mode="platform_managed", chunk_vector=_vector(1.0)
+    )
+    _grant(session, org, user, path["space"])
+    staged_chunk, generation, _activation = _activate_staged_generation(
+        session, org, path
+    )
+    session.flush()
+    assert [row.chunk_id for row in _search(session, org, user)] == [staged_chunk]
+
+    # The database constraint is the primary invariant.  Dropping it only
+    # inside this rolled-back test transaction proves retrieval independently
+    # fails closed if an unsupported value is ever present.
+    session.execute(
+        text(
+            "ALTER TABLE connector_sync_generations DROP CONSTRAINT "
+            "ck_connector_sync_generations_ck_connector_sync_generat_736f"
+        )
+    )
+    session.execute(
+        text(
+            "UPDATE connector_sync_generations SET manifest_schema_version=3 "
+            "WHERE id=:id"
+        ),
+        {"id": generation},
     )
     session.flush()
     assert _search(session, org, user) == ()

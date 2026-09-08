@@ -15,7 +15,7 @@ from sqlalchemy import Sequence as SqlSequence
 from sqlalchemy import and_, exists, func, or_, select, tuple_
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from domain.connectors.sync_work_ledger import (
     FileWorkCounters,
@@ -1729,6 +1729,11 @@ class ConnectorSyncWorkLedgerRepository:
                 if row.provider_version_id == materialization.provider_blob_id
                 and row.content_checksum == materialization.content_checksum
                 and row.lifecycle == "available"
+                and row.version_metadata.get("provider") == "github"
+                and row.version_metadata.get("commit_object_id")
+                == generation.commit_object_id
+                and row.version_metadata.get("blob_object_id")
+                == materialization.provider_blob_id
             ]
             if len(matching_versions) > 1:
                 raise SyncWorkLedgerConflict("generation citation version is duplicated")
@@ -1763,14 +1768,6 @@ class ConnectorSyncWorkLedgerRepository:
                 )
                 self._session.add(version)
                 self._flush("generation version projection failed")
-            elif (
-                version.version_metadata.get("provider") != "github"
-                or version.version_metadata.get("commit_object_id")
-                != generation.commit_object_id
-                or version.version_metadata.get("blob_object_id")
-                != materialization.provider_blob_id
-            ):
-                raise SyncWorkLedgerConflict("generation citation version attribution changed")
             elif restored and not version.is_current:
                 if current is not None:
                     current.is_current = False
@@ -2038,87 +2035,7 @@ class ConnectorSyncWorkLedgerRepository:
         if not require_citations:
             return len(materializations), len(chunk_rows)
 
-        projection_count = self._one(
-            select(func.count(ConnectorSyncFileMaterialization.id))
-            .select_from(ConnectorSyncFileMaterialization)
-            .join(
-                SourceItem,
-                and_(
-                    SourceItem.organization_id
-                    == ConnectorSyncFileMaterialization.organization_id,
-                    SourceItem.connector_id
-                    == ConnectorSyncFileMaterialization.connector_id,
-                    SourceItem.source_item_key
-                    == ConnectorSyncFileMaterialization.source_item_key,
-                ),
-            )
-            .join(
-                SourceItemScopeMembership,
-                and_(
-                    SourceItemScopeMembership.organization_id
-                    == SourceItem.organization_id,
-                    SourceItemScopeMembership.connector_id == SourceItem.connector_id,
-                    SourceItemScopeMembership.source_item_id == SourceItem.id,
-                    SourceItemScopeMembership.connector_scope_id
-                    == ConnectorSyncFileMaterialization.connector_scope_id,
-                ),
-            )
-            .join(
-                DocumentVersion,
-                and_(
-                    DocumentVersion.organization_id == SourceItem.organization_id,
-                    DocumentVersion.connector_id == SourceItem.connector_id,
-                    DocumentVersion.source_item_id == SourceItem.id,
-                ),
-            )
-            .join(
-                Document,
-                and_(
-                    Document.organization_id == DocumentVersion.organization_id,
-                    Document.source_type == "github",
-                    Document.source_document_key
-                    == ConnectorSyncFileMaterialization.source_item_key,
-                ),
-            )
-            .join(
-                DocumentIndexingState,
-                and_(
-                    DocumentIndexingState.organization_id
-                    == DocumentVersion.organization_id,
-                    DocumentIndexingState.document_version_id == DocumentVersion.id,
-                    DocumentIndexingState.profile_fingerprint
-                    == ConnectorSyncFileMaterialization.profile_fingerprint,
-                ),
-            )
-            .where(
-                ConnectorSyncFileMaterialization.organization_id
-                == generation.organization_id,
-                ConnectorSyncFileMaterialization.generation_id == generation.id,
-                SourceItem.status == "active",
-                SourceItem.deleted_at.is_(None),
-                SourceItemScopeMembership.status == "active",
-                SourceItemScopeMembership.removed_at.is_(None),
-                DocumentVersion.lifecycle == "available",
-                DocumentVersion.provider_version_id
-                == ConnectorSyncFileMaterialization.provider_blob_id,
-                DocumentVersion.content_checksum
-                == ConnectorSyncFileMaterialization.content_checksum,
-                DocumentVersion.version_metadata["provider"].as_string() == "github",
-                DocumentVersion.version_metadata["commit_object_id"].as_string()
-                == generation.commit_object_id,
-                DocumentVersion.version_metadata["blob_object_id"].as_string()
-                == ConnectorSyncFileMaterialization.provider_blob_id,
-                Document.status == "ready",
-                Document.deleted_at.is_(None),
-                DocumentIndexingState.status == "indexed",
-                DocumentIndexingState.indexed_generation
-                == DocumentIndexingState.desired_generation,
-                DocumentIndexingState.embedding_model
-                == ConnectorSyncFileMaterialization.embedding_model,
-                DocumentIndexingState.embedding_dimensions == 1536,
-            ),
-            "generation citation projection validation failed",
-        )
+        projection_count = self._promotion_projection_count(generation)
         if projection_count != len(materializations):
             raise SyncWorkLedgerConflict("generation citation projection is incomplete")
         return len(materializations), len(chunk_rows)
@@ -2340,6 +2257,68 @@ class ConnectorSyncWorkLedgerRepository:
             raise SyncWorkLedgerConflict("generation citation projection is incomplete")
 
     def _promotion_projection_count(self, generation: ConnectorSyncGeneration) -> int:
+        # Manifest v1 promotions may already cite the sole immutable version
+        # created for an unchanged Git blob at an earlier commit.  Manifest v2
+        # projection creates a commit-exact version instead.  In both cases,
+        # more than one eligible candidate is deliberately treated as a
+        # conflict rather than resolved by ordering or a mutable current flag.
+        exact_version = aliased(DocumentVersion)
+        compatible_version = aliased(DocumentVersion)
+        exact_version_count = (
+            select(func.count(exact_version.id))
+            .where(
+                exact_version.organization_id == SourceItem.organization_id,
+                exact_version.connector_id == SourceItem.connector_id,
+                exact_version.source_item_id == SourceItem.id,
+                exact_version.provider_version_id
+                == ConnectorSyncFileMaterialization.provider_blob_id,
+                exact_version.content_checksum
+                == ConnectorSyncFileMaterialization.content_checksum,
+                exact_version.lifecycle == "available",
+                exact_version.version_metadata["provider"].as_string() == "github",
+                exact_version.version_metadata["commit_object_id"].as_string()
+                == generation.commit_object_id,
+                exact_version.version_metadata["blob_object_id"].as_string()
+                == ConnectorSyncFileMaterialization.provider_blob_id,
+            )
+            .correlate(SourceItem, ConnectorSyncFileMaterialization)
+            .scalar_subquery()
+        )
+        compatible_version_count = (
+            select(func.count(compatible_version.id))
+            .where(
+                compatible_version.organization_id == SourceItem.organization_id,
+                compatible_version.connector_id == SourceItem.connector_id,
+                compatible_version.source_item_id == SourceItem.id,
+                compatible_version.provider_version_id
+                == ConnectorSyncFileMaterialization.provider_blob_id,
+                compatible_version.content_checksum
+                == ConnectorSyncFileMaterialization.content_checksum,
+                compatible_version.lifecycle == "available",
+                compatible_version.version_metadata["provider"].as_string()
+                == "github",
+                compatible_version.version_metadata["blob_object_id"].as_string()
+                == ConnectorSyncFileMaterialization.provider_blob_id,
+            )
+            .correlate(SourceItem, ConnectorSyncFileMaterialization)
+            .scalar_subquery()
+        )
+        exact_version_match = and_(
+            DocumentVersion.version_metadata["commit_object_id"].as_string()
+            == generation.commit_object_id,
+            exact_version_count == 1,
+        )
+        if generation.manifest_schema_version == 1:
+            citation_version_match = or_(
+                exact_version_match,
+                and_(
+                    exact_version_count == 0,
+                    compatible_version_count == 1,
+                ),
+            )
+        else:
+            citation_version_match = exact_version_match
+
         return self._one(
             select(func.count(ConnectorSyncFileMaterialization.id))
             .select_from(ConnectorSyncFileMaterialization)
@@ -2406,10 +2385,9 @@ class ConnectorSyncWorkLedgerRepository:
                 DocumentVersion.content_checksum
                 == ConnectorSyncFileMaterialization.content_checksum,
                 DocumentVersion.version_metadata["provider"].as_string() == "github",
-                DocumentVersion.version_metadata["commit_object_id"].as_string()
-                == generation.commit_object_id,
                 DocumentVersion.version_metadata["blob_object_id"].as_string()
                 == ConnectorSyncFileMaterialization.provider_blob_id,
+                citation_version_match,
                 Document.status == "ready",
                 Document.deleted_at.is_(None),
                 DocumentIndexingState.status == "indexed",

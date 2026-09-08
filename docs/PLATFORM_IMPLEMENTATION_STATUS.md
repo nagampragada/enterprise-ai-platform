@@ -479,7 +479,12 @@ caller-owned transaction. Old retrieval stays authoritative until commit;
 activated retrieval preserves the full tenant/user/grant/space/connector/scope/
 membership authorization gates and binds exactly one historical version to the
 generation commit, staged blob/checksum, GitHub attribution, profile, document,
-and materialization. The mutable current `document_version_documents` pointer
+and materialization for manifest-v2 generations. Historical manifest-v1
+activations use the exact version when present and otherwise accept only one
+unambiguous available version with the same immutable Git blob/checksum;
+duplicates fail closed. Projection creates an exact version for future
+generations even when unchanged-file reuse finds an older equivalent blob. The
+mutable current `document_version_documents` pointer
 cannot redirect the organization-unique canonical GitHub document and is not
 required for retained historical activation. Active-scope branching happens before legacy source
 deduplication, so two activated shared scopes remain independent and an active
@@ -507,6 +512,15 @@ migration required; the application head is compatible and current. Unknown,
 missing, malformed, older, newer, and multiple heads fail closed. The
 predecessor allowance is temporary and must be removed after every environment
 has reached `20260905_000024`.
+
+The historical-citation correction remains a local rollout candidate. Recovered
+production evidence reports `enterprise-ai-api-00014-mmm` as the live revision
+and correction revision `enterprise-ai-api-00015-lrk` at zero traffic; this
+local-only audit does not refresh or alter that state. Commit/publication, a
+Git-object-faithful image build and static verification, predecessor/current
+schema checks, a no-traffic revision check, controlled traffic transition, and
+independent retrieval verification remain required. Local test success alone
+must not be described as restored production compatibility.
 
 Migration `20260902_000022` adds one isolated organization scheduling-state
 table and one monotonic sequence. Indexed correlated eligibility probes avoid a

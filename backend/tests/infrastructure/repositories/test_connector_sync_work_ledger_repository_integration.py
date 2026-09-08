@@ -2073,6 +2073,201 @@ def test_projection_builds_missing_citations_and_promotes_in_one_commit(engine) 
         ) == 1
 
 
+def test_projection_creates_generation_exact_citation_for_reused_git_blob(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation, _work, source_id, version_id, document_id = (
+            _ready_promotion(session, "ProjectedUnchangedBlob")
+        )
+        historical_commit = "0" * 40
+        historical = session.execute(
+            select(
+                DocumentVersion.version_number,
+                DocumentVersion.provider_version_id,
+                DocumentVersion.content_checksum,
+                DocumentVersion.is_current,
+            ).where(DocumentVersion.id == version_id)
+        ).one()
+        historical_identity = (
+            historical.version_number,
+            historical.provider_version_id,
+            historical.content_checksum,
+            historical.is_current,
+        )
+        session.execute(
+            text(
+                "UPDATE document_versions SET "
+                "metadata=jsonb_set(metadata,'{commit_object_id}',"
+                "to_jsonb(CAST(:commit AS text))) WHERE id=:id"
+            ),
+            {"id": version_id, "commit": historical_commit},
+        )
+        session.commit()
+
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        result = repository.project_citations_and_promote_generation(
+            _promotion_request(generation),
+            _projection_profile(generation),
+            now=NOW + timedelta(minutes=1),
+        )
+        session.commit()
+
+        assert result.promoted is True
+        versions = session.execute(
+            select(DocumentVersion)
+            .where(
+                DocumentVersion.organization_id == context[0],
+                DocumentVersion.source_item_id == source_id,
+            )
+            .order_by(DocumentVersion.version_number)
+        ).scalars().all()
+        assert len(versions) == 2
+        assert versions[0].id == version_id
+        assert versions[0].version_metadata["commit_object_id"] == historical_commit
+        assert (
+            versions[0].version_number,
+            versions[0].provider_version_id,
+            versions[0].content_checksum,
+            versions[0].is_current,
+        ) == historical_identity
+        assert versions[1].version_metadata["commit_object_id"] == generation.commit_object_id
+        assert versions[1].provider_version_id == versions[0].provider_version_id
+        assert versions[1].content_checksum == versions[0].content_checksum
+        assert versions[1].is_current is False
+        exact_version = versions[1]
+        states = session.execute(
+            select(DocumentIndexingState).where(
+                DocumentIndexingState.organization_id == context[0],
+                DocumentIndexingState.document_version_id == exact_version.id,
+            )
+        ).scalars().all()
+        assert len(states) == 1
+        state = states[0]
+        assert (
+            state.profile_fingerprint,
+            state.embedding_model,
+            state.embedding_dimensions,
+            state.status,
+            state.indexed_generation,
+            state.desired_generation,
+        ) == (
+            generation.profile_fingerprint,
+            "fake:model:1536",
+            1536,
+            "indexed",
+            1,
+            1,
+        )
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncGenerationActivation)
+        ) == 1
+
+        staged_chunk_id = session.scalar(
+            select(ConnectorSyncFileMaterializationChunk.id).where(
+                ConnectorSyncFileMaterializationChunk.organization_id == context[0],
+                ConnectorSyncFileMaterializationChunk.generation_id
+                == generation.generation_id,
+            )
+        )
+        assert staged_chunk_id is not None
+        user_id = _retrieval_user(session, context[0], context[2])
+        retrieval = PermissionAwareDocumentChunkSearchRepository(session).search(
+            context[0],
+            user_id,
+            [1.0] + [0.0] * 1535,
+            "fake:model:1536",
+            100,
+            source_item_types=("file",),
+        )
+        assert [
+            (
+                row.chunk_id,
+                row.document_id,
+                row.document_version_id,
+                row.source_item_id,
+                row.connector_scope_id,
+            )
+            for row in retrieval
+        ] == [
+            (
+                staged_chunk_id,
+                document_id,
+                exact_version.id,
+                source_id,
+                context[2],
+            )
+        ]
+
+        version_count = session.scalar(
+            select(func.count()).select_from(DocumentVersion).where(
+                DocumentVersion.organization_id == context[0],
+                DocumentVersion.source_item_id == source_id,
+            )
+        )
+        indexing_count = session.scalar(
+            select(func.count()).select_from(DocumentIndexingState).where(
+                DocumentIndexingState.organization_id == context[0],
+                DocumentIndexingState.document_version_id == exact_version.id,
+            )
+        )
+        replay = repository.project_citations_and_promote_generation(
+            _promotion_request(generation),
+            _projection_profile(generation),
+            now=NOW + timedelta(minutes=2),
+        )
+        session.commit()
+        assert replay.promoted is False
+        assert session.scalar(
+            select(func.count()).select_from(DocumentVersion).where(
+                DocumentVersion.organization_id == context[0],
+                DocumentVersion.source_item_id == source_id,
+            )
+        ) == version_count
+        assert session.scalar(
+            select(func.count()).select_from(DocumentIndexingState).where(
+                DocumentIndexingState.organization_id == context[0],
+                DocumentIndexingState.document_version_id == exact_version.id,
+            )
+        ) == indexing_count
+
+
+def test_manifest_v1_historical_citation_promotion_replay_is_compatible(engine) -> None:
+    with Session(engine, expire_on_commit=False) as session:
+        _context, generation, _work, _source_id, version_id, _document_id = (
+            _ready_promotion(session, "HistoricalPromotionReplay")
+        )
+        session.execute(
+            text(
+                "UPDATE connector_sync_generations SET manifest_schema_version=1 "
+                "WHERE id=:id"
+            ),
+            {"id": generation.generation_id},
+        )
+        session.execute(
+            text(
+                "UPDATE document_versions SET "
+                "metadata=jsonb_set(metadata,'{commit_object_id}',"
+                "to_jsonb(CAST(:commit AS text))) WHERE id=:id"
+            ),
+            {"id": version_id, "commit": "0" * 40},
+        )
+        session.commit()
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        request = _promotion_request(generation)
+
+        first = repository.promote_generation(
+            request, now=NOW + timedelta(minutes=1)
+        )
+        session.commit()
+        replay = repository.promote_generation(
+            request, now=NOW + timedelta(minutes=2)
+        )
+        session.commit()
+
+        assert first.promoted is True
+        assert replay.promoted is False
+        assert replay.activation.activation_id == first.activation.activation_id
+
+
 def test_projection_failure_savepoint_prevents_partial_commit(engine, monkeypatch) -> None:
     with Session(engine, expire_on_commit=False) as session:
         context, generation, _work, source_id, _version_id, document_id = (

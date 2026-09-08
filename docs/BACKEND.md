@@ -59,17 +59,33 @@ the caller commits.
 
 Activated retrieval preserves every tenant, user grant/ACL, active knowledge
 space, connector, membership, and scope gate. It branches by authorized scope
-before legacy source deduplication: a valid active scope resolves one unique
-historical citation version bound to the generation commit, staged blob and
+before legacy source deduplication. Manifest-v2 generations resolve exactly one
+immutable citation version bound to the generation commit, staged blob and
 checksum, GitHub attribution, profile, canonical document identity, and
-materialization. The mutable one-to-one `document_version_documents` pointer is
+materialization. Historical manifest-v1 activations may instead use one unique
+available version with the same immutable Git blob and checksum when no
+generation-commit version exists; an exact version always wins and any exact or
+fallback ambiguity fails closed. This compatibility is required because legacy
+unchanged-file skipping reused a version first observed at an earlier commit.
+New citation projection always creates or reuses a generation-commit-exact
+version, so the fallback cannot expand manifest-v2 authority. The mutable
+one-to-one `document_version_documents` pointer is
 not citation authority: a fabricated pointer cannot redirect the
 organization-unique GitHub `source_document_key`, and a later scope projection
-cannot invalidate a retained historical activation. Invalid
-active state fails closed without legacy fallback for that scope; retirement
-removes active authority and restores ordinary legacy eligibility. Legacy scopes
-retain their current-version and indexing-state checks, and two activated scopes
-sharing one source/document retain independent exact citation identities.
+cannot invalidate a retained historical activation. Invalid active state fails
+closed without legacy fallback for that scope; retirement removes active
+authority and restores ordinary legacy eligibility. Legacy scopes retain their
+current-version and indexing-state checks, and two activated scopes sharing one
+source/document retain independent exact citation identities.
+
+The retrieval SQL reads the optional manifest version through `to_jsonb(sg)`:
+on predecessor schema `20260904_000023` the absent field is treated as the
+historical v1 contract, while current schema `20260905_000024` accepts only
+stored values `1` and `2`. This avoids a direct new-column dependency during
+the expand window and makes unsupported values fail closed. A historical
+citation returns its actual immutable `document_version_id`; activation and
+materialization carry the active generation snapshot, so the earlier version's
+creation commit is not relabeled as the generation commit.
 
 `GITHUB_SYNC_LEDGER_RECONCILIATION_ENABLED` is the independent Slice 5 gate.
 It defaults to `false`, accepts only exact lowercase `true` or `false`, and is

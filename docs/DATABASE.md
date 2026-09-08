@@ -205,20 +205,40 @@ before source deduplication and retain their current-version/indexing rules.
 Each activated scope instead reads only its single active generation; invalid
 active state returns no row rather than silently falling back, while a retired
 activation restores ordinary legacy eligibility because no active authority
-remains. Stable citations deliberately may identify a historical version, but
-the query requires exactly one version bound to the projected source item with
-matching GitHub provider, generation commit, staged blob and checksum, profile,
-generation-owned materialization, and the organization-unique canonical GitHub
-document key. The mutable one-to-one `document_version_documents` pointer is
+remains. Stable citations deliberately may identify a historical version.
+Manifest-v2 authority requires exactly one generation-commit-exact version
+bound to the projected source item with matching GitHub provider, staged blob
+and checksum, profile, generation-owned materialization, and the
+organization-unique canonical GitHub document key. For already-promoted
+manifest-v1 history only, an exact version is preferred; when none exists,
+exactly one available version with the same immutable Git
+blob/checksum/provider attribution is compatible. Multiple exact or fallback
+candidates fail closed. This preserves unchanged files whose legacy
+synchronization reused a version created at an earlier commit without allowing
+the compatibility rule for manifest-v2 generations. Projection now creates an
+exact non-current citation version when an otherwise identical blob was first
+observed at another commit. The mutable one-to-one
+`document_version_documents` pointer is
 not ledger citation authority: fabricating it cannot redirect the canonical
 document, while replacing it for a later scope cannot invalidate retained
 historical authority. Multiple activated scopes sharing one source/document keep
 independent authorization paths and exact staged versions/chunks. Connector-
 scope uniqueness prevents two scopes for one connector and repository identity;
 explicit shared memberships remain permission paths and are never retired by
-projection. Deletion reconciliation,
-physical legacy retirement, staging cleanup/retention, scheduling, and API/UI
-controls remain Slices 5 and 6.
+projection.
+
+The retrieval query obtains `manifest_schema_version` from `to_jsonb(sg)`
+rather than referencing the Slice 5 column directly. Its absence on predecessor
+schema `20260904_000023` maps only to historical manifest v1, while current
+schema `20260905_000024` is explicitly allowlisted to values `1` and `2`;
+unsupported values acquire neither compatibility nor deletion authority. The
+returned citation retains the selected immutable document-version identity.
+The activation/materialization identity separately proves which repository
+snapshot is authoritative, so an older version creation commit is never
+reported as though it were the active generation commit. Slice 5's bounded
+manifest-based lifecycle reconciliation remains a separate explicit operation
+with no automatic caller. Physical staging cleanup/retention, scheduling, and
+API/UI controls remain Slice 6 or later work.
 
 ## Retrieval-isolated file-work materialization (`20260831_000021`)
 
