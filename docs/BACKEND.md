@@ -21,6 +21,33 @@ cursor, entry, file, byte, and chunk limits remain independent hard limits. The
 planner does not download blobs, extract, embed, process, promote, reconcile,
 or change retrieval authority.
 
+Controlled planner executions may additionally supply the all-or-none canonical
+UUID tuple `GITHUB_LEDGER_PLANNER_TARGET_ORGANIZATION_ID`,
+`GITHUB_LEDGER_PLANNER_TARGET_CONNECTOR_ID`,
+`GITHUB_LEDGER_PLANNER_TARGET_SCOPE_ID`, and
+`GITHUB_LEDGER_PLANNER_TARGET_SYNC_JOB_ID`. Any partial, blank, whitespace,
+malformed, normalized, or noncanonical tuple fails before database/provider
+composition, even while planning is disabled. Targeted mode restricts both
+expired-job recovery and the atomic GitHub claim to that exact tuple and never
+falls back to global selection. A missing, terminal, cancelled, exhausted,
+not-due, locked, or mismatched target exits unsuccessfully without reporting
+discovery success or touching unrelated jobs. Without the tuple, established
+global selection and bounded recovery remain unchanged. `--once` means one
+claim followed by multiple bounded batches for that job; batch/runtime exhaustion
+is resumable and a later invocation is required. Targeting prevents this planner
+from choosing another job, but cannot prevent a legacy/global consumer from
+winning the target first. Production use still requires an independently proven
+exclusive window and invocation-source controls. Keeping the persistent planner
+flag false and using future execution-scoped settings is a rollout proposal only;
+this implementation does not enable or execute it.
+
+The sanitized target-miss outcome is one of `completed`, `cancelled`, `failed`,
+`attempts_exhausted`, `owned_elsewhere`, `retry_not_due`, `not_eligible`, or
+`not_found_or_mismatched`. It is a post-claim observation for operations; under
+concurrency it is not proof that the observed state caused the atomic claim to
+miss and it may become stale immediately. The durable guarantee is narrower:
+that invocation acquired no target and did not fall back to another job.
+
 Planning also changes legacy-worker routing: when the same strict planning flag
 is `true`, `connector_sync_worker_host` recovers and claims Local Folder jobs
 only, while the dedicated planner claims GitHub jobs only. Since Cloud Run Job

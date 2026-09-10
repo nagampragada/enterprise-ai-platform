@@ -3,19 +3,24 @@
 from __future__ import annotations
 
 import logging
+import random
 import signal
 import threading
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from types import FrameType
 from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
 from app.config import (
+    GitHubPlannerClaimTarget,
     GitHubPlannerProcessSettings,
     validate_github_planner_process_environment,
 )
 from application.services.connector_sync_execution_service import (
+    AcquiredSyncAttempt,
     ConnectorSyncExecutionService,
 )
 from application.services.connector_sync_retry_policy import ConnectorSyncRetryPolicy
@@ -51,6 +56,33 @@ from infrastructure.workers.local_folder_sync_worker import LocalFolderAttemptCo
 LOGGER = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class _PlannerClaimResult:
+    outcome: str
+    attempt: AcquiredSyncAttempt | None = None
+
+    def __post_init__(self) -> None:
+        valid_outcomes = frozenset(
+            {
+                "acquired",
+                "empty",
+                "shutdown",
+                "not_found_or_mismatched",
+                "completed",
+                "cancelled",
+                "failed",
+                "attempts_exhausted",
+                "owned_elsewhere",
+                "retry_not_due",
+                "not_eligible",
+            }
+        )
+        acquired = self.outcome == "acquired"
+        valid_attempt = isinstance(self.attempt, AcquiredSyncAttempt)
+        if self.outcome not in valid_outcomes or acquired != valid_attempt:
+            raise ValueError("planner claim result is invalid")
+
+
 class _ProfileOnlyEmbeddingProvider(EmbeddingProvider):
     """Expose the immutable production profile without constructing OpenAI."""
 
@@ -79,6 +111,7 @@ class GitHubSyncLedgerPlannerHost:
         settings: ConnectorWorkerSettings,
         *,
         planning_enabled: bool,
+        claim_target: GitHubPlannerClaimTarget | None = None,
         shutdown_event=None,
         monotonic=time.monotonic,
         logger=LOGGER,
@@ -90,6 +123,7 @@ class GitHubSyncLedgerPlannerHost:
         self._worker = worker
         self._settings = settings
         self._planning_enabled = planning_enabled
+        self._claim_target = claim_target
         self._shutdown = shutdown_event or threading.Event()
         self._monotonic = monotonic
         self._logger = logger
@@ -104,11 +138,22 @@ class GitHubSyncLedgerPlannerHost:
             return 0
         if self._worker is None:
             raise RuntimeError("GitHub ledger planner is unavailable")
-        acquired = self._recover_and_claim()
-        if acquired is None:
+        claim = self._recover_and_claim()
+        if claim.attempt is None:
+            if self._claim_target is not None:
+                self._logger.error(
+                    "event=github_ledger_planner_target_not_acquired outcome=%s "
+                    "organization_id=%s connector_id=%s connector_scope_id=%s job_id=%s",
+                    claim.outcome,
+                    self._claim_target.organization_id,
+                    self._claim_target.connector_id,
+                    self._claim_target.connector_scope_id,
+                    self._claim_target.sync_job_id,
+                )
+                return 1
             self._logger.info("event=github_ledger_planner_empty")
             return 0
-        context = _attempt_context(acquired, self._settings.worker_id)
+        context = _attempt_context(claim.attempt, self._settings.worker_id)
         self._logger.info(
             "event=github_ledger_planner_job_claimed organization_id=%s "
             "connector_id=%s connector_scope_id=%s job_id=%s attempt=%d",
@@ -161,22 +206,62 @@ class GitHubSyncLedgerPlannerHost:
         session = self._sessions()
         try:
             execution = self._execution(session)
-            recovered = execution.recover_expired_github(
-                limit=self._settings.recovery_limit
-            )
+            if self._claim_target is None:
+                recovered = execution.recover_expired_github(
+                    limit=self._settings.recovery_limit
+                )
+            else:
+                recovered = execution.recover_expired_target_github(
+                    self._claim_target.organization_id,
+                    self._claim_target.connector_id,
+                    self._claim_target.connector_scope_id,
+                    self._claim_target.sync_job_id,
+                )
             if recovered:
                 self._logger.info(
                     "event=github_ledger_planner_expired_jobs_recovered count=%d",
                     len(recovered),
                 )
-            acquired = None
+            result = _PlannerClaimResult("shutdown")
             if not self._shutdown.is_set():
-                acquired = execution.acquire_one_github(
-                    worker_id=self._settings.worker_id,
-                    lease_duration=self._settings.lease_duration,
-                )
+                if self._claim_target is None:
+                    acquired = execution.acquire_one_github(
+                        worker_id=self._settings.worker_id,
+                        lease_duration=self._settings.lease_duration,
+                    )
+                    result = (
+                        _PlannerClaimResult("acquired", acquired)
+                        if acquired is not None
+                        else _PlannerClaimResult("empty")
+                    )
+                else:
+                    targeted = execution.acquire_target_github(
+                        self._claim_target.organization_id,
+                        self._claim_target.connector_id,
+                        self._claim_target.connector_scope_id,
+                        self._claim_target.sync_job_id,
+                        worker_id=self._settings.worker_id,
+                        lease_duration=self._settings.lease_duration,
+                    )
+                    result = _PlannerClaimResult(targeted.outcome, targeted.attempt)
+                    if targeted.attempt is not None:
+                        lease = targeted.attempt.lease
+                        actual = (
+                            lease.organization_id,
+                            lease.connector_id,
+                            lease.connector_scope_id,
+                            lease.job_id,
+                        )
+                        expected = (
+                            self._claim_target.organization_id,
+                            self._claim_target.connector_id,
+                            self._claim_target.connector_scope_id,
+                            self._claim_target.sync_job_id,
+                        )
+                        if actual != expected:
+                            raise RuntimeError("targeted planner claim identity mismatch")
             session.commit()
-            return acquired
+            return result
         except Exception:
             session.rollback()
             raise
@@ -190,12 +275,13 @@ def compose_github_sync_ledger_planner_host(
     process_settings: GitHubPlannerProcessSettings,
     session_factory=SessionLocal,
     shutdown_event=None,
+    random_uniform: Callable[[float, float], float] = random.SystemRandom().uniform,
 ) -> GitHubSyncLedgerPlannerHost:
     if not process_settings.github_sync_ledger_planning_enabled:
         raise ValueError("GitHub ledger planning is disabled")
     secret_store = GoogleSecretManagerSecretStore(process_settings.secret_manager)
     github_client = GitHubAppRestClient(process_settings.github, secret_store)
-    retry = ConnectorSyncRetryPolicy()
+    retry = ConnectorSyncRetryPolicy(random_uniform=random_uniform)
 
     def execution(session: Session):
         from datetime import UTC, datetime
@@ -238,6 +324,7 @@ def compose_github_sync_ledger_planner_host(
         worker,
         settings,
         planning_enabled=True,
+        claim_target=process_settings.claim_target,
         shutdown_event=shutdown_event,
     )
 
@@ -284,6 +371,7 @@ def main(argv=None) -> int:
                 None,
                 settings,
                 planning_enabled=False,
+                claim_target=process_settings.claim_target,
                 shutdown_event=shutdown,
             ).run()
         return compose_github_sync_ledger_planner_host(

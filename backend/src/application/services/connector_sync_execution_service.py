@@ -42,6 +42,33 @@ class AcquiredRoutedSyncAttempt:
     connector_type: str
 
 
+@dataclass(frozen=True)
+class TargetedSyncAttemptResult:
+    """Acquisition result that never falls back beyond the configured target."""
+
+    outcome: str
+    attempt: AcquiredSyncAttempt | None = None
+
+    def __post_init__(self) -> None:
+        outcomes = frozenset(
+            {
+                "acquired",
+                "not_found_or_mismatched",
+                "completed",
+                "cancelled",
+                "failed",
+                "attempts_exhausted",
+                "owned_elsewhere",
+                "retry_not_due",
+                "not_eligible",
+            }
+        )
+        acquired = self.outcome == "acquired"
+        valid_attempt = isinstance(self.attempt, AcquiredSyncAttempt)
+        if self.outcome not in outcomes or acquired != valid_attempt:
+            raise ValueError("targeted synchronization attempt result is invalid")
+
+
 class ConnectorSyncExecutionService:
     def __init__(
         self,
@@ -142,6 +169,63 @@ class ConnectorSyncExecutionService:
             return None
         run = self._repository.create_attempt_run(lease, worker_id=worker_id, now=now)
         return AcquiredSyncAttempt(lease, run.id)
+
+    def acquire_target_github(
+        self,
+        organization_id: UUID,
+        connector_id: UUID,
+        connector_scope_id: UUID,
+        sync_job_id: UUID,
+        *,
+        worker_id: str,
+        lease_duration: timedelta,
+    ) -> TargetedSyncAttemptResult:
+        """Acquire only the exact target and return a fail-closed miss reason."""
+        now = self._now()
+        lease = self._repository.acquire_target_github(
+            organization_id,
+            connector_id,
+            connector_scope_id,
+            sync_job_id,
+            worker_id=worker_id,
+            lease_duration=lease_duration,
+            now=now,
+        )
+        if lease is not None:
+            run = self._repository.create_attempt_run(
+                lease,
+                worker_id=worker_id,
+                now=now,
+            )
+            return TargetedSyncAttemptResult(
+                "acquired",
+                AcquiredSyncAttempt(lease, run.id),
+            )
+        state = self._repository.get_target_github(
+            organization_id,
+            connector_id,
+            connector_scope_id,
+            sync_job_id,
+        )
+        if state is None:
+            outcome = "not_found_or_mismatched"
+        elif state.status == "succeeded":
+            outcome = "completed"
+        elif state.status == "cancelled" or state.cancellation_requested:
+            outcome = "cancelled"
+        elif state.status == "failed":
+            outcome = "failed"
+        elif state.attempt_count >= state.max_attempts:
+            outcome = "attempts_exhausted"
+        elif state.status == "running":
+            outcome = "owned_elsewhere"
+        elif state.status == "retry_wait" and (
+            state.next_attempt_at is None or state.next_attempt_at > now
+        ):
+            outcome = "retry_not_due"
+        else:
+            outcome = "not_eligible"
+        return TargetedSyncAttemptResult(outcome)
 
     def acquire_one_routed(
         self,
@@ -285,6 +369,24 @@ class ConnectorSyncExecutionService:
         """Recover only expired GitHub attempts for the dedicated planner."""
         now = self._now()
         expired = self._repository.lock_expired_github(now=now, limit=limit)
+        return self._recover_expired(expired, now)
+
+    def recover_expired_target_github(
+        self,
+        organization_id: UUID,
+        connector_id: UUID,
+        connector_scope_id: UUID,
+        sync_job_id: UUID,
+    ) -> tuple[SyncJobHistoryItem, ...]:
+        """Recover only the exact expired target; never scan global GitHub work."""
+        now = self._now()
+        expired = self._repository.lock_expired_target_github(
+            organization_id,
+            connector_id,
+            connector_scope_id,
+            sync_job_id,
+            now=now,
+        )
         return self._recover_expired(expired, now)
 
     def recover_expired_routed(

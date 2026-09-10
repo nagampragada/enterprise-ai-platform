@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+from unittest.mock import Mock
+from uuid import UUID
+
 import pytest
+
+import app.config as runtime_config
 
 from app.config import (
     DEFAULT_API_PORT,
@@ -21,6 +26,12 @@ SAFE_DATABASE = "postgresql+psycopg://sandbox_user:S4ndboxDbValue9284@db.interna
 JWT_SECRET = "Sandbox-JWT-secret-value-1234567890!"
 REFRESH_SECRET = "Sandbox-Refresh-secret-value-098765!"
 TOKEN = "0123456789abcdef0123456789abcdef"
+TARGET_VALUES = {
+    "GITHUB_LEDGER_PLANNER_TARGET_ORGANIZATION_ID": "11111111-1111-4111-8111-111111111111",
+    "GITHUB_LEDGER_PLANNER_TARGET_CONNECTOR_ID": "22222222-2222-4222-8222-222222222222",
+    "GITHUB_LEDGER_PLANNER_TARGET_SCOPE_ID": "33333333-3333-4333-8333-333333333333",
+    "GITHUB_LEDGER_PLANNER_TARGET_SYNC_JOB_ID": "44444444-4444-4444-8444-444444444444",
+}
 
 
 def _sandbox() -> dict[str, str]:
@@ -222,6 +233,85 @@ def test_github_planner_requires_no_openai_credential_and_parses_gate_strictly()
     values["GITHUB_SYNC_LEDGER_PLANNING_ENABLED"] = "TRUE"
     with pytest.raises(InvalidRuntimeConfiguration):
         validate_github_planner_process_environment(values)
+
+
+def test_github_planner_target_is_optional_and_complete_tuple_is_canonical() -> None:
+    values = _sandbox()
+    assert validate_github_planner_process_environment(values).claim_target is None
+
+    values.update(TARGET_VALUES)
+    target = validate_github_planner_process_environment(values).claim_target
+    assert target is not None
+    assert target.organization_id == UUID(
+        TARGET_VALUES["GITHUB_LEDGER_PLANNER_TARGET_ORGANIZATION_ID"]
+    )
+    assert target.connector_id == UUID(TARGET_VALUES["GITHUB_LEDGER_PLANNER_TARGET_CONNECTOR_ID"])
+    assert target.connector_scope_id == UUID(
+        TARGET_VALUES["GITHUB_LEDGER_PLANNER_TARGET_SCOPE_ID"]
+    )
+    assert target.sync_job_id == UUID(TARGET_VALUES["GITHUB_LEDGER_PLANNER_TARGET_SYNC_JOB_ID"])
+
+
+@pytest.mark.parametrize(
+    "present_names",
+    tuple(
+        tuple(name for index, name in enumerate(TARGET_VALUES) if mask & (1 << index))
+        for mask in range(1, (1 << len(TARGET_VALUES)) - 1)
+    ),
+)
+def test_github_planner_target_rejects_every_partial_tuple(present_names) -> None:
+    values = _sandbox()
+    values.update({name: TARGET_VALUES[name] for name in present_names})
+    with pytest.raises(InvalidRuntimeConfiguration, match="Runtime configuration is invalid"):
+        validate_github_planner_process_environment(values)
+
+
+@pytest.mark.parametrize("name", tuple(TARGET_VALUES))
+@pytest.mark.parametrize(
+    "invalid_value",
+    (
+        "",
+        " ",
+        "not-a-uuid",
+        "11111111111141118111111111111111",
+        "{11111111-1111-4111-8111-111111111111}",
+        "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+    ),
+)
+def test_github_planner_target_rejects_blank_malformed_and_noncanonical_values(
+    name: str,
+    invalid_value: str,
+) -> None:
+    values = _sandbox()
+    values.update(TARGET_VALUES)
+    values[name] = invalid_value
+    with pytest.raises(InvalidRuntimeConfiguration, match="Runtime configuration is invalid"):
+        validate_github_planner_process_environment(values)
+
+
+def test_invalid_planner_target_fails_before_other_configuration_loaders(monkeypatch) -> None:
+    values = {"GITHUB_LEDGER_PLANNER_TARGET_ORGANIZATION_ID": "not-a-uuid"}
+    database_loader = Mock(side_effect=AssertionError("database loader was called"))
+    github_loader = Mock(side_effect=AssertionError("GitHub loader was called"))
+    monkeypatch.setattr(runtime_config, "load_database_settings", database_loader)
+    monkeypatch.setattr(
+        runtime_config,
+        "load_github_worker_settings_from_environment",
+        github_loader,
+    )
+    with pytest.raises(InvalidRuntimeConfiguration, match="Runtime configuration is invalid"):
+        validate_github_planner_process_environment(values)
+    database_loader.assert_not_called()
+    github_loader.assert_not_called()
+
+
+def test_planner_target_variables_are_ignored_by_api_and_general_worker() -> None:
+    values = _sandbox()
+    values["GITHUB_LEDGER_PLANNER_TARGET_ORGANIZATION_ID"] = "planner-only-invalid"
+
+    assert validate_api_process_environment(values).port == 8080
+    worker = validate_worker_process_environment(values)
+    assert worker.github_sync_ledger_planning_enabled is False
 
 
 def test_scheduler_and_migration_require_database_only() -> None:

@@ -133,6 +133,17 @@ def _setup(session: Session, name: str = "Alpha"):
     return organization_id, connector_id, scope_id
 
 
+def _setup_github(session: Session, name: str = "GitHub"):
+    organization_id, connector_id, scope_id = _setup(session, name)
+    _exec(
+        session,
+        "UPDATE connectors SET connector_type='github' WHERE id=:id",
+        id=connector_id,
+    )
+    session.commit()
+    return organization_id, connector_id, scope_id
+
+
 def _scope(session: Session, organization_id, connector_id, name: str):
     space_id, scope_id = uuid.uuid4(), uuid.uuid4()
     _exec(
@@ -201,6 +212,645 @@ def _acquire_routed(session: Session, *, worker="worker-one", now=NOW):
         lease_duration=LEASE,
         now=now,
     )
+
+
+def _service(session: Session, *, now=NOW) -> ConnectorSyncExecutionService:
+    return ConnectorSyncExecutionService(
+        _repo(session),
+        ConnectorSyncRetryPolicy(random_uniform=lambda low, high: high / 2),
+        clock=lambda: now,
+    )
+
+
+def _target_claim(
+    session: Session,
+    organization_id,
+    connector_id,
+    scope_id,
+    job_id,
+    *,
+    worker="targeted-planner",
+    now=NOW,
+):
+    return _service(session, now=now).acquire_target_github(
+        organization_id,
+        connector_id,
+        scope_id,
+        job_id,
+        worker_id=worker,
+        lease_duration=LEASE,
+    )
+
+
+def test_targeted_github_claim_ignores_unrelated_eligible_jobs(session):
+    organization_id, connector_id, target_scope = _setup_github(session, "TargetExact")
+    unrelated_scope = _scope(session, organization_id, connector_id, "UnrelatedExact")
+    unrelated = _enqueue(session, organization_id, connector_id, unrelated_scope)
+    target = _enqueue(session, organization_id, connector_id, target_scope)
+    session.commit()
+
+    result = _target_claim(
+        session,
+        organization_id,
+        connector_id,
+        target_scope,
+        target.job_id,
+    )
+    session.commit()
+
+    assert result.outcome == "acquired"
+    assert result.attempt is not None
+    assert result.attempt.lease.job_id == target.job_id
+    unrelated_state = _repo(session).get(organization_id, unrelated.job_id)
+    assert unrelated_state is not None
+    assert unrelated_state.status == "queued"
+    assert unrelated_state.attempt_count == 0
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ("organization", "connector", "scope", "job"),
+)
+def test_targeted_github_claim_rejects_every_mismatched_identifier(session, mismatch):
+    organization_id, connector_id, scope_id = _setup_github(session, f"Mismatch{mismatch}")
+    job = _enqueue(session, organization_id, connector_id, scope_id)
+    session.commit()
+    identifiers = {
+        "organization": organization_id,
+        "connector": connector_id,
+        "scope": scope_id,
+        "job": job.job_id,
+    }
+    identifiers[mismatch] = uuid.uuid4()
+
+    result = _target_claim(
+        session,
+        identifiers["organization"],
+        identifiers["connector"],
+        identifiers["scope"],
+        identifiers["job"],
+    )
+
+    assert result.outcome == "not_found_or_mismatched"
+    state = _repo(session).get(organization_id, job.job_id)
+    assert state is not None
+    assert state.status == "queued"
+    assert state.attempt_count == 0
+
+
+def test_targeted_github_claim_rejects_non_github_and_nonexistent_targets(session):
+    organization_id, connector_id, scope_id = _setup(session, "NotGitHubTarget")
+    job = _enqueue(session, organization_id, connector_id, scope_id)
+    session.commit()
+
+    wrong_type = _target_claim(
+        session,
+        organization_id,
+        connector_id,
+        scope_id,
+        job.job_id,
+    )
+    missing = _target_claim(
+        session,
+        organization_id,
+        connector_id,
+        scope_id,
+        uuid.uuid4(),
+    )
+
+    assert wrong_type.outcome == "not_found_or_mismatched"
+    assert missing.outcome == "not_found_or_mismatched"
+    state = _repo(session).get(organization_id, job.job_id)
+    assert state is not None and state.status == "queued"
+
+
+@pytest.mark.parametrize(
+    ("sql_values", "expected_outcome"),
+    (
+        (
+            {
+                "status": "retry_wait",
+                "attempt_count": 1,
+                "fencing_token": 1,
+                "next_attempt_at": NOW + timedelta(minutes=1),
+            },
+            "retry_not_due",
+        ),
+        ({"cancel_requested_at": NOW}, "cancelled"),
+        (
+            {"attempt_count": 3, "max_attempts": 3, "fencing_token": 3},
+            "attempts_exhausted",
+        ),
+        (
+            {
+                "status": "succeeded",
+                "attempt_count": 1,
+                "fencing_token": 1,
+                "next_attempt_at": None,
+                "completed_at": NOW,
+            },
+            "completed",
+        ),
+        (
+            {
+                "status": "failed",
+                "attempt_count": 1,
+                "fencing_token": 1,
+                "next_attempt_at": None,
+                "completed_at": NOW,
+            },
+            "failed",
+        ),
+    ),
+)
+def test_targeted_github_claim_reports_ineligible_lifecycle_state(
+    session,
+    sql_values,
+    expected_outcome,
+):
+    organization_id, connector_id, scope_id = _setup_github(
+        session, f"Ineligible{expected_outcome}"
+    )
+    job = _enqueue(session, organization_id, connector_id, scope_id)
+    session.commit()
+    assignments = ", ".join(f"{name}=:{name}" for name in sql_values)
+    _exec(
+        session,
+        f"UPDATE connector_sync_jobs SET {assignments} WHERE id=:job_id",
+        job_id=job.job_id,
+        **sql_values,
+    )
+    session.commit()
+
+    result = _target_claim(
+        session,
+        organization_id,
+        connector_id,
+        scope_id,
+        job.job_id,
+    )
+
+    assert result.outcome == expected_outcome
+    assert result.attempt is None
+
+
+def test_targeted_github_claim_accepts_due_retry_wait(session):
+    organization_id, connector_id, scope_id = _setup_github(session, "DueRetryTarget")
+    job = _enqueue(session, organization_id, connector_id, scope_id)
+    _exec(
+        session,
+        """UPDATE connector_sync_jobs
+           SET status='retry_wait', attempt_count=1, fencing_token=1
+           WHERE id=:job_id""",
+        job_id=job.job_id,
+    )
+    session.commit()
+
+    result = _target_claim(
+        session,
+        organization_id,
+        connector_id,
+        scope_id,
+        job.job_id,
+    )
+
+    assert result.outcome == "acquired"
+    assert result.attempt is not None
+    assert result.attempt.lease.attempt_number == 2
+
+
+def test_targeted_github_claim_does_not_override_active_lease(session):
+    organization_id, connector_id, scope_id = _setup_github(session, "LeasedTarget")
+    job = _enqueue(session, organization_id, connector_id, scope_id)
+    first = _target_claim(
+        session,
+        organization_id,
+        connector_id,
+        scope_id,
+        job.job_id,
+        worker="first-owner",
+    )
+    session.commit()
+
+    second = _target_claim(
+        session,
+        organization_id,
+        connector_id,
+        scope_id,
+        job.job_id,
+        worker="second-owner",
+    )
+
+    assert first.outcome == "acquired"
+    assert second.outcome == "owned_elsewhere"
+    assert second.attempt is None
+
+
+def test_targeted_recovery_changes_only_exact_expired_job_and_fences_stale_owner(session):
+    organization_id, connector_id, target_scope = _setup_github(session, "TargetRecovery")
+    unrelated_scope = _scope(session, organization_id, connector_id, "UnrelatedRecovery")
+    target_job = _enqueue(session, organization_id, connector_id, target_scope)
+    unrelated_job = _enqueue(session, organization_id, connector_id, unrelated_scope)
+    target = _target_claim(
+        session,
+        organization_id,
+        connector_id,
+        target_scope,
+        target_job.job_id,
+        worker="stale-target",
+    )
+    unrelated = _target_claim(
+        session,
+        organization_id,
+        connector_id,
+        unrelated_scope,
+        unrelated_job.job_id,
+        worker="unrelated-owner",
+    )
+    session.commit()
+    assert target.attempt is not None and unrelated.attempt is not None
+    recovery_time = NOW + LEASE + timedelta(seconds=1)
+
+    recovered = _service(session, now=recovery_time).recover_expired_target_github(
+        organization_id,
+        connector_id,
+        target_scope,
+        target_job.job_id,
+    )
+    session.commit()
+
+    assert len(recovered) == 1
+    assert recovered[0].job_id == target_job.job_id
+    target_state = _repo(session).get(organization_id, target_job.job_id)
+    unrelated_state = _repo(session).get(organization_id, unrelated_job.job_id)
+    assert target_state is not None and target_state.status == "retry_wait"
+    assert unrelated_state is not None and unrelated_state.status == "running"
+    with pytest.raises(LostSyncJobLease):
+        _service(session, now=recovery_time).heartbeat(
+            target.attempt.lease,
+            worker_id="stale-target",
+            lease_duration=LEASE,
+        )
+
+
+def test_mismatched_target_recovery_leaves_expired_job_unchanged(session):
+    organization_id, connector_id, scope_id = _setup_github(session, "MismatchedRecovery")
+    job = _enqueue(session, organization_id, connector_id, scope_id)
+    acquired = _target_claim(
+        session,
+        organization_id,
+        connector_id,
+        scope_id,
+        job.job_id,
+    )
+    session.commit()
+    assert acquired.attempt is not None
+    recovery_time = NOW + LEASE + timedelta(seconds=1)
+
+    recovered = _service(session, now=recovery_time).recover_expired_target_github(
+        organization_id,
+        connector_id,
+        uuid.uuid4(),
+        job.job_id,
+    )
+
+    assert recovered == ()
+    state = _repo(session).get(organization_id, job.job_id)
+    assert state is not None
+    assert state.status == "running"
+    assert state.last_error_code is None
+
+
+@pytest.mark.parametrize(
+    ("maximum", "request_cancellation", "expected_status"),
+    ((3, True, "cancelled"), (1, False, "failed")),
+)
+def test_targeted_recovery_preserves_cancellation_and_attempt_limit_semantics(
+    session,
+    maximum,
+    request_cancellation,
+    expected_status,
+):
+    organization_id, connector_id, scope_id = _setup_github(
+        session, f"Recovery{expected_status}"
+    )
+    job = _enqueue(
+        session,
+        organization_id,
+        connector_id,
+        scope_id,
+        maximum=maximum,
+    )
+    acquired = _target_claim(
+        session,
+        organization_id,
+        connector_id,
+        scope_id,
+        job.job_id,
+    )
+    assert acquired.attempt is not None
+    if request_cancellation:
+        _exec(
+            session,
+            "UPDATE connector_sync_jobs SET cancel_requested_at=:now WHERE id=:job_id",
+            now=NOW,
+            job_id=job.job_id,
+        )
+    session.commit()
+    recovery_time = NOW + LEASE + timedelta(seconds=1)
+
+    recovered = _service(session, now=recovery_time).recover_expired_target_github(
+        organization_id,
+        connector_id,
+        scope_id,
+        job.job_id,
+    )
+    session.commit()
+
+    assert len(recovered) == 1
+    assert recovered[0].status == expected_status
+    state = _repo(session).get(organization_id, job.job_id)
+    assert state is not None
+    assert state.status == expected_status
+    assert state.next_attempt_at is None
+
+
+def test_targeted_claim_and_attempt_run_roll_back_together(engine):
+    setup = Session(engine, expire_on_commit=False)
+    organization_id, connector_id, scope_id = _setup_github(setup, "TargetRollback")
+    job = _enqueue(setup, organization_id, connector_id, scope_id)
+    setup.commit()
+    result = _target_claim(
+        setup,
+        organization_id,
+        connector_id,
+        scope_id,
+        job.job_id,
+    )
+    assert result.outcome == "acquired"
+    setup.rollback()
+    setup.close()
+
+    verify = Session(engine, expire_on_commit=False)
+    try:
+        state = _repo(verify).get(organization_id, job.job_id)
+        runs = verify.scalars(
+            select(ConnectorSyncRun).where(ConnectorSyncRun.sync_job_id == job.job_id)
+        ).all()
+        assert state is not None
+        assert state.status == "queued"
+        assert state.attempt_count == 0
+        assert runs == []
+    finally:
+        verify.close()
+
+
+def test_targeted_attempt_run_failure_cannot_leave_committed_claim(engine):
+    setup = Session(engine, expire_on_commit=False)
+    organization_id, connector_id, scope_id = _setup_github(
+        setup, "TargetRunFailure"
+    )
+    job = _enqueue(setup, organization_id, connector_id, scope_id)
+    existing_run = ConnectorSyncRun(
+        id=uuid.uuid4(),
+        organization_id=organization_id,
+        connector_id=connector_id,
+        connector_scope_id=scope_id,
+        sync_job_id=job.job_id,
+        job_attempt_number=1,
+        mode="incremental",
+        trigger_type="manual",
+        status="completed",
+        started_at=NOW,
+        heartbeat_at=NOW,
+        finished_at=NOW,
+        run_metadata={"fixture": "attempt_conflict"},
+    )
+    setup.add(existing_run)
+    setup.commit()
+    existing_run_id = existing_run.id
+
+    with pytest.raises(SyncJobConflict, match="attempt run already exists"):
+        _target_claim(
+            setup,
+            organization_id,
+            connector_id,
+            scope_id,
+            job.job_id,
+        )
+    setup.rollback()
+    setup.close()
+
+    verify = Session(engine, expire_on_commit=False)
+    try:
+        state = _repo(verify).get(organization_id, job.job_id)
+        runs = verify.scalars(
+            select(ConnectorSyncRun).where(ConnectorSyncRun.sync_job_id == job.job_id)
+        ).all()
+        assert state is not None
+        assert state.status == "queued"
+        assert state.attempt_count == 0
+        assert [run.id for run in runs] == [existing_run_id]
+    finally:
+        verify.close()
+
+
+def test_targeted_recovery_rolls_back_without_partial_lifecycle_mutation(engine):
+    setup = Session(engine, expire_on_commit=False)
+    organization_id, connector_id, scope_id = _setup_github(setup, "RecoveryRollback")
+    job = _enqueue(setup, organization_id, connector_id, scope_id)
+    acquired = _target_claim(
+        setup,
+        organization_id,
+        connector_id,
+        scope_id,
+        job.job_id,
+    )
+    setup.commit()
+    assert acquired.attempt is not None
+    recovery_time = NOW + LEASE + timedelta(seconds=1)
+
+    recovered = _service(setup, now=recovery_time).recover_expired_target_github(
+        organization_id,
+        connector_id,
+        scope_id,
+        job.job_id,
+    )
+    assert len(recovered) == 1
+    setup.rollback()
+    setup.close()
+
+    verify = Session(engine, expire_on_commit=False)
+    try:
+        state = _repo(verify).get(organization_id, job.job_id)
+        assert state is not None
+        assert state.status == "running"
+        assert state.last_error_code is None
+        assert state.attempt_count == acquired.attempt.lease.attempt_number
+    finally:
+        verify.close()
+
+
+def test_concurrent_targeted_claim_has_exactly_one_winner(engine):
+    setup = Session(engine, expire_on_commit=False)
+    organization_id, connector_id, scope_id = _setup_github(
+        setup, "TargetConcurrency"
+    )
+    job = _enqueue(setup, organization_id, connector_id, scope_id)
+    setup.commit()
+    setup.close()
+    barrier = threading.Barrier(2)
+    results, errors = [], []
+
+    def claim(worker):
+        value = Session(engine, expire_on_commit=False)
+        try:
+            barrier.wait()
+            results.append(
+                _target_claim(
+                    value,
+                    organization_id,
+                    connector_id,
+                    scope_id,
+                    job.job_id,
+                    worker=worker,
+                )
+            )
+            value.commit()
+        except Exception as error:  # pragma: no cover - asserted below
+            errors.append(error)
+            value.rollback()
+        finally:
+            value.close()
+
+    threads = [
+        threading.Thread(target=claim, args=(f"target-{index}",))
+        for index in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert not errors
+    assert sum(result.outcome == "acquired" for result in results) == 1
+    assert sum(result.outcome in {"owned_elsewhere", "not_eligible"} for result in results) == 1
+
+
+def test_concurrent_targeted_and_global_claim_have_one_owner(engine):
+    setup = Session(engine, expire_on_commit=False)
+    organization_id, connector_id, scope_id = _setup_github(
+        setup, "TargetGlobalRace"
+    )
+    job = _enqueue(setup, organization_id, connector_id, scope_id)
+    setup.commit()
+    setup.close()
+    barrier = threading.Barrier(2)
+    results = {}
+    errors = []
+
+    def claim_targeted():
+        session = Session(engine, expire_on_commit=False)
+        try:
+            barrier.wait()
+            results["targeted"] = _target_claim(
+                session,
+                organization_id,
+                connector_id,
+                scope_id,
+                job.job_id,
+                worker="targeted-racer",
+            )
+            session.commit()
+        except Exception as error:
+            errors.append(error)
+            session.rollback()
+        finally:
+            session.close()
+
+    def claim_global():
+        session = Session(engine, expire_on_commit=False)
+        try:
+            barrier.wait()
+            results["global"] = _service(session).acquire_one_github(
+                worker_id="global-racer",
+                lease_duration=LEASE,
+            )
+            session.commit()
+        except Exception as error:
+            errors.append(error)
+            session.rollback()
+        finally:
+            session.close()
+
+    threads = [
+        threading.Thread(target=claim_targeted),
+        threading.Thread(target=claim_global),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert not errors
+    targeted = results["targeted"]
+    global_attempt = results["global"]
+    winners = int(targeted.outcome == "acquired") + int(global_attempt is not None)
+    assert winners == 1
+    verify = Session(engine, expire_on_commit=False)
+    try:
+        runs = verify.scalars(
+            select(ConnectorSyncRun).where(ConnectorSyncRun.sync_job_id == job.job_id)
+        ).all()
+        assert len(runs) == 1
+    finally:
+        verify.close()
+
+
+def test_global_consumer_winning_target_does_not_make_targeted_claim_fall_back(session):
+    organization_id, connector_id, target_scope = _setup_github(session, "CompetingTarget")
+    unrelated_scope = _scope(session, organization_id, connector_id, "CompetingUnrelated")
+    target = _repo(session).enqueue_or_coalesce(
+        organization_id,
+        connector_id,
+        target_scope,
+        mode="incremental",
+        trigger_type="manual",
+        priority=1,
+        now=NOW,
+    )
+    unrelated = _repo(session).enqueue_or_coalesce(
+        organization_id,
+        connector_id,
+        unrelated_scope,
+        mode="incremental",
+        trigger_type="manual",
+        priority=100,
+        now=NOW,
+    )
+    session.commit()
+    global_winner = _service(session).acquire_one_github(
+        worker_id="global-consumer",
+        lease_duration=LEASE,
+    )
+    session.commit()
+    assert global_winner is not None and global_winner.lease.job_id == target.job_id
+
+    targeted = _target_claim(
+        session,
+        organization_id,
+        connector_id,
+        target_scope,
+        target.job_id,
+    )
+
+    assert targeted.outcome == "owned_elsewhere"
+    unrelated_state = _repo(session).get(organization_id, unrelated.job_id)
+    assert unrelated_state is not None
+    assert unrelated_state.status == "queued"
+    assert unrelated_state.attempt_count == 0
 
 
 def test_routed_claim_has_one_concurrent_winner_and_uses_persisted_type(engine):

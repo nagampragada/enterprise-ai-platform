@@ -12,6 +12,7 @@ from sqlalchemy import and_, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.elements import ColumnElement
 
 from infrastructure.db.models import (
     Connector,
@@ -383,6 +384,33 @@ class ConnectorSyncJobRepository:
         )
         return routed.lease if routed is not None else None
 
+    def acquire_target_github(
+        self,
+        organization_id: UUID,
+        connector_id: UUID,
+        connector_scope_id: UUID,
+        sync_job_id: UUID,
+        *,
+        worker_id: str,
+        lease_duration: timedelta,
+        now: datetime,
+    ) -> SyncJobLease | None:
+        """Atomically claim only the exact tenant-qualified GitHub job."""
+        target = _target_identifiers(
+            organization_id,
+            connector_id,
+            connector_scope_id,
+            sync_job_id,
+        )
+        routed = self._acquire_routed(
+            worker_id=worker_id,
+            lease_duration=lease_duration,
+            now=now,
+            connector_type="github",
+            target_predicates=_target_predicates(target),
+        )
+        return routed.lease if routed is not None else None
+
     def acquire_next_routed(
         self,
         *,
@@ -406,6 +434,23 @@ class ConnectorSyncJobRepository:
         now: datetime,
         connector_type: str | None,
     ) -> RoutedSyncJobLease | None:
+        return self._acquire_routed(
+            worker_id=worker_id,
+            lease_duration=lease_duration,
+            now=now,
+            connector_type=connector_type,
+            target_predicates=(),
+        )
+
+    def _acquire_routed(
+        self,
+        *,
+        worker_id: str,
+        lease_duration: timedelta,
+        now: datetime,
+        connector_type: str | None,
+        target_predicates: tuple[ColumnElement[bool], ...],
+    ) -> RoutedSyncJobLease | None:
         worker_id = _worker_id(worker_id)
         now = _aware("now", now)
         duration = _lease_duration(lease_duration)
@@ -425,6 +470,7 @@ class ConnectorSyncJobRepository:
                 ConnectorSyncJob.next_attempt_at <= now,
                 ConnectorSyncJob.cancel_requested_at.is_(None),
                 ConnectorSyncJob.attempt_count < ConnectorSyncJob.max_attempts,
+                *target_predicates,
             )
             .order_by(
                 ConnectorSyncJob.priority,
@@ -445,6 +491,7 @@ class ConnectorSyncJobRepository:
                 ConnectorSyncJob.next_attempt_at <= now,
                 ConnectorSyncJob.cancel_requested_at.is_(None),
                 ConnectorSyncJob.attempt_count < ConnectorSyncJob.max_attempts,
+                *target_predicates,
             )
             .values(
                 status="running",
@@ -768,6 +815,29 @@ class ConnectorSyncJobRepository:
         """Lock expired GitHub attempts without consuming other connector work."""
         return self._lock_expired_routed(now=now, limit=limit, connector_type="github")
 
+    def lock_expired_target_github(
+        self,
+        organization_id: UUID,
+        connector_id: UUID,
+        connector_scope_id: UUID,
+        sync_job_id: UUID,
+        *,
+        now: datetime,
+    ) -> tuple[ExpiredSyncJobLease, ...]:
+        """Lock only the exact expired tenant-qualified GitHub attempt."""
+        target = _target_identifiers(
+            organization_id,
+            connector_id,
+            connector_scope_id,
+            sync_job_id,
+        )
+        return self._lock_expired_routed_with_predicates(
+            now=now,
+            limit=1,
+            connector_type="github",
+            target_predicates=_target_predicates(target),
+        )
+
     def lock_expired_routed(
         self, *, now: datetime, limit: int
     ) -> tuple[ExpiredSyncJobLease, ...]:
@@ -775,6 +845,21 @@ class ConnectorSyncJobRepository:
 
     def _lock_expired_routed(
         self, *, now: datetime, limit: int, connector_type: str | None
+    ) -> tuple[ExpiredSyncJobLease, ...]:
+        return self._lock_expired_routed_with_predicates(
+            now=now,
+            limit=limit,
+            connector_type=connector_type,
+            target_predicates=(),
+        )
+
+    def _lock_expired_routed_with_predicates(
+        self,
+        *,
+        now: datetime,
+        limit: int,
+        connector_type: str | None,
+        target_predicates: tuple[ColumnElement[bool], ...],
     ) -> tuple[ExpiredSyncJobLease, ...]:
         now = _aware("now", now)
         limit = _recovery_limit(limit)
@@ -791,6 +876,7 @@ class ConnectorSyncJobRepository:
                 persisted_connector,
                 ConnectorSyncJob.status == "running",
                 ConnectorSyncJob.lease_expires_at <= now,
+                *target_predicates,
             )
             .order_by(ConnectorSyncJob.lease_expires_at, ConnectorSyncJob.id)
             .with_for_update(of=ConnectorSyncJob, skip_locked=True)
@@ -920,6 +1006,38 @@ class ConnectorSyncJobRepository:
                 ConnectorSyncJob.id == _uuid("job_id", job_id),
             ),
             "synchronization job could not be read",
+        )
+        return _history(row) if row is not None else None
+
+    def get_target_github(
+        self,
+        organization_id: UUID,
+        connector_id: UUID,
+        connector_scope_id: UUID,
+        sync_job_id: UUID,
+    ) -> SyncJobHistoryItem | None:
+        """Read an exact target only when its persisted connector is GitHub."""
+        target = _target_identifiers(
+            organization_id,
+            connector_id,
+            connector_scope_id,
+            sync_job_id,
+        )
+        persisted_connector = (
+            select(Connector.id)
+            .where(
+                Connector.organization_id == ConnectorSyncJob.organization_id,
+                Connector.id == ConnectorSyncJob.connector_id,
+                Connector.connector_type == "github",
+            )
+            .exists()
+        )
+        row = self._one(
+            select(ConnectorSyncJob).where(
+                persisted_connector,
+                *_target_predicates(target),
+            ),
+            "target synchronization job could not be read",
         )
         return _history(row) if row is not None else None
 
@@ -1237,6 +1355,32 @@ def _history(row: ConnectorSyncJob) -> SyncJobHistoryItem:
         row.last_error_category,
         row.last_error_code,
         row.created_at,
+    )
+
+
+def _target_identifiers(
+    organization_id: UUID,
+    connector_id: UUID,
+    connector_scope_id: UUID,
+    sync_job_id: UUID,
+) -> tuple[UUID, UUID, UUID, UUID]:
+    return (
+        _uuid("organization_id", organization_id),
+        _uuid("connector_id", connector_id),
+        _uuid("connector_scope_id", connector_scope_id),
+        _uuid("sync_job_id", sync_job_id),
+    )
+
+
+def _target_predicates(
+    target: tuple[UUID, UUID, UUID, UUID],
+) -> tuple[ColumnElement[bool], ...]:
+    organization_id, connector_id, connector_scope_id, sync_job_id = target
+    return (
+        ConnectorSyncJob.organization_id == organization_id,
+        ConnectorSyncJob.connector_id == connector_id,
+        ConnectorSyncJob.connector_scope_id == connector_scope_id,
+        ConnectorSyncJob.id == sync_job_id,
     )
 
 

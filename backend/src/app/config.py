@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from urllib.parse import urlparse
+from uuid import UUID
 
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
@@ -142,6 +143,16 @@ class WorkerProcessSettings:
 
 
 @dataclass(frozen=True, repr=False)
+class GitHubPlannerClaimTarget:
+    """Exact synchronization job that a controlled planner may claim."""
+
+    organization_id: UUID
+    connector_id: UUID
+    connector_scope_id: UUID
+    sync_job_id: UUID
+
+
+@dataclass(frozen=True, repr=False)
 class GitHubPlannerProcessSettings:
     """Provider configuration for ledger discovery without OpenAI credentials."""
 
@@ -149,6 +160,7 @@ class GitHubPlannerProcessSettings:
     github: GitHubWorkerSettings
     secret_manager: GoogleSecretManagerSettings
     github_sync_ledger_planning_enabled: bool = False
+    claim_target: GitHubPlannerClaimTarget | None = None
 
 
 def load_runtime_environment(environ: Mapping[str, str] | None = None) -> str:
@@ -385,6 +397,7 @@ def validate_github_planner_process_environment(
 ) -> GitHubPlannerProcessSettings:
     """Validate the dedicated planner without reading or requiring OpenAI."""
     values = os.environ if environ is None else environ
+    claim_target = _optional_github_planner_claim_target(values)
     database = load_database_settings(values)
     github = load_github_worker_settings_from_environment(values)
     secret_manager = load_google_secret_manager_settings_from_environment(values)
@@ -403,6 +416,7 @@ def validate_github_planner_process_environment(
             "GITHUB_SYNC_LEDGER_PLANNING_ENABLED",
             default=False,
         ),
+        claim_target,
     )
 
 
@@ -583,3 +597,32 @@ def _optional_strict_boolean(
     if supplied == "false":
         return False
     raise InvalidRuntimeConfiguration("Runtime configuration is invalid")
+
+
+def _optional_github_planner_claim_target(
+    values: Mapping[str, str],
+) -> GitHubPlannerClaimTarget | None:
+    names = (
+        "GITHUB_LEDGER_PLANNER_TARGET_ORGANIZATION_ID",
+        "GITHUB_LEDGER_PLANNER_TARGET_CONNECTOR_ID",
+        "GITHUB_LEDGER_PLANNER_TARGET_SCOPE_ID",
+        "GITHUB_LEDGER_PLANNER_TARGET_SYNC_JOB_ID",
+    )
+    supplied = tuple(name in values for name in names)
+    if not any(supplied):
+        return None
+    if not all(supplied):
+        raise InvalidRuntimeConfiguration("Runtime configuration is invalid")
+    identifiers: list[UUID] = []
+    for name in names:
+        value = values[name]
+        if not isinstance(value, str):
+            raise InvalidRuntimeConfiguration("Runtime configuration is invalid")
+        try:
+            identifier = UUID(value)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise InvalidRuntimeConfiguration("Runtime configuration is invalid") from exc
+        if str(identifier) != value:
+            raise InvalidRuntimeConfiguration("Runtime configuration is invalid")
+        identifiers.append(identifier)
+    return GitHubPlannerClaimTarget(*identifiers)

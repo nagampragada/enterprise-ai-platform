@@ -467,6 +467,18 @@ same true flag before concurrent execution, or the legacy host must remain idle.
 A legacy template at false retains its historical GitHub claim route. Lease,
 fence, cancellation, and retry authority remain database-backed.
 
+The planner also supports a locally implemented, default-inert exact-target
+contract using an all-or-none canonical organization/connector/scope/job UUID
+tuple. Targeted mode uses target-only expired recovery and applies all four
+predicates plus the persisted GitHub type inside the atomic claim and update
+recheck. It has no global fallback and preserves one claim followed by bounded
+continuation batches for that job. Global behavior is unchanged when the tuple
+is absent, and no schema change is needed. This is controlled-execution safety,
+not exclusive reservation: another legacy/global consumer can still win first.
+Automatic-invocation evidence and an exclusive production window therefore
+remain unresolved, the persistent planner remains disabled in reported evidence,
+and no production execution is authorized by this implementation.
+
 Migration `20260831_000021` adds retrieval-isolated materialization and chunk
 tables for the default-off Phase 3 processor. When
 `GITHUB_SYNC_LEDGER_PROCESSING_ENABLED=true` and the legacy queue is empty, one

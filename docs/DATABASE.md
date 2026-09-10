@@ -255,6 +255,17 @@ state. When the same planning flag is true on the legacy host, that host claims
 Local Folder jobs only. Because deployment environments are independent, an
 operator must update both worker templates consistently or keep the legacy host
 idle; a legacy host left at false still has its historical GitHub claim route.
+A controlled planner may supply an exact all-or-none tenant/connector/scope/job
+UUID tuple. In that mode the existing transaction applies every identifier and
+the persisted GitHub connector predicate inside both target-only expired recovery
+and the atomic `FOR UPDATE SKIP LOCKED` claim/update recheck. It never recovers or
+claims an unrelated row and never falls back to the global query. Claim plus
+attempt-run allocation remains caller-committed as one transaction; existing
+lease UUID, attempt, fence, cancellation, expiry, heartbeat, retry, and stale
+writer checks are unchanged. No migration or index is required because the
+target uses the existing job key and tenant-qualified connector/scope integrity.
+This prevents wrong-target mutation by the controlled planner but does not make
+it win a race with another valid global consumer.
 A separate strict worker-only
 `GITHUB_SYNC_LEDGER_PROCESSING_ENABLED=true` gate enables one-at-a-time GitHub
 file-work claiming only after discovery is complete and only when the legacy

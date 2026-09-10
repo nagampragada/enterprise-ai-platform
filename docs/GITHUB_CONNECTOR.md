@@ -77,6 +77,28 @@ complete; the durable cursor is continued only after normal fenced lease
 expiry/recovery. Each batch still obeys the 500-row ledger cap and each provider
 continuation still obeys the tree/request limits below.
 
+An optional controlled mode binds the planner to one exact organization,
+connector, scope, and synchronization-job UUID. All four
+`GITHUB_LEDGER_PLANNER_TARGET_*` settings must be present in lowercase canonical
+UUID form or all must be absent; invalid targeting fails before composition.
+Target predicates are part of target-only expired recovery and the atomic claim,
+not a post-claim Python filter. There is no global fallback. A target miss,
+terminal/cancelled/exhausted state, future retry, or lease held elsewhere is a
+non-successful execution outcome and cannot select unrelated work. Omitting the
+tuple preserves global mode. One invocation still performs one claim and then
+multiple bounded continuation batches for only that job; budget exhaustion is
+resumable and never triggers another claim. Database leases prevent duplicate
+ownership but do not reserve which consumer wins, so an older/global worker may
+still acquire the target first. Production targeting remains blocked on an
+exclusive consumer window and complete automatic-invocation evidence.
+
+Target misses emit the safe target tuple plus exactly one of `completed`,
+`cancelled`, `failed`, `attempts_exhausted`, `owned_elsewhere`,
+`retry_not_due`, `not_eligible`, or `not_found_or_mismatched`. These labels are
+post-failed-claim state observations, not atomic explanations of why the claim
+lost; concurrent state can change immediately. They prove only that this
+invocation acquired no target and performed no global fallback.
+
 Exclusive ownership is enforced in process routing when the planning flag is
 consistent across worker templates: `true` makes the legacy connector host
 recover and claim Local Folder jobs only, while the dedicated planner recovers
