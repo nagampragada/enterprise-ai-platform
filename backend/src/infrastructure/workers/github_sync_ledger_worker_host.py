@@ -20,7 +20,12 @@ from uuid import UUID, uuid4
 from openai import OpenAI
 from sqlalchemy.orm import Session
 
-from app.config import WorkerProcessSettings, validate_worker_process_environment
+from app.config import (
+    GitHubProcessorClaimTarget,
+    WorkerProcessSettings,
+    load_github_processor_claim_target,
+    validate_worker_process_environment,
+)
 from application.services.connector_sync_retry_policy import ConnectorSyncRetryPolicy
 from application.services.github_repository_content_service import (
     GitHubRepositoryContentService,
@@ -124,10 +129,15 @@ class GitHubLedgerWorkerSettings:
     provider_call_timeout: timedelta = timedelta(
         seconds=OPENAI_PROVIDER_CALL_TIMEOUT_SECONDS
     )
+    claim_target: GitHubProcessorClaimTarget | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.processing_enabled, bool):
             raise ValueError("processing_enabled must be a boolean")
+        if self.claim_target is not None and not isinstance(
+            self.claim_target, GitHubProcessorClaimTarget
+        ):
+            raise ValueError("processor claim target is invalid")
         if not isinstance(self.worker_id, str) or re.fullmatch(
             r"[A-Za-z0-9][A-Za-z0-9._:-]{0,254}", self.worker_id
         ) is None:
@@ -135,6 +145,8 @@ class GitHubLedgerWorkerSettings:
         _bounded_integer(
             "max_items_per_execution", self.max_items_per_execution, 500
         )
+        if self.claim_target is not None and self.max_items_per_execution != 1:
+            raise ValueError("targeted processing requires max-items=1")
         _bounded_integer("empty_poll_limit", self.empty_poll_limit, 100)
         _bounded_integer("recovery_limit", self.recovery_limit, 500)
         for name, value, maximum in (
@@ -166,6 +178,7 @@ class GitHubLedgerWorkerSettings:
         environ: Mapping[str, str] | None = None,
         *,
         processing_enabled: bool,
+        claim_target: GitHubProcessorClaimTarget | None = None,
     ) -> GitHubLedgerWorkerSettings:
         parser = argparse.ArgumentParser(
             description="Drain isolated GitHub synchronization ledger work",
@@ -260,6 +273,7 @@ class GitHubLedgerWorkerSettings:
             provider_call_timeout=timedelta(
                 seconds=OPENAI_PROVIDER_CALL_TIMEOUT_SECONDS
             ),
+            claim_target=claim_target,
         )
 
 
@@ -415,6 +429,13 @@ class GitHubSyncLedgerWorkerHost:
                         break
                     continue
 
+                if (
+                    self._settings.claim_target is not None
+                    and result.attempt_number is None
+                ):
+                    stop_reason, exit_code = _target_stop(result.outcome)
+                    break
+
                 empty_polls = 0
                 counts["items_claimed"] += 1
                 self._record(result, counts)
@@ -432,6 +453,9 @@ class GitHubSyncLedgerWorkerHost:
                     result.fairness_claim_sequence,
                     max(0.0, self._monotonic() - item_started),
                 )
+                if self._settings.claim_target is not None:
+                    stop_reason, exit_code = _target_stop(result.outcome)
+                    break
                 if result.outcome == "retry_scheduled":
                     if result.reason_code == "shutdown_grace_expired":
                         stop_reason = "shutdown_grace_expired"
@@ -627,6 +651,7 @@ def compose_github_sync_ledger_worker_host(
         progress_check=getattr(
             shutdown_event, "raise_if_grace_expired", lambda: None
         ),
+        claim_target=settings.claim_target,
     )
     return GitHubSyncLedgerWorkerHost(
         worker, settings, shutdown_event=shutdown_event
@@ -645,12 +670,14 @@ def install_shutdown_signal_handlers(event) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     try:
+        claim_target = load_github_processor_claim_target()
         process_settings = validate_worker_process_environment()
         settings = GitHubLedgerWorkerSettings.from_environment(
             argv,
             processing_enabled=(
                 process_settings.github_sync_ledger_processing_enabled
             ),
+            claim_target=claim_target,
         )
         shutdown = GitHubLedgerShutdownState(settings.shutdown_timeout)
         install_shutdown_signal_handlers(shutdown)
@@ -719,13 +746,53 @@ def _run_status(stop_reason: str) -> str:
         return "partial"
     if stop_reason == "retry_scheduled":
         return "retry_scheduled"
+    if stop_reason in {"target_completed", "target_already_terminal", "target_cancelled"}:
+        return "completed"
+    if stop_reason == "target_retry_pending":
+        return "retry_scheduled"
     if stop_reason == "shutdown_requested":
         return "stopped"
     if stop_reason == "shutdown_grace_expired":
         return "retry_scheduled"
-    if stop_reason in {"lease_or_fence_lost", "item_failed", "fatal_error"}:
+    if stop_reason in {
+        "lease_or_fence_lost",
+        "item_failed",
+        "fatal_error",
+        "target_failed",
+        "target_quarantined",
+        "target_not_acquired",
+    }:
         return "failed"
     raise ValueError("GitHub ledger host stop reason is invalid")
+
+
+def _target_stop(outcome: str) -> tuple[str, GitHubLedgerHostExitCode]:
+    if outcome == "completed":
+        return "target_completed", GitHubLedgerHostExitCode.SUCCESS
+    if outcome in {"retry_scheduled", "retry_not_due"}:
+        return "target_retry_pending", GitHubLedgerHostExitCode.RETRY_SCHEDULED
+    if outcome in {"cancelled", "recovered_cancelled", "already_cancelled"}:
+        return "target_cancelled", GitHubLedgerHostExitCode.SUCCESS
+    if outcome in {"quarantined", "already_quarantined"}:
+        return "target_quarantined", GitHubLedgerHostExitCode.ITEM_FAILED
+    if outcome in {
+        "failed",
+        "recovered_failed",
+        "already_failed",
+        "lost_lease",
+    }:
+        return "target_failed", GitHubLedgerHostExitCode.FAILURE
+    if outcome in {"already_succeeded", "already_skipped"}:
+        return "target_already_terminal", GitHubLedgerHostExitCode.SUCCESS
+    if outcome in {
+        "reservation_unavailable",
+        "target_unavailable",
+        "target_mismatch",
+        "target_busy",
+        "attempts_exhausted",
+    }:
+        return "target_not_acquired", GitHubLedgerHostExitCode.FAILURE
+    raise RuntimeError("GitHub targeted worker returned an invalid outcome")
 
 
 if __name__ == "__main__":

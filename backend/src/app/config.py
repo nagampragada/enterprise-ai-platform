@@ -14,6 +14,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 
 from application.ports.secret_store import SecretReference
+from domain.connectors.sync_control_reservation import ControlReservationOwner
 
 
 APP_ENVIRONMENT_VARIABLE = "APP_ENVIRONMENT"
@@ -150,6 +151,19 @@ class GitHubPlannerClaimTarget:
     connector_id: UUID
     connector_scope_id: UUID
     sync_job_id: UUID
+    reservation_owner: ControlReservationOwner
+
+
+@dataclass(frozen=True, repr=False)
+class GitHubProcessorClaimTarget:
+    """Exact reserved file work that a controlled processor may claim."""
+
+    organization_id: UUID
+    connector_id: UUID
+    connector_scope_id: UUID
+    generation_id: UUID
+    work_item_id: UUID
+    reservation_owner: ControlReservationOwner
 
 
 @dataclass(frozen=True, repr=False)
@@ -607,6 +621,8 @@ def _optional_github_planner_claim_target(
         "GITHUB_LEDGER_PLANNER_TARGET_CONNECTOR_ID",
         "GITHUB_LEDGER_PLANNER_TARGET_SCOPE_ID",
         "GITHUB_LEDGER_PLANNER_TARGET_SYNC_JOB_ID",
+        "GITHUB_LEDGER_CONTROL_RESERVATION_ID",
+        "GITHUB_LEDGER_CONTROL_RESERVATION_OWNER_TOKEN",
     )
     supplied = tuple(name in values for name in names)
     if not any(supplied):
@@ -614,7 +630,7 @@ def _optional_github_planner_claim_target(
     if not all(supplied):
         raise InvalidRuntimeConfiguration("Runtime configuration is invalid")
     identifiers: list[UUID] = []
-    for name in names:
+    for name in names[:-1]:
         value = values[name]
         if not isinstance(value, str):
             raise InvalidRuntimeConfiguration("Runtime configuration is invalid")
@@ -625,4 +641,47 @@ def _optional_github_planner_claim_target(
         if str(identifier) != value:
             raise InvalidRuntimeConfiguration("Runtime configuration is invalid")
         identifiers.append(identifier)
-    return GitHubPlannerClaimTarget(*identifiers)
+    try:
+        owner = ControlReservationOwner(identifiers[-1], values[names[-1]])
+    except (TypeError, ValueError) as exc:
+        raise InvalidRuntimeConfiguration("Runtime configuration is invalid") from exc
+    return GitHubPlannerClaimTarget(*identifiers[:-1], owner)
+
+
+def load_github_processor_claim_target(
+    environ: Mapping[str, str] | None = None,
+) -> GitHubProcessorClaimTarget | None:
+    """Validate an execution-scoped target before composing database/providers."""
+
+    values = os.environ if environ is None else environ
+    names = (
+        "GITHUB_LEDGER_PROCESSOR_TARGET_ORGANIZATION_ID",
+        "GITHUB_LEDGER_PROCESSOR_TARGET_CONNECTOR_ID",
+        "GITHUB_LEDGER_PROCESSOR_TARGET_SCOPE_ID",
+        "GITHUB_LEDGER_PROCESSOR_TARGET_GENERATION_ID",
+        "GITHUB_LEDGER_PROCESSOR_TARGET_WORK_ITEM_ID",
+        "GITHUB_LEDGER_CONTROL_RESERVATION_ID",
+        "GITHUB_LEDGER_CONTROL_RESERVATION_OWNER_TOKEN",
+    )
+    supplied = tuple(name in values for name in names)
+    if not any(supplied):
+        return None
+    if not all(supplied):
+        raise InvalidRuntimeConfiguration("Runtime configuration is invalid")
+    identifiers: list[UUID] = []
+    for name in names[:-1]:
+        value = values[name]
+        if not isinstance(value, str):
+            raise InvalidRuntimeConfiguration("Runtime configuration is invalid")
+        try:
+            identifier = UUID(value)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise InvalidRuntimeConfiguration("Runtime configuration is invalid") from exc
+        if str(identifier) != value:
+            raise InvalidRuntimeConfiguration("Runtime configuration is invalid")
+        identifiers.append(identifier)
+    try:
+        owner = ControlReservationOwner(identifiers[-1], values[names[-1]])
+    except (TypeError, ValueError) as exc:
+        raise InvalidRuntimeConfiguration("Runtime configuration is invalid") from exc
+    return GitHubProcessorClaimTarget(*identifiers[:-1], owner)

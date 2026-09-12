@@ -14,6 +14,7 @@ from app.config import (
     load_api_port,
     load_application_settings,
     load_database_settings,
+    load_github_processor_claim_target,
     validate_api_process_environment,
     validate_github_planner_process_environment,
     validate_migration_process_environment,
@@ -31,6 +32,17 @@ TARGET_VALUES = {
     "GITHUB_LEDGER_PLANNER_TARGET_CONNECTOR_ID": "22222222-2222-4222-8222-222222222222",
     "GITHUB_LEDGER_PLANNER_TARGET_SCOPE_ID": "33333333-3333-4333-8333-333333333333",
     "GITHUB_LEDGER_PLANNER_TARGET_SYNC_JOB_ID": "44444444-4444-4444-8444-444444444444",
+    "GITHUB_LEDGER_CONTROL_RESERVATION_ID": "55555555-5555-4555-8555-555555555555",
+    "GITHUB_LEDGER_CONTROL_RESERVATION_OWNER_TOKEN": "A" * 43,
+}
+PROCESSOR_TARGET_VALUES = {
+    "GITHUB_LEDGER_PROCESSOR_TARGET_ORGANIZATION_ID": "11111111-1111-4111-8111-111111111111",
+    "GITHUB_LEDGER_PROCESSOR_TARGET_CONNECTOR_ID": "22222222-2222-4222-8222-222222222222",
+    "GITHUB_LEDGER_PROCESSOR_TARGET_SCOPE_ID": "33333333-3333-4333-8333-333333333333",
+    "GITHUB_LEDGER_PROCESSOR_TARGET_GENERATION_ID": "44444444-4444-4444-8444-444444444444",
+    "GITHUB_LEDGER_PROCESSOR_TARGET_WORK_ITEM_ID": "66666666-6666-4666-8666-666666666666",
+    "GITHUB_LEDGER_CONTROL_RESERVATION_ID": "55555555-5555-4555-8555-555555555555",
+    "GITHUB_LEDGER_CONTROL_RESERVATION_OWNER_TOKEN": "A" * 43,
 }
 
 
@@ -250,6 +262,9 @@ def test_github_planner_target_is_optional_and_complete_tuple_is_canonical() -> 
         TARGET_VALUES["GITHUB_LEDGER_PLANNER_TARGET_SCOPE_ID"]
     )
     assert target.sync_job_id == UUID(TARGET_VALUES["GITHUB_LEDGER_PLANNER_TARGET_SYNC_JOB_ID"])
+    assert target.reservation_owner.reservation_id == UUID(
+        TARGET_VALUES["GITHUB_LEDGER_CONTROL_RESERVATION_ID"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -266,7 +281,7 @@ def test_github_planner_target_rejects_every_partial_tuple(present_names) -> Non
         validate_github_planner_process_environment(values)
 
 
-@pytest.mark.parametrize("name", tuple(TARGET_VALUES))
+@pytest.mark.parametrize("name", tuple(TARGET_VALUES)[:-1])
 @pytest.mark.parametrize(
     "invalid_value",
     (
@@ -287,6 +302,37 @@ def test_github_planner_target_rejects_blank_malformed_and_noncanonical_values(
     values[name] = invalid_value
     with pytest.raises(InvalidRuntimeConfiguration, match="Runtime configuration is invalid"):
         validate_github_planner_process_environment(values)
+
+
+def test_github_planner_target_rejects_invalid_owner_capability() -> None:
+    values = _sandbox()
+    values.update(TARGET_VALUES)
+    values["GITHUB_LEDGER_CONTROL_RESERVATION_OWNER_TOKEN"] = "short"
+    with pytest.raises(InvalidRuntimeConfiguration):
+        validate_github_planner_process_environment(values)
+
+
+def test_github_processor_target_is_all_or_none_and_canonical() -> None:
+    assert load_github_processor_claim_target({}) is None
+    target = load_github_processor_claim_target(PROCESSOR_TARGET_VALUES)
+    assert target is not None
+    assert str(target.organization_id) == PROCESSOR_TARGET_VALUES[
+        "GITHUB_LEDGER_PROCESSOR_TARGET_ORGANIZATION_ID"
+    ]
+    assert str(target.work_item_id) == PROCESSOR_TARGET_VALUES[
+        "GITHUB_LEDGER_PROCESSOR_TARGET_WORK_ITEM_ID"
+    ]
+    assert target.reservation_owner.owner_token_hash == (
+        "0f007385b6f9d4b7eeb2748605afe1a984a0a3bfa3f014d09e2a784ce9e5cd1a"
+    )
+
+
+@pytest.mark.parametrize("missing", tuple(PROCESSOR_TARGET_VALUES))
+def test_github_processor_target_rejects_every_partial_tuple(missing: str) -> None:
+    values = dict(PROCESSOR_TARGET_VALUES)
+    values.pop(missing)
+    with pytest.raises(InvalidRuntimeConfiguration):
+        load_github_processor_claim_target(values)
 
 
 def test_invalid_planner_target_fails_before_other_configuration_loaders(monkeypatch) -> None:

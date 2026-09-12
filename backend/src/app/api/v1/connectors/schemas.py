@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 Slug = str
 
@@ -219,8 +219,41 @@ class EnqueueSyncJobResponse(SyncJobResponse):
     coalesced: bool
 
 
+class ControlledSyncReservationRequest(BaseModel):
+    """Opaque, bounded ownership for one controlled GitHub synchronization."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reservation_id: UUID
+    owner_token: SecretStr
+    expires_in_seconds: int = Field(ge=300, le=7_200, strict=True)
+    target_source_key_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    target_provider_blob_id: str = Field(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+    target_provider_revision_id: str = Field(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+    target_profile_fingerprint: str = Field(
+        min_length=1,
+        max_length=255,
+        pattern=r"^[a-z0-9][a-z0-9._:/-]*$",
+    )
+
+    @field_validator("reservation_id", mode="before")
+    @classmethod
+    def validate_canonical_reservation_id(cls, value: object) -> object:
+        if not isinstance(value, str):
+            raise ValueError("reservation_id must be a canonical UUID")
+        try:
+            parsed = UUID(value)
+        except ValueError as exc:
+            raise ValueError("reservation_id must be a canonical UUID") from exc
+        if str(parsed) != value:
+            raise ValueError("reservation_id must be a canonical UUID")
+        return parsed
+
+
 class EnqueueSyncJobRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
+
+    reservation: ControlledSyncReservationRequest | None = None
 
 
 class CreateConnectorSyncJobRequest(BaseModel):

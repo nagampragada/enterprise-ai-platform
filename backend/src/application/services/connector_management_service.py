@@ -18,6 +18,7 @@ from application.services.github_repository_selection_service import (
     validated_github_repository_scope_config,
 )
 from domain.connectors.capabilities import ConnectorCapabilities
+from domain.connectors.sync_control_reservation import ControlledSyncReservationRequest
 from infrastructure.db.models import Connector, ConnectorScope, KnowledgeSpace
 from infrastructure.repositories.connector_credential_repository import (
     ConnectorCredentialRepository,
@@ -235,6 +236,8 @@ class ConnectorManagementService:
         requester_user_id: UUID,
         connector_id: UUID,
         scope_id: UUID,
+        *,
+        reservation: ControlledSyncReservationRequest | None = None,
     ) -> tuple[EnqueueResult, SyncJobHistoryItem]:
         connector = self._connectors.lock_by_id(organization_id, connector_id)
         scope = self._scopes.lock_by_id(organization_id, scope_id)
@@ -242,6 +245,10 @@ class ConnectorManagementService:
             raise ConnectorManagementNotFound("connector scope was not found")
         if connector.connector_type not in {"local_folder", "github"}:
             raise InvalidConnectorManagementRequest("connector type is not supported")
+        if reservation is not None and connector.connector_type != "github":
+            raise InvalidConnectorManagementRequest(
+                "controlled reservation requires a GitHub connector"
+            )
         if connector.status != "active" or scope.status != "active":
             raise ConnectorManagementConflict("connector scope is not active")
         self._require_active_knowledge_space(organization_id, scope.knowledge_space_id)
@@ -273,14 +280,19 @@ class ConnectorManagementService:
                 or installation.account_type != "Organization"
             ):
                 raise ConnectorManagementConflict("connector authorization is unavailable")
+        enqueue_options: dict[str, object] = {
+            "mode": "incremental",
+            "trigger_type": "manual",
+            "now": self._now(),
+            "requested_by_user_id": requester_user_id,
+        }
+        if reservation is not None:
+            enqueue_options["reservation"] = reservation
         result = self._jobs.enqueue_or_coalesce(
             organization_id,
             connector_id,
             scope_id,
-            mode="incremental",
-            trigger_type="manual",
-            now=self._now(),
-            requested_by_user_id=requester_user_id,
+            **enqueue_options,
         )
         job = self._jobs.get(organization_id, result.job_id)
         if job is None:

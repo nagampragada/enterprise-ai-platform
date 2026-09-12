@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import math
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import PurePosixPath
 from typing import Callable
@@ -45,10 +46,12 @@ from domain.connectors.sync_work_ledger import (
     TERMINAL_FILE_WORK_STATUSES,
     TERMINAL_GENERATION_STATUSES,
 )
+from domain.connectors.sync_control_reservation import ControlReservationOwner
 from infrastructure.db.models import (
     ConnectorSyncFileMaterialization,
     ConnectorSyncFileMaterializationChunk,
     ConnectorSyncFileWorkItem,
+    ConnectorSyncControlReservation,
     ConnectorSyncGeneration,
     ConnectorSyncGenerationActivation,
     ConnectorSyncGenerationObservation,
@@ -89,6 +92,15 @@ FAILURE_CATEGORIES = frozenset(
 
 class InvalidSyncWorkLedgerRequest(ValueError):
     """Raised when work-ledger input violates the bounded contract."""
+
+
+@dataclass(frozen=True)
+class TargetedFileWorkClaimResult:
+    """Sanitized result from one exact reservation-aware acquisition."""
+
+    outcome: str
+    lease: FileWorkLease | None = None
+    mutated: bool = False
 
 
 class SyncWorkLedgerNotFound(RuntimeError):
@@ -607,20 +619,130 @@ class ConnectorSyncWorkLedgerRepository:
         )
 
     def mark_discovery_complete(
-        self, organization_id: UUID, generation_id: UUID, *, now: datetime
+        self,
+        organization_id: UUID,
+        generation_id: UUID,
+        *,
+        now: datetime,
+        reservation_id: UUID | None = None,
+        planner_lease_id: UUID | None = None,
     ) -> RepositoryGenerationView:
         now = _aware("now", now)
-        row = self._locked_generation(_uuid("organization_id", organization_id), _uuid("generation_id", generation_id))
+        organization_id = _uuid("organization_id", organization_id)
+        generation_id = _uuid("generation_id", generation_id)
+        if (reservation_id is None) != (planner_lease_id is None):
+            raise InvalidSyncWorkLedgerRequest(
+                "controlled discovery ownership is incomplete"
+            )
+        row = self._locked_generation(organization_id, generation_id)
         if row is None:
             raise SyncWorkLedgerNotFound("generation was not found")
         if row.status in {status.value for status in TERMINAL_GENERATION_STATUSES}:
             raise SyncWorkLedgerConflict("terminal generation cannot complete discovery")
+        reservation = None
+        if reservation_id is not None:
+            reservation_id = _uuid("reservation_id", reservation_id)
+            planner_lease_id = _uuid("planner_lease_id", planner_lease_id)
+            # Cancellation/failure paths lock job then reservation. Establish
+            # that same order before moving the capability to its work item so
+            # the final planner transaction cannot deadlock by inversion.
+            job = self._one(
+                select(ConnectorSyncJob)
+                .where(
+                    ConnectorSyncJob.organization_id == organization_id,
+                    ConnectorSyncJob.connector_id == row.connector_id,
+                    ConnectorSyncJob.connector_scope_id == row.connector_scope_id,
+                    ConnectorSyncJob.id == row.sync_job_id,
+                )
+                .with_for_update(),
+                "controlled discovery synchronization job lock failed",
+            )
+            if job is None:
+                raise SyncWorkLedgerConflict(
+                    "controlled discovery synchronization job is unavailable"
+                )
+            reservation = self._one(
+                select(ConnectorSyncControlReservation)
+                .where(
+                    ConnectorSyncControlReservation.organization_id
+                    == organization_id,
+                    ConnectorSyncControlReservation.id == reservation_id,
+                    ConnectorSyncControlReservation.state == "job",
+                    ConnectorSyncControlReservation.planner_lease_id
+                    == planner_lease_id,
+                    ConnectorSyncControlReservation.released_at.is_(None),
+                    ConnectorSyncControlReservation.expires_at
+                    > func.clock_timestamp(),
+                )
+                .with_for_update(),
+                "controlled discovery reservation lock failed",
+            )
+            if reservation is None:
+                raise SyncWorkLedgerConflict(
+                    "controlled discovery reservation is unavailable"
+                )
+        if reservation is not None:
+            work_rows = self._all(
+                select(ConnectorSyncFileWorkItem)
+                .where(
+                    ConnectorSyncFileWorkItem.organization_id == organization_id,
+                    ConnectorSyncFileWorkItem.generation_id == generation_id,
+                )
+                .order_by(ConnectorSyncFileWorkItem.id)
+                .with_for_update(),
+                "controlled discovery work validation failed",
+            )
+            if (
+                reservation.connector_id != row.connector_id
+                or reservation.connector_scope_id != row.connector_scope_id
+                or reservation.sync_job_id != row.sync_job_id
+                or reservation.target_provider_revision_id != row.commit_object_id
+                or reservation.target_profile_fingerprint
+                != row.profile_fingerprint
+            ):
+                raise SyncWorkLedgerConflict(
+                    "controlled discovery reservation attribution changed"
+                )
+            if len(work_rows) != 1 or row.items_registered != 1:
+                raise SyncWorkLedgerConflict(
+                    "controlled discovery target is not unique"
+                )
+            target = work_rows[0]
+            if (
+                target.connector_id != reservation.connector_id
+                or target.connector_scope_id != reservation.connector_scope_id
+                or target.source_key_hash != reservation.target_source_key_hash
+                or target.provider_blob_id != reservation.target_provider_blob_id
+                or target.provider_revision_id
+                != reservation.target_provider_revision_id
+                or target.profile_fingerprint
+                != reservation.target_profile_fingerprint
+            ):
+                raise SyncWorkLedgerConflict(
+                    "controlled discovery target attribution changed"
+                )
+            database_now = self._scalar(
+                select(func.clock_timestamp()),
+                "controlled discovery database time lookup failed",
+            )
+            if not isinstance(database_now, datetime):
+                raise SyncWorkLedgerPersistenceError(
+                    "controlled discovery database time is invalid"
+                )
+            reservation.state = "work_item"
+            reservation.generation_id = row.id
+            reservation.work_item_id = target.id
+            reservation.planner_lease_id = None
+            reservation.processor_lease_id = None
+            reservation.handed_off_at = database_now
         if not row.discovery_complete:
             row.discovery_complete = True
             row.discovery_completed_at = now
             row.status = RepositoryGenerationStatus.PROCESSING.value
             row.updated_at = now
             self._flush("generation discovery could not be completed")
+        elif reservation is not None:
+            self._flush("controlled discovery handoff could not be completed")
         return _generation_view(row)
 
     def require_follow_up(
@@ -667,6 +789,7 @@ class ConnectorSyncWorkLedgerRepository:
                 ConnectorSyncFileWorkItem.next_attempt_at <= now,
                 ConnectorSyncFileWorkItem.cancel_requested_at.is_(None),
                 ConnectorSyncFileWorkItem.attempt_count < ConnectorSyncFileWorkItem.max_attempts,
+                _generic_work_reservation_available(),
                 ConnectorSyncGeneration.status.in_(
                     (RepositoryGenerationStatus.DISCOVERING.value, RepositoryGenerationStatus.PROCESSING.value)
                 ),
@@ -679,6 +802,188 @@ class ConnectorSyncWorkLedgerRepository:
             .limit(1)
         )
         return self._claim_one(statement, worker_id=worker_id, now=now, lease_duration=lease_duration)
+
+    def acquire_target_available(
+        self,
+        organization_id: UUID,
+        connector_id: UUID,
+        connector_scope_id: UUID,
+        generation_id: UUID,
+        work_item_id: UUID,
+        reservation_owner: ControlReservationOwner,
+        *,
+        provider_key: str,
+        profile_fingerprint: str,
+        worker_id: str,
+        now: datetime,
+        lease_duration: timedelta,
+    ) -> TargetedFileWorkClaimResult:
+        """Recover, if necessary, and claim only one capability-owned item."""
+        organization_id = _uuid("organization_id", organization_id)
+        connector_id = _uuid("connector_id", connector_id)
+        connector_scope_id = _uuid("connector_scope_id", connector_scope_id)
+        generation_id = _uuid("generation_id", generation_id)
+        work_item_id = _uuid("work_item_id", work_item_id)
+        if not isinstance(reservation_owner, ControlReservationOwner):
+            raise InvalidSyncWorkLedgerRequest("controlled reservation owner is invalid")
+        provider_key = _code("provider_key", provider_key, 64)
+        profile_fingerprint = _identifier(
+            "profile_fingerprint", profile_fingerprint, 255
+        )
+        worker_id = _worker_id(worker_id)
+        now = _aware("now", now)
+        lease_duration = _lease_duration(lease_duration)
+
+        reservation = self._one(
+            select(ConnectorSyncControlReservation)
+            .where(
+                ConnectorSyncControlReservation.organization_id == organization_id,
+                ConnectorSyncControlReservation.connector_id == connector_id,
+                ConnectorSyncControlReservation.connector_scope_id
+                == connector_scope_id,
+                ConnectorSyncControlReservation.generation_id == generation_id,
+                ConnectorSyncControlReservation.work_item_id == work_item_id,
+                ConnectorSyncControlReservation.id
+                == reservation_owner.reservation_id,
+                ConnectorSyncControlReservation.owner_token_hash
+                == reservation_owner.owner_token_hash,
+                ConnectorSyncControlReservation.state == "work_item",
+                ConnectorSyncControlReservation.released_at.is_(None),
+                ConnectorSyncControlReservation.expires_at
+                > func.clock_timestamp(),
+            )
+            .with_for_update(skip_locked=True),
+            "controlled file-work reservation lock failed",
+        )
+        if reservation is None:
+            return TargetedFileWorkClaimResult("reservation_unavailable")
+
+        row = self._one(
+            select(ConnectorSyncFileWorkItem)
+            .join(
+                ConnectorSyncGeneration,
+                and_(
+                    ConnectorSyncGeneration.organization_id
+                    == ConnectorSyncFileWorkItem.organization_id,
+                    ConnectorSyncGeneration.connector_id
+                    == ConnectorSyncFileWorkItem.connector_id,
+                    ConnectorSyncGeneration.connector_scope_id
+                    == ConnectorSyncFileWorkItem.connector_scope_id,
+                    ConnectorSyncGeneration.id
+                    == ConnectorSyncFileWorkItem.generation_id,
+                    ConnectorSyncGeneration.profile_fingerprint
+                    == ConnectorSyncFileWorkItem.profile_fingerprint,
+                ),
+            )
+            .join(
+                ConnectorSyncJob,
+                and_(
+                    ConnectorSyncJob.organization_id
+                    == ConnectorSyncGeneration.organization_id,
+                    ConnectorSyncJob.connector_id
+                    == ConnectorSyncGeneration.connector_id,
+                    ConnectorSyncJob.connector_scope_id
+                    == ConnectorSyncGeneration.connector_scope_id,
+                    ConnectorSyncJob.id == ConnectorSyncGeneration.sync_job_id,
+                ),
+            )
+            .join(
+                ConnectorScope,
+                and_(
+                    ConnectorScope.organization_id
+                    == ConnectorSyncGeneration.organization_id,
+                    ConnectorScope.connector_id
+                    == ConnectorSyncGeneration.connector_id,
+                    ConnectorScope.id
+                    == ConnectorSyncGeneration.connector_scope_id,
+                    ConnectorScope.external_scope_key
+                    == ConnectorSyncGeneration.repository_identity,
+                ),
+            )
+            .where(
+                ConnectorSyncFileWorkItem.organization_id == organization_id,
+                ConnectorSyncFileWorkItem.connector_id == connector_id,
+                ConnectorSyncFileWorkItem.connector_scope_id == connector_scope_id,
+                ConnectorSyncFileWorkItem.generation_id == generation_id,
+                ConnectorSyncFileWorkItem.id == work_item_id,
+                ConnectorSyncGeneration.provider_key == provider_key,
+                ConnectorSyncGeneration.profile_fingerprint == profile_fingerprint,
+                ConnectorSyncGeneration.profile_fingerprint
+                == reservation.target_profile_fingerprint,
+                ConnectorSyncGeneration.commit_object_id
+                == ConnectorSyncFileWorkItem.provider_revision_id,
+                ConnectorSyncGeneration.commit_object_id
+                == reservation.target_provider_revision_id,
+                ConnectorSyncGeneration.status
+                == RepositoryGenerationStatus.PROCESSING.value,
+                ConnectorSyncGeneration.discovery_complete.is_(True),
+                ConnectorSyncJob.status != "cancelled",
+                ConnectorSyncJob.cancel_requested_at.is_(None),
+            )
+            .with_for_update(of=ConnectorSyncFileWorkItem, skip_locked=True),
+            "controlled file-work target lock failed",
+        )
+        if row is None:
+            return TargetedFileWorkClaimResult("target_unavailable")
+        if (
+            row.source_key_hash != reservation.target_source_key_hash
+            or row.provider_blob_id != reservation.target_provider_blob_id
+            or row.provider_revision_id != reservation.target_provider_revision_id
+            or row.profile_fingerprint != reservation.target_profile_fingerprint
+        ):
+            return TargetedFileWorkClaimResult("target_mismatch")
+        if row.cancel_requested_at is not None:
+            if (
+                row.status == FileWorkStatus.RUNNING.value
+                and row.lease_expires_at is not None
+                and row.lease_expires_at <= now
+            ):
+                _apply_terminal(row, FileWorkStatus.CANCELLED.value, now)
+                self._release_work_reservation(reservation, now=now)
+                self._flush("controlled cancelled file work recovery failed")
+                return TargetedFileWorkClaimResult(
+                    "recovered_cancelled", mutated=True
+                )
+            return TargetedFileWorkClaimResult("cancelled")
+        if row.status == FileWorkStatus.RUNNING.value:
+            if row.lease_expires_at is None or row.lease_expires_at > now:
+                return TargetedFileWorkClaimResult("target_busy")
+            if row.attempt_count >= row.max_attempts:
+                row.last_error_category = "internal"
+                row.last_error_code = "lease_expired"
+                _apply_terminal(row, FileWorkStatus.FAILED.value, now)
+                self._release_work_reservation(reservation, now=now)
+                self._flush("controlled exhausted file work recovery failed")
+                return TargetedFileWorkClaimResult("recovered_failed", mutated=True)
+            row.status = FileWorkStatus.RETRY_WAIT.value
+            row.next_attempt_at = now
+            row.last_error_category = "internal"
+            row.last_error_code = "lease_expired"
+            _clear_lease(row)
+            reservation.processor_lease_id = None
+            row.updated_at = now
+        elif row.status in {status.value for status in TERMINAL_FILE_WORK_STATUSES}:
+            return TargetedFileWorkClaimResult(f"already_{row.status}")
+        elif row.status not in {
+            FileWorkStatus.PENDING.value,
+            FileWorkStatus.RETRY_WAIT.value,
+        }:
+            return TargetedFileWorkClaimResult("target_unavailable")
+
+        if row.next_attempt_at is None or row.next_attempt_at > now:
+            return TargetedFileWorkClaimResult("retry_not_due")
+        if row.attempt_count >= row.max_attempts:
+            return TargetedFileWorkClaimResult("attempts_exhausted")
+        lease = self._claim_locked_row(
+            row,
+            worker_id=worker_id,
+            now=now,
+            lease_duration=lease_duration,
+            reservation_id=reservation.id,
+        )
+        reservation.processor_lease_id = lease.lease_id
+        self._flush("controlled file work could not be acquired")
+        return TargetedFileWorkClaimResult("acquired", lease, True)
 
     def claim_next_available(
         self,
@@ -724,6 +1029,7 @@ class ConnectorSyncWorkLedgerRepository:
                 ConnectorSyncFileWorkItem.next_attempt_at <= now,
                 ConnectorSyncFileWorkItem.cancel_requested_at.is_(None),
                 ConnectorSyncFileWorkItem.attempt_count < ConnectorSyncFileWorkItem.max_attempts,
+                _generic_work_reservation_available(),
             )
             .order_by(
                 ConnectorSyncGeneration.created_at,
@@ -960,6 +1266,7 @@ class ConnectorSyncWorkLedgerRepository:
                 ConnectorSyncFileWorkItem.next_attempt_at <= now,
                 ConnectorSyncFileWorkItem.cancel_requested_at.is_(None),
                 ConnectorSyncFileWorkItem.attempt_count < ConnectorSyncFileWorkItem.max_attempts,
+                _generic_work_reservation_available(),
             )
             .order_by(
                 ConnectorSyncGeneration.created_at,
@@ -988,6 +1295,22 @@ class ConnectorSyncWorkLedgerRepository:
         row = self._one(statement, "file work claim failed")
         if row is None:
             return None
+        return self._claim_locked_row(
+            row,
+            worker_id=worker_id,
+            now=now,
+            lease_duration=lease_duration,
+        )
+
+    def _claim_locked_row(
+        self,
+        row: ConnectorSyncFileWorkItem,
+        *,
+        worker_id: str,
+        now: datetime,
+        lease_duration: timedelta,
+        reservation_id: UUID | None = None,
+    ) -> FileWorkLease:
         lease_id = self._new_uuid("lease_id", self._lease_id_factory)
         row.status = FileWorkStatus.RUNNING.value
         row.attempt_count += 1
@@ -1007,7 +1330,7 @@ class ConnectorSyncWorkLedgerRepository:
         row.embedding_batch_count = 0
         row.updated_at = now
         self._flush("file work could not be claimed")
-        return _lease(row)
+        return _lease(row, reservation_id=reservation_id)
 
     def heartbeat(
         self,
@@ -1025,7 +1348,7 @@ class ConnectorSyncWorkLedgerRepository:
         row.lease_expires_at = now + _lease_duration(lease_duration)
         row.updated_at = now
         self._flush("file work heartbeat failed")
-        return _lease(row)
+        return _lease(row, reservation_id=lease.reservation_id)
 
     def complete(
         self,
@@ -1045,6 +1368,7 @@ class ConnectorSyncWorkLedgerRepository:
         if row.cancel_requested_at is not None:
             raise FileWorkCancellationConflict("file work cancellation is pending")
         _apply_terminal(row, outcome.value, now, counters=counters)
+        self._release_work_reservation_for_lease(lease, now=now)
         self._flush("file work completion failed")
         return _work_view(row)
 
@@ -1084,14 +1408,17 @@ class ConnectorSyncWorkLedgerRepository:
         if quarantine_reason_code is not None:
             row.quarantine_reason_code = quarantine_reason_code
             _apply_terminal(row, FileWorkStatus.QUARANTINED.value, now, preserve_counters=True)
+            self._release_work_reservation_for_lease(lease, now=now)
         elif retry_at is not None and row.attempt_count < row.max_attempts:
             row.status = FileWorkStatus.RETRY_WAIT.value
             row.next_attempt_at = retry_at
             row.terminal_at = None
             _clear_lease(row)
+            self._retain_work_reservation_for_retry(lease)
             row.updated_at = now
         else:
             _apply_terminal(row, FileWorkStatus.FAILED.value, now, preserve_counters=True)
+            self._release_work_reservation_for_lease(lease, now=now)
         self._flush("file work failure transition failed")
         return _work_view(row)
 
@@ -1109,6 +1436,12 @@ class ConnectorSyncWorkLedgerRepository:
         work_item_id = _uuid("work_item_id", work_item_id)
         reason_code = _code("reason_code", reason_code, 64)
         now = _aware("now", now)
+        # Target acquisition, heartbeats and terminal transitions all lock the
+        # reservation before the work item. Cancellation must use the same
+        # ordering or it can deadlock with a concurrent exact-target claim.
+        reservation = self._lock_work_reservation(
+            organization_id, generation_id, work_item_id
+        )
         row = self._one(
             select(ConnectorSyncFileWorkItem)
             .where(
@@ -1128,6 +1461,8 @@ class ConnectorSyncWorkLedgerRepository:
             row.cancel_reason_code = reason_code
         if row.status in {FileWorkStatus.PENDING.value, FileWorkStatus.RETRY_WAIT.value}:
             _apply_terminal(row, FileWorkStatus.CANCELLED.value, now)
+            if reservation is not None:
+                self._release_work_reservation(reservation, now=now)
         else:
             row.updated_at = now
         self._flush("file work cancellation failed")
@@ -1141,6 +1476,7 @@ class ConnectorSyncWorkLedgerRepository:
         if row.cancel_requested_at is None:
             raise FileWorkCancellationConflict("file work cancellation was not requested")
         _apply_terminal(row, FileWorkStatus.CANCELLED.value, now)
+        self._release_work_reservation_for_lease(lease, now=now)
         self._flush("file work cancellation acknowledgement failed")
         return _work_view(row)
 
@@ -1163,6 +1499,7 @@ class ConnectorSyncWorkLedgerRepository:
                 ConnectorSyncFileWorkItem.generation_id == generation_id,
                 ConnectorSyncFileWorkItem.status == FileWorkStatus.RUNNING.value,
                 ConnectorSyncFileWorkItem.lease_expires_at <= now,
+                _generic_work_reservation_available(),
             )
             .order_by(ConnectorSyncFileWorkItem.lease_expires_at, ConnectorSyncFileWorkItem.id)
             .with_for_update(skip_locked=True)
@@ -1210,6 +1547,7 @@ class ConnectorSyncWorkLedgerRepository:
                 ConnectorSyncJob.cancel_requested_at.is_(None),
                 ConnectorSyncFileWorkItem.status == FileWorkStatus.RUNNING.value,
                 ConnectorSyncFileWorkItem.lease_expires_at <= now,
+                _generic_work_reservation_available(),
             )
             .order_by(ConnectorSyncFileWorkItem.lease_expires_at, ConnectorSyncFileWorkItem.id)
             .with_for_update(of=ConnectorSyncFileWorkItem, skip_locked=True)
@@ -3039,6 +3377,7 @@ class ConnectorSyncWorkLedgerRepository:
                 )
 
         _apply_terminal(work_row, FileWorkStatus.SUCCEEDED.value, now, counters=counters)
+        self._release_work_reservation_for_lease(lease, now=now)
         self._flush("file materialization completion failed")
         return _work_view(work_row), _materialization_view(existing), created
 
@@ -3075,6 +3414,8 @@ class ConnectorSyncWorkLedgerRepository:
         worker_id = _worker_id(worker_id)
         if worker_id != lease.worker_id:
             raise LostFileWorkLease("file work lease is no longer owned")
+        if lease.reservation_id is not None:
+            self._owned_work_reservation(lease)
         row = self._one(
             select(ConnectorSyncFileWorkItem)
             .where(
@@ -3098,6 +3439,78 @@ class ConnectorSyncWorkLedgerRepository:
         if not allow_cancellation and row.cancel_requested_at is not None:
             raise FileWorkCancellationConflict("file work cancellation is pending")
         return row
+
+    def _owned_work_reservation(
+        self, lease: FileWorkLease
+    ) -> ConnectorSyncControlReservation:
+        reservation = self._one(
+            select(ConnectorSyncControlReservation)
+            .where(
+                ConnectorSyncControlReservation.organization_id
+                == lease.organization_id,
+                ConnectorSyncControlReservation.connector_id == lease.connector_id,
+                ConnectorSyncControlReservation.connector_scope_id
+                == lease.connector_scope_id,
+                ConnectorSyncControlReservation.generation_id
+                == lease.generation_id,
+                ConnectorSyncControlReservation.work_item_id == lease.work_item_id,
+                ConnectorSyncControlReservation.id == lease.reservation_id,
+                ConnectorSyncControlReservation.state == "work_item",
+                ConnectorSyncControlReservation.processor_lease_id == lease.lease_id,
+                ConnectorSyncControlReservation.released_at.is_(None),
+                ConnectorSyncControlReservation.expires_at
+                > func.clock_timestamp(),
+            )
+            .with_for_update(),
+            "controlled file-work reservation validation failed",
+        )
+        if reservation is None:
+            raise LostFileWorkLease(
+                "controlled file-work reservation is no longer owned"
+            )
+        return reservation
+
+    def _release_work_reservation_for_lease(
+        self, lease: FileWorkLease, *, now: datetime
+    ) -> None:
+        if lease.reservation_id is None:
+            return
+        self._release_work_reservation(self._owned_work_reservation(lease), now=now)
+
+    def _retain_work_reservation_for_retry(self, lease: FileWorkLease) -> None:
+        if lease.reservation_id is None:
+            return
+        reservation = self._owned_work_reservation(lease)
+        reservation.processor_lease_id = None
+
+    def _lock_work_reservation(
+        self,
+        organization_id: UUID,
+        generation_id: UUID,
+        work_item_id: UUID,
+    ) -> ConnectorSyncControlReservation | None:
+        return self._one(
+            select(ConnectorSyncControlReservation)
+            .where(
+                ConnectorSyncControlReservation.organization_id
+                == organization_id,
+                ConnectorSyncControlReservation.generation_id == generation_id,
+                ConnectorSyncControlReservation.work_item_id == work_item_id,
+                ConnectorSyncControlReservation.state == "work_item",
+                ConnectorSyncControlReservation.released_at.is_(None),
+            )
+            .with_for_update(),
+            "controlled file-work reservation lock failed",
+        )
+
+    @staticmethod
+    def _release_work_reservation(
+        reservation: ConnectorSyncControlReservation, *, now: datetime
+    ) -> None:
+        reservation.state = "released"
+        reservation.planner_lease_id = None
+        reservation.processor_lease_id = None
+        reservation.released_at = func.clock_timestamp()
 
     def _raise_lost_lease(self, lease: FileWorkLease) -> None:
         row = self._one(
@@ -3214,10 +3627,55 @@ def _eligible_file_work_candidate(
             ConnectorSyncFileWorkItem.cancel_requested_at.is_(None),
             ConnectorSyncFileWorkItem.attempt_count
             < ConnectorSyncFileWorkItem.max_attempts,
+            _generic_work_reservation_available(),
         )
         .limit(1)
         .scalar_subquery()
     )
+
+
+def _generic_work_reservation_available():
+    reservation_generation = aliased(ConnectorSyncGeneration)
+    live_work = exists(
+        select(ConnectorSyncControlReservation.id).where(
+            ConnectorSyncControlReservation.organization_id
+            == ConnectorSyncFileWorkItem.organization_id,
+            ConnectorSyncControlReservation.generation_id
+            == ConnectorSyncFileWorkItem.generation_id,
+            ConnectorSyncControlReservation.work_item_id
+            == ConnectorSyncFileWorkItem.id,
+            ConnectorSyncControlReservation.state == "work_item",
+            ConnectorSyncControlReservation.released_at.is_(None),
+            ConnectorSyncControlReservation.expires_at > func.clock_timestamp(),
+        )
+    )
+    live_job = exists(
+        select(ConnectorSyncControlReservation.id)
+        .select_from(ConnectorSyncControlReservation)
+        .join(
+            reservation_generation,
+            and_(
+                reservation_generation.organization_id
+                == ConnectorSyncControlReservation.organization_id,
+                reservation_generation.connector_id
+                == ConnectorSyncControlReservation.connector_id,
+                reservation_generation.connector_scope_id
+                == ConnectorSyncControlReservation.connector_scope_id,
+                reservation_generation.sync_job_id
+                == ConnectorSyncControlReservation.sync_job_id,
+            ),
+        )
+        .where(
+            reservation_generation.organization_id
+            == ConnectorSyncFileWorkItem.organization_id,
+            reservation_generation.id
+            == ConnectorSyncFileWorkItem.generation_id,
+            ConnectorSyncControlReservation.state == "job",
+            ConnectorSyncControlReservation.released_at.is_(None),
+            ConnectorSyncControlReservation.expires_at > func.clock_timestamp(),
+        )
+    )
+    return ~(live_work | live_job)
 
 
 def _generation_matches(row, request: RepositoryGenerationRegistration) -> bool:
@@ -3523,7 +3981,7 @@ def _clear_lease(row) -> None:
     row.heartbeat_at = None
 
 
-def _lease(row) -> FileWorkLease:
+def _lease(row, *, reservation_id: UUID | None = None) -> FileWorkLease:
     if row.lease_id is None or row.lease_owner is None or row.lease_expires_at is None:
         raise SyncWorkLedgerPersistenceError("persisted file work lease is incomplete")
     return FileWorkLease(
@@ -3538,6 +3996,7 @@ def _lease(row) -> FileWorkLease:
         row.attempt_count,
         row.max_attempts,
         row.lease_expires_at,
+        reservation_id=reservation_id,
     )
 
 

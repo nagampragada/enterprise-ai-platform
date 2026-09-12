@@ -70,6 +70,10 @@ from application.services.connector_sync_schedule_service import (
     SyncScheduleResourceConflict,
     SyncScheduleView,
 )
+from domain.connectors.sync_control_reservation import (
+    ControlReservationOwner,
+    ControlledSyncReservationRequest as ControlledReservation,
+)
 from application.services.github_app_installation_service import (
     GitHubAppInstallationService, GitHubInstallationConflict,
     GitHubInstallationNotFound, GitHubInstallationRejected,
@@ -476,13 +480,29 @@ def enqueue_sync_job(
     service: ConnectorManagementService = Depends(get_connector_management_service),
     db_session: Session = Depends(get_db_session),
 ) -> EnqueueSyncJobResponse:
-    del payload
     try:
+        reservation = None
+        if payload is not None and payload.reservation is not None:
+            requested = payload.reservation
+            reservation = ControlledReservation(
+                owner=ControlReservationOwner(
+                    requested.reservation_id,
+                    requested.owner_token.get_secret_value(),
+                ),
+                created_by_user_id=administrator.user_id,
+                expires_in_seconds=requested.expires_in_seconds,
+                target_source_key_hash=requested.target_source_key_hash,
+                target_provider_blob_id=requested.target_provider_blob_id,
+                target_provider_revision_id=requested.target_provider_revision_id,
+                target_profile_fingerprint=requested.target_profile_fingerprint,
+            )
+        arguments = {"reservation": reservation} if reservation is not None else {}
         result, job = service.enqueue_sync_job(
             administrator.organization_id,
             administrator.user_id,
             connector_id,
             scope_id,
+            **arguments,
         )
         db_session.commit()
         return EnqueueSyncJobResponse(**_job_values(job), coalesced=result.coalesced)

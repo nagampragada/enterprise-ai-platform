@@ -6,9 +6,9 @@
 |---|---|
 | Repository | `enterprise-ai-platform` |
 | Snapshot branch | `main` |
-| Snapshot commit | `6339d45cb4c89dabd61c47a3b35c3bab591029bd` (base of the unstaged Slice 5 implementation) |
-| Snapshot date | 2026-09-05 |
-| Alembic head | `20260905_000024` |
+| Snapshot commit | `709f27d040bc3915e123b5da55d692d52c675b62` (base of the unstaged controlled-reservation correction) |
+| Snapshot date | 2026-09-11 |
+| Alembic head | `20260911_000025` |
 | Purpose | Authoritative, code-evidenced inventory of implemented, exposed, partial, planned, deferred, and excluded capabilities |
 | Audiences | Product owners, backend/data/security/connector/operations/UI/QA engineers, and future repository agents |
 
@@ -125,7 +125,7 @@ Evidence: `backend/pyproject.toml`, `infra/docker/docker-compose.postgres.yml`, 
 
 ## 6. Database architecture
 
-SQLAlchemy metadata contains **49 live tables**. Alembic head is `20260905_000024`; migrations are forward-ordered, tested against real PostgreSQL, and generally provide narrow downgrades. The pgvector extension downgrade is intentionally conservative because extensions can be shared infrastructure.
+SQLAlchemy metadata contains **50 live tables**. Alembic head is `20260911_000025`; migrations are forward-ordered, tested against real PostgreSQL, and generally provide narrow downgrades. The pgvector extension downgrade is intentionally conservative because extensions can be shared infrastructure.
 
 ### Organizations, users, authentication, and structure
 
@@ -467,17 +467,31 @@ same true flag before concurrent execution, or the legacy host must remain idle.
 A legacy template at false retains its historical GitHub claim route. Lease,
 fence, cancellation, and retry authority remain database-backed.
 
-The planner also supports a locally implemented, default-inert exact-target
-contract using an all-or-none canonical organization/connector/scope/job UUID
-tuple. Targeted mode uses target-only expired recovery and applies all four
-predicates plus the persisted GitHub type inside the atomic claim and update
-recheck. It has no global fallback and preserves one claim followed by bounded
-continuation batches for that job. Global behavior is unchanged when the tuple
-is absent, and no schema change is needed. This is controlled-execution safety,
-not exclusive reservation: another legacy/global consumer can still win first.
-Automatic-invocation evidence and an exclusive production window therefore
-remain unresolved, the persistent planner remains disabled in reported evidence,
-and no production execution is authorized by this implementation.
+The planner also supports a default-inert exact-target contract using an
+all-or-none canonical organization/connector/scope/job UUID tuple plus a
+durable reservation ID and opaque 32-byte base64url owner capability. Targeted
+controllers must create that capability in memory with a cryptographically
+secure random source equivalent to `secrets.token_bytes(32)`; database hashing
+does not make literal execution arguments or environment overrides safe.
+Targeted mode uses target-only expired recovery and applies all identities, GitHub type,
+and capability ownership inside its lock/claim recheck. It has no global
+fallback and preserves one claim followed by bounded continuation batches for
+that job. Global behavior remains unchanged when the target is absent.
+
+Migration `20260911_000025` adds one tenant-qualified controlled-reservation
+table. The reservation is inserted atomically with the administrator-created
+GitHub job, stores only the capability hash, and uses database time for a
+5-minute to 2-hour lifetime. Compatible generic job and item claim/recovery
+queries skip it while live. Discovery completion atomically validates exactly
+one intended source/blob/revision/profile, binds its generation/item, hands the
+reservation to processing, and completes the job. The exact processor supplies
+all five target IDs plus the capability, performs only target-specific recovery
+and acquisition, and stops after one outcome. Retry retains the capability
+reservation; terminal paths release it. Lease/fence checks remain authoritative
+and expiry does not revoke an unexpired lease. Older binaries do not enforce
+the exclusion and must be upgraded or held idle before production use.
+Reservation expiry ends exclusive protection; a controller that loses
+ownership must stop rather than silently reacquire.
 
 Migration `20260831_000021` adds retrieval-isolated materialization and chunk
 tables for the default-off Phase 3 processor. When
@@ -517,13 +531,19 @@ Nonrecursive Git Trees remain limited to 1 MiB and 1,000 entries per tree, and
 the legacy cursor still caps one run at 100,000 examined entries and 10,000
 observed files, so true million-file repository discovery remains future work.
 
-Phase 3 API readiness supports the Slice 5 zero-downtime expand-migration sequence with
-an exact immutable compatibility set containing only `20260904_000023` and
-`20260905_000024`. The predecessor is compatible but not current and reports
+Phase 3 API readiness supports the reservation expand-migration sequence with
+an exact immutable compatibility set containing only `20260905_000024` and
+`20260911_000025`. The predecessor is compatible but not current and reports
 migration required; the application head is compatible and current. Unknown,
 missing, malformed, older, newer, and multiple heads fail closed. The
 predecessor allowance is temporary and must be removed after every environment
-has reached `20260905_000024`.
+has reached `20260911_000025`.
+This compatibility is API-specific. New generic worker queries reference the
+reservation table and must remain idle on predecessor `20260905_000024`.
+Rollout requires the compatible API first, migration, then image alignment (or
+verified idleness) for the legacy connector worker, dedicated planner, and
+dedicated processor before the first reserved job. Older-binary/schema rollback
+is prohibited while a reservation or reserved job/item remains.
 
 The historical-citation correction remains a local rollout candidate. Recovered
 production evidence reports `enterprise-ai-api-00014-mmm` as the live revision
@@ -973,7 +993,7 @@ Known output at snapshot:
 | Local PostgreSQL | Docker Compose uses `pgvector/pgvector:pg16`, localhost port, health check, named volume; development credentials only |
 | pgvector | Extension migration and vector column complete |
 | Local configuration | Environment-driven database/JWT/OpenAI settings; no secrets are documented here |
-| Migrations | 24 revisions, head `20260905_000024`, real PostgreSQL lifecycle tests |
+| Migrations | 25 revisions, head `20260911_000025`, real PostgreSQL lifecycle tests |
 | Worker runner | Bounded staged callable class implemented |
 | Continuous worker host | Direct module with continuous and one-shot modes implemented |
 | Scheduler/automatic recovery | Continuous/one-shot interval scheduler and worker expired recovery implemented |

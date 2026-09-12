@@ -47,8 +47,13 @@ from application.services.github_sync_work_planning_service import (
     GitHubSyncWorkPlanningService,
 )
 from application.services.local_document_indexing_service import LocalDocumentIndexingProfile
+from domain.connectors.sync_control_reservation import (
+    ControlledSyncReservationRequest,
+    generate_control_reservation_owner,
+)
 from domain.embeddings.models import EmbeddingProfile
 from infrastructure.db.models import (
+    ConnectorSyncControlReservation,
     ConnectorSyncFileMaterialization,
     ConnectorSyncFileMaterializationChunk,
     ConnectorSyncFileWorkItem,
@@ -157,6 +162,7 @@ def engine():
 def clean(engine):
     with engine.begin() as connection:
         for table in (
+            "connector_sync_control_reservations",
             "connector_sync_file_work_items",
             "connector_sync_generations",
             "document_indexing_attempts",
@@ -2646,6 +2652,7 @@ def test_phase3_only_file_is_not_retrieval_visible_before_promotion(engine):
 
 def test_permission_aware_retrieval_sql_uses_only_activated_ledger_materialization():
     normalized = SEARCH_SQL.casefold()
+    assert "connector_sync_control_reservations" not in normalized
     assert "connector_sync_file_work_items" not in normalized
     assert "connector_sync_generation_activations" in normalized
     assert "connector_sync_generations" in normalized
@@ -3096,3 +3103,176 @@ def test_ledger_only_discovery_projection_promotion_and_reconciliation_preserve_
     assert [(row.chunk_id, row.chunk_text) for row in final] == [
         (after[0].chunk_id, "new retained content")
     ]
+
+
+def test_controlled_planning_failure_caught_then_committed_leaves_no_partial_handoff(
+    engine,
+):
+    factory = _factory(engine)
+    organization_id, connector_id, scope_id = _seed(factory)
+    profile = _profile()
+    path = "document.md"
+    source_key = f"github:repository:501:path:{path}"
+    source_hash = hashlib.sha256(
+        source_key.encode("utf-8") + b"\x00" + path.encode("utf-8")
+    ).hexdigest()
+
+    with factory() as session:
+        creator_id = session.scalar(
+            text("SELECT id FROM users WHERE organization_id=:organization_id"),
+            {"organization_id": organization_id},
+        )
+        assert creator_id is not None
+        owner = generate_control_reservation_owner()
+        request = ControlledSyncReservationRequest(
+            owner,
+            creator_id,
+            3600,
+            source_hash,
+            BLOB,
+            COMMIT,
+            profile.fingerprint,
+        )
+        enqueued = ConnectorSyncJobRepository(session).enqueue_or_coalesce(
+            organization_id,
+            connector_id,
+            scope_id,
+            mode="incremental",
+            trigger_type="manual",
+            now=NOW,
+            requested_by_user_id=creator_id,
+            reservation=request,
+        )
+        session.commit()
+
+    with factory() as session:
+        attempt = _execution(session).acquire_target_github(
+            organization_id,
+            connector_id,
+            scope_id,
+            enqueued.job_id,
+            owner,
+            worker_id="controlled-planner",
+            lease_duration=timedelta(minutes=15),
+        )
+        assert attempt.outcome == "acquired" and attempt.attempt is not None
+        acquired = attempt.attempt
+        session.commit()
+
+    with factory() as session:
+        service = GitHubStagedSynchronizationService(
+            session,
+            _execution(session),
+            GitHubRepositoryContentService(session, Client()),
+            profile,
+            ledger_planning_enabled=True,
+        )
+        snapshot = service.snapshot(
+            acquired.lease,
+            acquired.sync_run_id,
+            worker_id="controlled-planner",
+        )
+        session.rollback()
+    cursor = GitHubTraversalCursor.initial(
+        GitHubRepositorySnapshot(
+            connector_id,
+            scope_id,
+            501,
+            "github:repository:501",
+            "main",
+            COMMIT,
+            TREE,
+        ),
+        snapshot.authorization,
+    )
+    with factory() as session:
+        GitHubStagedSynchronizationService(
+            session,
+            _execution(session),
+            GitHubRepositoryContentService(session, Client()),
+            profile,
+            ledger_planning_enabled=True,
+        ).pin_snapshot(
+            acquired.lease,
+            snapshot,
+            cursor,
+            worker_id="controlled-planner",
+            now=NOW,
+        )
+        session.commit()
+
+    terminal = replace(
+        cursor,
+        frames=(),
+        totals=GitHubRunBudget(entries_examined=1),
+        scan_complete=True,
+    )
+    discovered = _candidate(cursor, snapshot.authorization, path=path, blob=BLOB)
+    batch = GitHubDiscoveryBatch((discovered,), terminal, 1, 1)
+    with factory() as session:
+        service = GitHubStagedSynchronizationService(
+            session,
+            _execution(session),
+            GitHubRepositoryContentService(session, Client()),
+            profile,
+            ledger_planning_enabled=True,
+        )
+        current = service.snapshot(
+            acquired.lease,
+            acquired.sync_run_id,
+            worker_id="controlled-planner",
+        )
+        persisted_run = service._sync.get_run(
+            organization_id,
+            connector_id,
+            scope_id,
+            acquired.sync_run_id,
+        )
+        assert persisted_run is not None
+        service._sync.get_run = Mock(  # type: ignore[method-assign]
+            side_effect=(persisted_run, None)
+        )
+        with pytest.raises(StalePreparedGitHubBatch, match="run is unavailable"):
+            service.persist_planning_batch(
+                acquired.lease,
+                current,
+                batch,
+                worker_id="controlled-planner",
+                now=NOW,
+            )
+        # Deliberately commit after catching the service error. The controlled
+        # savepoint must have removed every mutation made by the failed batch.
+        session.commit()
+
+    with factory() as verification:
+        job = verification.get(ConnectorSyncJob, enqueued.job_id)
+        reservation = verification.get(
+            ConnectorSyncControlReservation, owner.reservation_id
+        )
+        cursor_row = verification.scalar(
+            select(ConnectorSyncCursor).where(
+                ConnectorSyncCursor.created_by_run_id == acquired.sync_run_id,
+                ConnectorSyncCursor.state == "active",
+            )
+        )
+        assert job is not None and job.status == "running"
+        assert reservation is not None and reservation.state == "job"
+        assert reservation.planner_lease_id == acquired.lease.lease_id
+        generation = verification.scalar(
+            select(ConnectorSyncGeneration).where(
+                ConnectorSyncGeneration.sync_job_id == enqueued.job_id
+            )
+        )
+        assert generation is not None
+        assert generation.discovery_complete is False
+        assert generation.items_discovered == 0
+        assert generation.items_registered == 0
+        assert verification.scalar(
+            select(func.count()).select_from(ConnectorSyncFileWorkItem)
+        ) == 0
+        assert cursor_row is not None
+        assert GitHubTraversalCursor.from_safe_json(
+            cursor_row.safe_cursor,
+            connector_id=connector_id,
+            scope_id=scope_id,
+        ) == cursor

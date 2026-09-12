@@ -1796,6 +1796,131 @@ class ConnectorSyncFileWorkItem(Base):
     terminal_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class ConnectorSyncControlReservation(Base):
+    """Short-lived capability that moves atomically from a job to one file item."""
+
+    __tablename__ = "connector_sync_control_reservations"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", name="pk_connector_sync_control_reservations"),
+        ForeignKeyConstraint(
+            ["organization_id"], ["organizations.id"],
+            name="fk_sync_control_reservations_organization", ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "created_by_user_id"],
+            ["users.organization_id", "users.id"],
+            name="fk_sync_control_reservations_creator_tenant", ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "connector_id", "connector_scope_id", "sync_job_id"],
+            ["connector_sync_jobs.organization_id", "connector_sync_jobs.connector_id", "connector_sync_jobs.connector_scope_id", "connector_sync_jobs.id"],
+            name="fk_sync_control_reservations_job_tenant", ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "generation_id", "work_item_id"],
+            ["connector_sync_file_work_items.organization_id", "connector_sync_file_work_items.generation_id", "connector_sync_file_work_items.id"],
+            name="fk_sync_control_reservations_work_item_tenant", ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "organization_id", "sync_job_id",
+            name="uq_sync_control_reservations_job",
+        ),
+        UniqueConstraint(
+            "owner_token_hash",
+            name="uq_sync_control_reservations_owner_token_hash",
+        ),
+        UniqueConstraint(
+            "organization_id", "generation_id", "work_item_id",
+            name="uq_sync_control_reservations_work_item",
+        ),
+        CheckConstraint(
+            "state IN ('job', 'work_item', 'released')", name="state_valid"
+        ),
+        CheckConstraint(
+            "owner_token_hash ~ '^[0-9a-f]{64}$'", name="owner_token_hash_valid"
+        ),
+        CheckConstraint(
+            "target_source_key_hash ~ '^[0-9a-f]{64}$'",
+            name="target_source_key_hash_valid",
+        ),
+        CheckConstraint(
+            "target_provider_blob_id ~ '^([0-9a-f]{40}|[0-9a-f]{64})$' AND "
+            "target_provider_revision_id ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'",
+            name="provider_identity_valid",
+        ),
+        CheckConstraint(
+            "target_profile_fingerprint ~ '^[a-z0-9][a-z0-9._:/-]*$'",
+            name="target_profile_fingerprint_valid",
+        ),
+        CheckConstraint(
+            "expires_at >= created_at + interval '5 minutes' AND "
+            "expires_at <= created_at + interval '2 hours'",
+            name="expiry_bounded",
+        ),
+        CheckConstraint(
+            "(state = 'job' AND generation_id IS NULL AND work_item_id IS NULL "
+            "AND handed_off_at IS NULL AND released_at IS NULL) OR "
+            "(state = 'work_item' AND generation_id IS NOT NULL "
+            "AND work_item_id IS NOT NULL AND handed_off_at IS NOT NULL "
+            "AND released_at IS NULL) OR "
+            "(state = 'released' AND released_at IS NOT NULL "
+            "AND ((generation_id IS NULL AND work_item_id IS NULL "
+            "AND handed_off_at IS NULL) OR (generation_id IS NOT NULL "
+            "AND work_item_id IS NOT NULL AND handed_off_at IS NOT NULL)))",
+            name="lifecycle_consistent",
+        ),
+        CheckConstraint(
+            "planner_lease_id IS NULL OR "
+            "(state = 'job' AND processor_lease_id IS NULL)",
+            name="planner_lease_state_valid",
+        ),
+        CheckConstraint(
+            "processor_lease_id IS NULL OR "
+            "(state = 'work_item' AND planner_lease_id IS NULL)",
+            name="processor_lease_state_valid",
+        ),
+        CheckConstraint(
+            "handed_off_at IS NULL OR handed_off_at >= created_at",
+            name="handoff_after_created",
+        ),
+        CheckConstraint(
+            "released_at IS NULL OR released_at >= created_at",
+            name="release_after_created",
+        ),
+        Index(
+            "ix_sync_control_reservations_job_live",
+            "organization_id", "sync_job_id", "expires_at",
+            postgresql_where=text("released_at IS NULL AND state = 'job'"),
+        ),
+        Index(
+            "ix_sync_control_reservations_work_live",
+            "organization_id", "generation_id", "work_item_id", "expires_at",
+            postgresql_where=text("released_at IS NULL AND state = 'work_item'"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    connector_scope_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    sync_job_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    generation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    work_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    created_by_user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    owner_token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_source_key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_provider_blob_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    target_provider_revision_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    target_profile_fingerprint: Mapped[str] = mapped_column(String(255), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    planner_lease_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    processor_lease_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    handed_off_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class ConnectorSyncFileMaterialization(Base):
     """Immutable generation-scoped file output that is not retrieval-visible."""
 

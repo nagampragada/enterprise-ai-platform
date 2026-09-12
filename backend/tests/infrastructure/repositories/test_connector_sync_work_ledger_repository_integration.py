@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import base64
 import statistics
 import subprocess
 import threading
@@ -26,6 +27,7 @@ from application.services.github_repository_content_service import (
 from application.services.github_sync_work_planning_service import (
     GitHubSyncWorkPlanningService,
 )
+from domain.connectors.sync_control_reservation import ControlReservationOwner
 from domain.connectors.sync_work_ledger import (
     FileWorkCounters,
     FileWorkManifestEntry,
@@ -38,11 +40,13 @@ from domain.connectors.sync_work_ledger import (
     GenerationReconciliationRequest,
     GenerationSourceObservation,
     RepositoryGenerationRegistration,
+    RepositoryGenerationStatus,
 )
 from infrastructure.db.models import (
     ConnectorSyncFileMaterialization,
     ConnectorSyncFileMaterializationChunk,
     ConnectorSyncFileWorkItem,
+    ConnectorSyncControlReservation,
     ConnectorSyncGeneration,
     ConnectorSyncGenerationActivation,
     ConnectorSyncGenerationObservation,
@@ -121,6 +125,7 @@ def engine():
 def clean_database(engine):
     with engine.begin() as connection:
         for table in (
+            "connector_sync_control_reservations",
             "connector_sync_file_work_items",
             "connector_sync_generations",
             "connector_sync_runs",
@@ -308,6 +313,135 @@ def _generation(session: Session, label: str = "Ledger"):
     session.commit()
     assert created
     return context, generation
+
+
+def _reservation_owner(seed: UUID | None = None) -> ControlReservationOwner:
+    value = seed or uuid4()
+    token = base64.urlsafe_b64encode(value.bytes + value.bytes).decode().rstrip("=")
+    return ControlReservationOwner(uuid4(), token)
+
+
+def _insert_creator(session: Session, organization_id: UUID) -> UUID:
+    creator_id = uuid4()
+    session.execute(
+        text(
+            """INSERT INTO users
+               (id,organization_id,email,normalized_email,password_hash,display_name)
+               VALUES (:id,:org,:email,:email,'test-hash','Controlled Creator')"""
+        ),
+        {
+            "id": creator_id,
+            "org": organization_id,
+            "email": f"{creator_id}@example.test",
+        },
+    )
+    return creator_id
+
+
+def _insert_work_reservation(
+    session: Session,
+    context,
+    generation,
+    work: ConnectorSyncFileWorkItem,
+    *,
+    owner: ControlReservationOwner | None = None,
+    state: str = "work_item",
+    planner_lease_id: UUID | None = None,
+    source_key_hash: str | None = None,
+) -> ControlReservationOwner:
+    owner = owner or _reservation_owner()
+    creator_id = _insert_creator(session, context[0])
+    handed_off = "clock_timestamp()" if state == "work_item" else "NULL"
+    generation_id = ":generation" if state == "work_item" else "NULL"
+    work_item_id = ":work" if state == "work_item" else "NULL"
+    session.execute(
+        text(
+            f"""INSERT INTO connector_sync_control_reservations
+               (id,organization_id,connector_id,connector_scope_id,sync_job_id,
+                generation_id,work_item_id,created_by_user_id,owner_token_hash,
+                target_source_key_hash,target_provider_blob_id,
+                target_provider_revision_id,target_profile_fingerprint,state,
+                planner_lease_id,created_at,expires_at,handed_off_at)
+               VALUES (:id,:org,:connector,:scope,:job,{generation_id},{work_item_id},
+                       :creator,:token_hash,:source_hash,:blob,:revision,:profile,
+                       :state,:planner_lease,clock_timestamp(),
+                       clock_timestamp()+interval '1 hour',{handed_off})"""
+        ),
+        {
+            "id": owner.reservation_id,
+            "org": context[0],
+            "connector": context[1],
+            "scope": context[2],
+            "job": context[3],
+            "generation": generation.generation_id,
+            "work": work.id,
+            "creator": creator_id,
+            "token_hash": owner.owner_token_hash,
+            "source_hash": source_key_hash or work.source_key_hash,
+            "blob": work.provider_blob_id,
+            "revision": work.provider_revision_id,
+            "profile": work.profile_fingerprint,
+            "state": state,
+            "planner_lease": planner_lease_id,
+        },
+    )
+    return owner
+
+
+def _reserved_generation(
+    session: Session,
+    label: str,
+    *,
+    mismatched_source: bool = False,
+):
+    context, generation = _generation(session, label)
+    registration = _register(
+        session, context[0], generation.generation_id, (_entry(1),)
+    )
+    repository = ConnectorSyncWorkLedgerRepository(session)
+    repository.mark_discovery_complete(
+        context[0], generation.generation_id, now=NOW
+    )
+    work = session.get(ConnectorSyncFileWorkItem, registration.work_item_ids[0])
+    assert work is not None
+    owner = _insert_work_reservation(
+        session,
+        context,
+        generation,
+        work,
+        source_key_hash="e" * 64 if mismatched_source else None,
+    )
+    session.execute(
+        text("UPDATE connector_scopes SET external_scope_key=:key WHERE id=:scope"),
+        {"key": generation.repository_identity, "scope": context[2]},
+    )
+    session.commit()
+    return context, generation, work, owner
+
+
+def _target_acquire(
+    session: Session,
+    context,
+    generation,
+    work: ConnectorSyncFileWorkItem,
+    owner: ControlReservationOwner,
+    *,
+    worker_id: str = "controlled-processor",
+    now: datetime = NOW,
+):
+    return ConnectorSyncWorkLedgerRepository(session).acquire_target_available(
+        context[0],
+        context[1],
+        context[2],
+        generation.generation_id,
+        work.id,
+        owner,
+        provider_key="github",
+        profile_fingerprint=PROFILE,
+        worker_id=worker_id,
+        now=now,
+        lease_duration=LEASE,
+    )
 
 
 def _register(
@@ -4028,6 +4162,818 @@ def test_observed_unindexable_source_is_not_treated_as_deleted(engine) -> None:
         assert session.get(DocumentVersion, version_id).is_current is True
         assert session.get(Document, document_id).deleted_at is None
         assert chunk_id not in _retrieval_chunk_ids(session, context[0], user_id)
+
+
+def test_target_mismatch_and_unrelated_arrival_cause_no_mutation(engine):
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation, work, owner = _reserved_generation(
+            session, "TargetMismatch", mismatched_source=True
+        )
+        unrelated_context, unrelated_generation = _generation(
+            session, "TargetMismatchUnrelated"
+        )
+        unrelated_registration = _register(
+            session,
+            unrelated_context[0],
+            unrelated_generation.generation_id,
+            (_entry(2),),
+        )
+        ConnectorSyncWorkLedgerRepository(session).mark_discovery_complete(
+            unrelated_context[0], unrelated_generation.generation_id, now=NOW
+        )
+        session.commit()
+        before = (
+            work.status,
+            work.attempt_count,
+            work.fencing_token,
+            work.lease_id,
+        )
+
+        result = _target_acquire(session, context, generation, work, owner)
+        session.commit()
+
+        session.refresh(work)
+        unrelated = session.get(
+            ConnectorSyncFileWorkItem,
+            unrelated_registration.work_item_ids[0],
+        )
+        assert result.outcome == "target_mismatch"
+        assert result.lease is None
+        assert result.mutated is False
+        assert (
+            work.status,
+            work.attempt_count,
+            work.fencing_token,
+            work.lease_id,
+        ) == before
+        assert unrelated is not None
+        assert unrelated.status == FileWorkStatus.PENDING.value
+        assert unrelated.attempt_count == 0
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncOrganizationClaimSchedule)
+        ) == 0
+
+
+def test_all_generic_work_paths_skip_live_reserved_item(engine):
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation, work, owner = _reserved_generation(
+            session, "GenericWorkSkip"
+        )
+        repository = ConnectorSyncWorkLedgerRepository(session)
+
+        assert repository.claim_next(
+            context[0],
+            generation.generation_id,
+            worker_id="generic-generation",
+            now=NOW,
+            lease_duration=LEASE,
+        ) is None
+        assert repository.claim_next_available(
+            provider_key="github",
+            profile_fingerprint=PROFILE,
+            worker_id="generic-global",
+            now=NOW,
+            lease_duration=LEASE,
+        ) is None
+        assert repository.claim_next_available_fair(
+            provider_key="github",
+            profile_fingerprint=PROFILE,
+            worker_id="generic-fair",
+            now=NOW,
+            lease_duration=LEASE,
+        ) is None
+        acquired = _target_acquire(session, context, generation, work, owner)
+        session.commit()
+        assert acquired.lease is not None
+
+        assert repository.recover_expired(
+            context[0],
+            generation.generation_id,
+            now=NOW + LEASE + timedelta(seconds=1),
+            limit=10,
+        ) == ()
+        assert repository.recover_expired_available(
+            provider_key="github",
+            profile_fingerprint=PROFILE,
+            now=NOW + LEASE + timedelta(seconds=1),
+            limit=10,
+        ) == ()
+        session.refresh(work)
+        assert work.status == FileWorkStatus.RUNNING.value
+        assert work.lease_id == acquired.lease.lease_id
+        assert session.scalar(
+            select(func.count()).select_from(ConnectorSyncOrganizationClaimSchedule)
+        ) == 0
+
+
+def test_targeted_recovery_and_claim_never_touch_unrelated_expired_work(engine):
+    with Session(engine, expire_on_commit=False) as session:
+        target_context, target_generation, target_work, owner = _reserved_generation(
+            session, "ExactRecoveryTarget"
+        )
+        other_context, other_generation = _generation(session, "ExactRecoveryOther")
+        other_registration = _register(
+            session, other_context[0], other_generation.generation_id, (_entry(2),)
+        )
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        repository.mark_discovery_complete(
+            other_context[0], other_generation.generation_id, now=NOW
+        )
+        other = repository.claim_next(
+            other_context[0],
+            other_generation.generation_id,
+            worker_id="other-worker",
+            now=NOW,
+            lease_duration=LEASE,
+        )
+        session.commit()
+        assert other is not None
+
+        result = _target_acquire(
+            session,
+            target_context,
+            target_generation,
+            target_work,
+            owner,
+            now=NOW + LEASE + timedelta(seconds=1),
+        )
+        session.commit()
+
+        unrelated = session.get(
+            ConnectorSyncFileWorkItem, other_registration.work_item_ids[0]
+        )
+        assert result.outcome == "acquired"
+        assert result.lease is not None
+        assert unrelated is not None
+        assert unrelated.status == FileWorkStatus.RUNNING.value
+        assert unrelated.lease_id == other.lease_id
+        assert unrelated.last_error_code is None
+
+
+def test_wrong_reservation_owner_and_cross_tenant_target_fail_closed(engine):
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation, work, owner = _reserved_generation(
+            session, "WrongWorkOwner"
+        )
+        other_context, _other_generation = _generation(session, "OtherTenant")
+        before = (work.status, work.attempt_count, work.fencing_token)
+        alternate = _reservation_owner()
+        wrong_token = ControlReservationOwner(
+            owner.reservation_id, alternate.owner_token
+        )
+
+        wrong_owner = _target_acquire(
+            session, context, generation, work, wrong_token
+        )
+        cross_tenant = ConnectorSyncWorkLedgerRepository(
+            session
+        ).acquire_target_available(
+            other_context[0],
+            context[1],
+            context[2],
+            generation.generation_id,
+            work.id,
+            owner,
+            provider_key="github",
+            profile_fingerprint=PROFILE,
+            worker_id="cross-tenant",
+            now=NOW,
+            lease_duration=LEASE,
+        )
+        session.commit()
+
+        session.refresh(work)
+        assert wrong_owner.outcome == "reservation_unavailable"
+        assert cross_tenant.outcome == "reservation_unavailable"
+        assert (work.status, work.attempt_count, work.fencing_token) == before
+
+
+def test_discovery_handoff_has_no_generic_claim_gap(engine):
+    planner_lease_id = uuid4()
+    with Session(engine, expire_on_commit=False) as setup:
+        context, generation = _generation(setup, "AtomicHandoff")
+        registration = _register(
+            setup, context[0], generation.generation_id, (_entry(1),)
+        )
+        work = setup.get(
+            ConnectorSyncFileWorkItem, registration.work_item_ids[0]
+        )
+        assert work is not None
+        owner = _insert_work_reservation(
+            setup,
+            context,
+            generation,
+            work,
+            state="job",
+            planner_lease_id=planner_lease_id,
+        )
+        setup.commit()
+
+    handoff = Session(engine, expire_on_commit=False)
+    generic = Session(engine, expire_on_commit=False)
+    try:
+        repository = ConnectorSyncWorkLedgerRepository(handoff)
+        repository.mark_discovery_complete(
+            context[0],
+            generation.generation_id,
+            now=NOW,
+            reservation_id=owner.reservation_id,
+            planner_lease_id=planner_lease_id,
+        )
+
+        generic_repository = ConnectorSyncWorkLedgerRepository(generic)
+        assert generic_repository.claim_next(
+            context[0],
+            generation.generation_id,
+            worker_id="generic-during-handoff",
+            now=NOW,
+            lease_duration=LEASE,
+        ) is None
+        handoff.execute(
+            text(
+                """UPDATE connector_sync_jobs
+                   SET status='running',attempt_count=1,fencing_token=1,
+                       next_attempt_at=NULL,lease_owner='expired-planner',
+                       lease_id=:lease,lease_acquired_at=:acquired,
+                       lease_expires_at=:expired,heartbeat_at=:acquired,
+                       updated_at=:acquired
+                   WHERE id=:job"""
+            ),
+            {
+                "lease": uuid4(),
+                "acquired": NOW - timedelta(minutes=10),
+                "expired": NOW - timedelta(minutes=5),
+                "job": context[3],
+            },
+        )
+        handoff.commit()
+        generic.rollback()
+        assert generic_repository.claim_next(
+            context[0],
+            generation.generation_id,
+            worker_id="generic-after-handoff",
+            now=NOW,
+            lease_duration=LEASE,
+        ) is None
+        assert ConnectorSyncJobRepository(generic).lock_expired_github(
+            now=NOW,
+            limit=10,
+        ) == ()
+        reservation = generic.get(
+            ConnectorSyncControlReservation, owner.reservation_id
+        )
+        assert reservation is not None
+        assert reservation.state == "work_item"
+        assert reservation.generation_id == generation.generation_id
+        assert reservation.work_item_id == work.id
+        assert reservation.planner_lease_id is None
+    finally:
+        handoff.rollback()
+        handoff.close()
+        generic.rollback()
+        generic.close()
+
+
+def test_work_cancellation_locks_reservation_before_work_item(engine):
+    with Session(engine, expire_on_commit=False) as setup:
+        context, generation, work, owner = _reserved_generation(
+            setup, "CancellationLockOrder"
+        )
+        work_id = work.id
+
+    blocker = Session(engine)
+    blocker.execute(
+        select(ConnectorSyncControlReservation)
+        .where(ConnectorSyncControlReservation.id == owner.reservation_id)
+        .with_for_update()
+    ).scalar_one()
+
+    started = threading.Event()
+    errors: list[BaseException] = []
+
+    def cancel() -> None:
+        with Session(engine) as session:
+            try:
+                session.execute(
+                    text(
+                        "SET LOCAL application_name = "
+                        "'phase3-slice5-cancellation-lock-order'"
+                    )
+                )
+                started.set()
+                ConnectorSyncWorkLedgerRepository(session).request_cancellation(
+                    context[0],
+                    generation.generation_id,
+                    work_id,
+                    reason_code="controlled_test",
+                    now=NOW,
+                )
+                session.commit()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                session.rollback()
+                errors.append(exc)
+
+    thread = threading.Thread(target=cancel)
+    thread.start()
+    try:
+        assert started.wait(10)
+
+        blocked = False
+        with engine.connect() as observer:
+            for _ in range(100):
+                blocked = bool(
+                    observer.scalar(
+                        text(
+                            "SELECT count(*) FROM pg_stat_activity "
+                            "WHERE application_name = "
+                            "'phase3-slice5-cancellation-lock-order' "
+                            "AND wait_event_type = 'Lock'"
+                        )
+                    )
+                )
+                if blocked:
+                    break
+                time.sleep(0.02)
+        assert blocked
+
+        # If cancellation had locked work first, this independent NOWAIT probe
+        # would fail while cancellation waited on the reservation row.
+        with Session(engine) as probe:
+            assert probe.execute(
+                select(ConnectorSyncFileWorkItem)
+                .where(ConnectorSyncFileWorkItem.id == work_id)
+                .with_for_update(nowait=True)
+            ).scalar_one().id == work_id
+            probe.rollback()
+    finally:
+        blocker.rollback()
+        blocker.close()
+        thread.join(10)
+    assert not thread.is_alive()
+    assert errors == []
+
+    with Session(engine) as verification:
+        persisted = verification.get(ConnectorSyncFileWorkItem, work_id)
+        reservation = verification.get(
+            ConnectorSyncControlReservation, owner.reservation_id
+        )
+        assert persisted is not None
+        assert persisted.status == FileWorkStatus.CANCELLED.value
+        assert reservation is not None
+        assert reservation.state == "released"
+
+
+def test_new_work_consumers_fail_closed_without_mutation_on_predecessor_schema(
+    engine,
+):
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation = _generation(session, "PredecessorWorkConsumer")
+        registration = _register(
+            session, context[0], generation.generation_id, (_entry(1),)
+        )
+        ConnectorSyncWorkLedgerRepository(session).mark_discovery_complete(
+            context[0], generation.generation_id, now=NOW
+        )
+        session.commit()
+        work_id = registration.work_item_ids[0]
+
+        session.execute(text("DROP TABLE connector_sync_control_reservations"))
+        with pytest.raises(SyncWorkLedgerPersistenceError):
+            ConnectorSyncWorkLedgerRepository(session).claim_next_available(
+                provider_key="github",
+                profile_fingerprint=PROFILE,
+                worker_id="new-worker-on-predecessor",
+                now=NOW,
+                lease_duration=LEASE,
+            )
+        session.rollback()
+
+        persisted = session.get(ConnectorSyncFileWorkItem, work_id)
+        assert persisted is not None
+        assert persisted.status == FileWorkStatus.PENDING.value
+        assert persisted.attempt_count == 0
+        assert persisted.fencing_token == 0
+
+
+def test_targeted_work_consumer_fails_closed_on_predecessor_schema(engine):
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation, work, owner = _reserved_generation(
+            session, "PredecessorTargetedWork"
+        )
+        work_id = work.id
+
+        session.execute(text("DROP TABLE connector_sync_control_reservations"))
+        with pytest.raises(SyncWorkLedgerPersistenceError):
+            _target_acquire(session, context, generation, work, owner)
+        session.rollback()
+
+        persisted = session.get(ConnectorSyncFileWorkItem, work_id)
+        assert persisted is not None
+        assert persisted.status == FileWorkStatus.PENDING.value
+        assert persisted.attempt_count == 0
+        assert persisted.fencing_token == 0
+
+
+def test_discovery_handoff_rejects_generation_revision_drift_without_mutation(
+    engine,
+):
+    planner_lease_id = uuid4()
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation = _generation(session, "HandoffRevisionDrift")
+        registration = _register(
+            session, context[0], generation.generation_id, (_entry(1),)
+        )
+        work = session.get(
+            ConnectorSyncFileWorkItem, registration.work_item_ids[0]
+        )
+        assert work is not None
+        owner = _insert_work_reservation(
+            session,
+            context,
+            generation,
+            work,
+            state="job",
+            planner_lease_id=planner_lease_id,
+        )
+        session.execute(
+            text(
+                "UPDATE connector_sync_generations SET commit_object_id=:commit "
+                "WHERE id=:generation"
+            ),
+            {"commit": "d" * 40, "generation": generation.generation_id},
+        )
+        session.commit()
+
+        with pytest.raises(SyncWorkLedgerConflict, match="attribution"):
+            ConnectorSyncWorkLedgerRepository(session).mark_discovery_complete(
+                context[0],
+                generation.generation_id,
+                now=NOW,
+                reservation_id=owner.reservation_id,
+                planner_lease_id=planner_lease_id,
+            )
+        session.rollback()
+
+        persisted_generation = session.get(
+            ConnectorSyncGeneration, generation.generation_id
+        )
+        reservation = session.get(
+            ConnectorSyncControlReservation, owner.reservation_id
+        )
+        assert persisted_generation is not None
+        assert persisted_generation.discovery_complete is False
+        assert reservation is not None
+        assert reservation.state == "job"
+        assert reservation.generation_id is None
+        assert reservation.work_item_id is None
+
+
+def test_planner_handoff_and_job_completion_commit_or_rollback_together(engine):
+    with Session(engine, expire_on_commit=False) as setup:
+        context, generation = _generation(setup, "PlannerAtomicFinalization")
+        registration = _register(
+            setup, context[0], generation.generation_id, (_entry(1),)
+        )
+        work = setup.get(
+            ConnectorSyncFileWorkItem, registration.work_item_ids[0]
+        )
+        assert work is not None
+        owner = _insert_work_reservation(
+            setup, context, generation, work, state="job"
+        )
+        setup.execute(
+            text(
+                "UPDATE connector_sync_jobs SET next_attempt_at=:now,"
+                "created_at=:now,updated_at=:now WHERE id=:job"
+            ),
+            {"now": NOW, "job": context[3]},
+        )
+        setup.commit()
+        jobs = ConnectorSyncJobRepository(setup)
+        lease = jobs.acquire_target_github(
+            context[0],
+            context[1],
+            context[2],
+            context[3],
+            owner,
+            worker_id="controlled-planner",
+            now=NOW,
+            lease_duration=LEASE,
+        )
+        assert lease is not None
+        jobs.create_attempt_run(lease, worker_id="controlled-planner", now=NOW)
+        setup.commit()
+
+    failed = Session(engine, expire_on_commit=False)
+    try:
+        ConnectorSyncWorkLedgerRepository(failed).mark_discovery_complete(
+            context[0],
+            generation.generation_id,
+            now=NOW + timedelta(minutes=1),
+            reservation_id=owner.reservation_id,
+            planner_lease_id=lease.lease_id,
+        )
+        ConnectorSyncJobRepository(failed).complete_success(
+            lease,
+            worker_id="controlled-planner",
+            now=NOW + timedelta(minutes=1),
+        )
+        failed.rollback()
+    finally:
+        failed.close()
+
+    with Session(engine) as verification:
+        persisted_generation = verification.get(
+            ConnectorSyncGeneration, generation.generation_id
+        )
+        persisted_job = ConnectorSyncJobRepository(verification).get(
+            context[0], context[3]
+        )
+        reservation = verification.get(
+            ConnectorSyncControlReservation, owner.reservation_id
+        )
+        assert persisted_generation is not None
+        assert persisted_generation.discovery_complete is False
+        assert persisted_job is not None and persisted_job.status == "running"
+        assert reservation is not None and reservation.state == "job"
+        assert reservation.planner_lease_id == lease.lease_id
+
+    with Session(engine, expire_on_commit=False) as completed:
+        ConnectorSyncWorkLedgerRepository(completed).mark_discovery_complete(
+            context[0],
+            generation.generation_id,
+            now=NOW + timedelta(minutes=1),
+            reservation_id=owner.reservation_id,
+            planner_lease_id=lease.lease_id,
+        )
+        ConnectorSyncJobRepository(completed).complete_success(
+            lease,
+            worker_id="controlled-planner",
+            now=NOW + timedelta(minutes=1),
+        )
+        completed.commit()
+
+    with Session(engine) as verification:
+        persisted_generation = verification.get(
+            ConnectorSyncGeneration, generation.generation_id
+        )
+        persisted_job = ConnectorSyncJobRepository(verification).get(
+            context[0], context[3]
+        )
+        reservation = verification.get(
+            ConnectorSyncControlReservation, owner.reservation_id
+        )
+        assert persisted_generation is not None
+        assert persisted_generation.discovery_complete is True
+        assert persisted_generation.status == RepositoryGenerationStatus.PROCESSING.value
+        assert persisted_job is not None and persisted_job.status == "succeeded"
+        assert reservation is not None and reservation.state == "work_item"
+        assert reservation.generation_id == generation.generation_id
+        assert reservation.work_item_id == work.id
+
+
+def test_concurrent_targeted_and_generic_claim_respects_reservation(engine):
+    with Session(engine, expire_on_commit=False) as setup:
+        context, generation, work, owner = _reserved_generation(
+            setup, "TargetGenericRace"
+        )
+        work_id = work.id
+    target_acquired = threading.Event()
+    generic_finished = threading.Event()
+    results: dict[str, object] = {}
+    errors: list[BaseException] = []
+
+    def target_claim() -> None:
+        with Session(engine, expire_on_commit=False) as session:
+            try:
+                target_work = session.get(ConnectorSyncFileWorkItem, work_id)
+                assert target_work is not None
+                results["target"] = _target_acquire(
+                    session, context, generation, target_work, owner
+                )
+                target_acquired.set()
+                assert generic_finished.wait(timeout=20)
+                session.commit()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+                session.rollback()
+                target_acquired.set()
+
+    def generic_claim() -> None:
+        assert target_acquired.wait(timeout=20)
+        with Session(engine, expire_on_commit=False) as session:
+            try:
+                results["generic"] = ConnectorSyncWorkLedgerRepository(
+                    session
+                ).claim_next_available_fair(
+                    provider_key="github",
+                    profile_fingerprint=PROFILE,
+                    worker_id="generic-racer",
+                    now=NOW,
+                    lease_duration=LEASE,
+                )
+                session.commit()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+                session.rollback()
+            finally:
+                generic_finished.set()
+
+    target_thread = threading.Thread(target=target_claim)
+    generic_thread = threading.Thread(target=generic_claim)
+    target_thread.start()
+    generic_thread.start()
+    target_thread.join(20)
+    generic_thread.join(20)
+
+    assert not target_thread.is_alive() and not generic_thread.is_alive()
+    assert errors == []
+    assert results["target"].outcome == "acquired"
+    assert results["generic"] is None
+    with Session(engine) as verification:
+        persisted = verification.get(ConnectorSyncFileWorkItem, work_id)
+        reservation = verification.get(
+            ConnectorSyncControlReservation, owner.reservation_id
+        )
+        assert persisted is not None and reservation is not None
+        assert persisted.lease_id == results["target"].lease.lease_id
+        assert reservation.processor_lease_id == results["target"].lease.lease_id
+
+
+def test_target_acquisition_failure_and_caller_rollback_are_atomic(engine, monkeypatch):
+    with Session(engine, expire_on_commit=False) as setup:
+        context, generation, work, owner = _reserved_generation(
+            setup, "TargetRollback"
+        )
+        work_id = work.id
+    session = Session(engine, expire_on_commit=False)
+    repository = ConnectorSyncWorkLedgerRepository(session)
+    original_flush = repository._flush
+
+    def fail_after_work_claim(message: str) -> None:
+        if message == "controlled file work could not be acquired":
+            raise RuntimeError("controlled acquisition fixture failure")
+        original_flush(message)
+
+    monkeypatch.setattr(repository, "_flush", fail_after_work_claim)
+    try:
+        with pytest.raises(RuntimeError, match="fixture failure"):
+            repository.acquire_target_available(
+                context[0],
+                context[1],
+                context[2],
+                generation.generation_id,
+                work_id,
+                owner,
+                provider_key="github",
+                profile_fingerprint=PROFILE,
+                worker_id="rollback-worker",
+                now=NOW,
+                lease_duration=LEASE,
+            )
+        session.rollback()
+    finally:
+        session.close()
+
+    with Session(engine) as verification:
+        persisted = verification.get(ConnectorSyncFileWorkItem, work_id)
+        reservation = verification.get(
+            ConnectorSyncControlReservation, owner.reservation_id
+        )
+        assert persisted is not None and reservation is not None
+        assert persisted.status == FileWorkStatus.PENDING.value
+        assert persisted.attempt_count == 0
+        assert persisted.fencing_token == 0
+        assert reservation.processor_lease_id is None
+
+
+def test_retry_retains_reservation_and_replay_claim_is_single_owner(engine):
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation, work, owner = _reserved_generation(
+            session, "TargetRetryReplay"
+        )
+        first = _target_acquire(session, context, generation, work, owner)
+        assert first.lease is not None
+        repository = ConnectorSyncWorkLedgerRepository(session)
+        retried = repository.record_failure(
+            first.lease,
+            worker_id="controlled-processor",
+            error_category="source_read",
+            error_code="network_temporarily_unavailable",
+            now=NOW,
+            retry_at=NOW + timedelta(minutes=1),
+        )
+        session.commit()
+        assert retried.status is FileWorkStatus.RETRY_WAIT
+        assert repository.claim_next_available(
+            provider_key="github",
+            profile_fingerprint=PROFILE,
+            worker_id="generic-retry-racer",
+            now=NOW + timedelta(minutes=1),
+            lease_duration=LEASE,
+        ) is None
+
+        second = _target_acquire(
+            session,
+            context,
+            generation,
+            work,
+            owner,
+            now=NOW + timedelta(minutes=1),
+        )
+        session.commit()
+        assert second.outcome == "acquired"
+        assert second.lease is not None
+        assert second.lease.attempt_number == 2
+        reservation = session.get(
+            ConnectorSyncControlReservation, owner.reservation_id
+        )
+        assert reservation is not None
+        assert reservation.processor_lease_id == second.lease.lease_id
+
+
+def test_reservation_survives_crash_and_expiry_never_bypasses_live_lease(engine):
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation, work, owner = _reserved_generation(
+            session, "TargetCrashExpiry"
+        )
+        acquired = _target_acquire(session, context, generation, work, owner)
+        session.commit()
+        assert acquired.lease is not None
+        reservation = session.get(
+            ConnectorSyncControlReservation, owner.reservation_id
+        )
+        assert reservation is not None
+        assert reservation.processor_lease_id == acquired.lease.lease_id
+
+        session.execute(
+            text(
+                """UPDATE connector_sync_control_reservations
+                   SET created_at=:created, handed_off_at=:created,
+                       expires_at=:expired
+                   WHERE id=:id"""
+            ),
+            {
+                "id": owner.reservation_id,
+                "created": NOW - timedelta(minutes=10),
+                "expired": NOW - timedelta(minutes=5),
+            },
+        )
+        session.commit()
+        repository = ConnectorSyncWorkLedgerRepository(session)
+
+        assert repository.recover_expired_available(
+            provider_key="github",
+            profile_fingerprint=PROFILE,
+            now=NOW + timedelta(minutes=2),
+            limit=10,
+        ) == ()
+        with pytest.raises(LostFileWorkLease):
+            repository.complete(
+                acquired.lease,
+                worker_id="controlled-processor",
+                outcome=FileWorkStatus.SUCCEEDED,
+                counters=FileWorkCounters(),
+                now=NOW + timedelta(minutes=2),
+            )
+        session.rollback()
+
+        recovered = repository.recover_expired_available(
+            provider_key="github",
+            profile_fingerprint=PROFILE,
+            now=NOW + LEASE + timedelta(seconds=1),
+            limit=10,
+        )
+        session.commit()
+        assert len(recovered) == 1
+        assert recovered[0].work_item_id == work.id
+        assert recovered[0].status is FileWorkStatus.RETRY_WAIT
+
+
+def test_fenced_terminal_completion_releases_only_owned_reservation(engine):
+    with Session(engine, expire_on_commit=False) as session:
+        context, generation, work, owner = _reserved_generation(
+            session, "TargetTerminalRelease"
+        )
+        acquired = _target_acquire(session, context, generation, work, owner)
+        assert acquired.lease is not None
+        completed = ConnectorSyncWorkLedgerRepository(session).complete(
+            acquired.lease,
+            worker_id="controlled-processor",
+            outcome=FileWorkStatus.SUCCEEDED,
+            counters=FileWorkCounters(10, 10, 1, 1),
+            now=NOW + timedelta(minutes=1),
+        )
+        session.commit()
+
+        reservation = session.get(
+            ConnectorSyncControlReservation, owner.reservation_id
+        )
+        assert completed.status is FileWorkStatus.SUCCEEDED
+        assert reservation is not None
+        assert reservation.state == "released"
+        assert reservation.processor_lease_id is None
+        assert reservation.released_at is not None
 
 
 def test_reconciliation_rejects_projection_drift_and_cross_tenant_request(engine) -> None:

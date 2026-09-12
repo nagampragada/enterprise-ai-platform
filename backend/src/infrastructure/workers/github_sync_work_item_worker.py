@@ -22,6 +22,7 @@ from application.services.github_sync_work_processing_service import (
     GitHubSyncWorkProcessingService,
 )
 from domain.connectors.sync_work_ledger import FileWorkCounters, FileWorkLease
+from app.config import GitHubProcessorClaimTarget
 from infrastructure.repositories.connector_sync_work_ledger_repository import (
     ConnectorSyncWorkLedgerRepository,
     FileWorkCancellationConflict,
@@ -88,6 +89,7 @@ class GitHubSyncWorkItemWorker:
         organization_fair_claims: bool = False,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         progress_check: Callable[[], None] = lambda: None,
+        claim_target: GitHubProcessorClaimTarget | None = None,
     ) -> None:
         self._sessions = session_factory
         self._service = service_factory
@@ -101,6 +103,7 @@ class GitHubSyncWorkItemWorker:
         self._organization_fair_claims = organization_fair_claims
         self._clock = clock
         self._progress_check = progress_check
+        self._claim_target = claim_target
 
     def execute_one(self) -> str:
         """Preserve the Slice 1 one-item outcome contract."""
@@ -109,11 +112,14 @@ class GitHubSyncWorkItemWorker:
     def execute_one_result(
         self, *, claim_allowed: Callable[[], bool] | None = None
     ) -> GitHubFileWorkExecution:
-        lease = (
+        acquisition = (
             self._recover_and_claim()
             if claim_allowed is None
             else self._recover_and_claim(claim_allowed)
         )
+        if isinstance(acquisition, GitHubFileWorkExecution):
+            return acquisition
+        lease = acquisition
         if lease is None:
             return GitHubFileWorkExecution("no_work")
         try:
@@ -220,10 +226,36 @@ class GitHubSyncWorkItemWorker:
 
     def _recover_and_claim(
         self, claim_allowed: Callable[[], bool] = lambda: True
-    ) -> FileWorkLease | None:
+    ) -> FileWorkLease | GitHubFileWorkExecution | None:
         session = self._sessions()
         try:
             repository = ConnectorSyncWorkLedgerRepository(session)
+            if self._claim_target is not None:
+                if not claim_allowed():
+                    session.rollback()
+                    return None
+                target = self._claim_target
+                result = repository.acquire_target_available(
+                    target.organization_id,
+                    target.connector_id,
+                    target.connector_scope_id,
+                    target.generation_id,
+                    target.work_item_id,
+                    target.reservation_owner,
+                    provider_key="github",
+                    profile_fingerprint=self._preparation.profile.fingerprint,
+                    worker_id=self._worker_id,
+                    now=self._now(),
+                    lease_duration=self._lease_duration,
+                )
+                session.commit()
+                if result.lease is not None:
+                    return result.lease
+                return GitHubFileWorkExecution(
+                    result.outcome,
+                    work_item_id=target.work_item_id,
+                    organization_id=target.organization_id,
+                )
             repository.recover_expired_available(
                 provider_key="github",
                 profile_fingerprint=self._preparation.profile.fingerprint,

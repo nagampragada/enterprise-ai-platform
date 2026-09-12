@@ -4,7 +4,7 @@ from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 from uuid import uuid4
 
 import pytest
@@ -779,11 +779,14 @@ def test_planner_only_batch_completes_job_without_legacy_persistence() -> None:
     now = datetime(2026, 8, 28, tzinfo=timezone.utc)
     run_id = uuid4()
     lease = _planning_lease(authorization)
+    lease.reservation_id = uuid4()
+    lease.lease_id = uuid4()
     discovered = GitHubDiscoveredFile(
         _entry(cursor.snapshot, "document.md"), cursor, complete, None
     )
+    session = MagicMock()
     service = GitHubStagedSynchronizationService(
-        Mock(), Mock(), Mock(), _profile(), ledger_planning_enabled=True
+        session, Mock(), Mock(), _profile(), ledger_planning_enabled=True
     )
     service._require_context = Mock()  # type: ignore[method-assign]
     service._replace_cursor = Mock()  # type: ignore[method-assign]
@@ -816,11 +819,18 @@ def test_planner_only_batch_completes_job_without_legacy_persistence() -> None:
     assert result.phase == "planning_complete"
     service._planner.register_manifest_batch.assert_called_once()
     service._planner.mark_discovery_complete.assert_called_once()
+    assert service._planner.mark_discovery_complete.call_args.kwargs[
+        "reservation_id"
+    ] == lease.reservation_id
+    assert service._planner.mark_discovery_complete.call_args.kwargs[
+        "planner_lease_id"
+    ] == lease.lease_id
     service._execution.complete_success.assert_called_once_with(
         lease, worker_id="worker"
     )
     service._sync.set_run_state.assert_called_once()
     service._persist_file.assert_not_called()
+    session.begin_nested.assert_called_once_with()
 
 
 def test_planner_only_partial_batch_is_resumable_and_does_not_complete_job() -> None:

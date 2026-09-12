@@ -7,6 +7,8 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from app.config import GitHubProcessorClaimTarget
+from domain.connectors.sync_control_reservation import ControlReservationOwner
 from domain.connectors.sync_work_ledger import FileWorkCounters
 import infrastructure.workers.github_sync_ledger_worker_host as host_module
 from infrastructure.workers.github_sync_ledger_worker_host import (
@@ -91,6 +93,20 @@ def _settings(**overrides):
     }
     values.update(overrides)
     return GitHubLedgerWorkerSettings(**values)
+
+
+def _target():
+    return GitHubProcessorClaimTarget(
+        uuid4(),
+        uuid4(),
+        uuid4(),
+        uuid4(),
+        uuid4(),
+        ControlReservationOwner(
+            uuid4(),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ),
+    )
 
 
 def test_defaults_are_conservative_disabled_and_bounded():
@@ -226,6 +242,54 @@ def test_item_bound_stops_before_another_claim_and_summarizes_counters():
     assert host.last_summary.stop_reason == "item_limit"
     assert host.last_summary.run_status == "partial"
     assert host.last_summary.partial_drain is True
+
+
+def test_targeted_host_stops_after_exactly_one_completed_item():
+    worker = ScriptedWorker(["completed", "completed"])
+    host = GitHubSyncLedgerWorkerHost(
+        worker,
+        _settings(max_items_per_execution=1, claim_target=_target()),
+        monotonic=lambda: 0.0,
+        run_id_factory=lambda: "target-run",
+    )
+
+    assert host.run() == GitHubLedgerHostExitCode.SUCCESS
+    assert worker.calls == 1
+    assert host.last_summary.stop_reason == "target_completed"
+    assert host.last_summary.items_claimed == 1
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    (
+        ("target_mismatch", GitHubLedgerHostExitCode.FAILURE),
+        ("reservation_unavailable", GitHubLedgerHostExitCode.FAILURE),
+        ("target_busy", GitHubLedgerHostExitCode.FAILURE),
+        ("retry_not_due", GitHubLedgerHostExitCode.RETRY_SCHEDULED),
+        ("already_succeeded", GitHubLedgerHostExitCode.SUCCESS),
+        ("already_quarantined", GitHubLedgerHostExitCode.ITEM_FAILED),
+    ),
+)
+def test_targeted_host_returns_one_terminal_sanitized_outcome(outcome, expected):
+    worker = Mock()
+    worker.execute_one_result.return_value = GitHubFileWorkExecution(
+        outcome,
+        work_item_id=uuid4(),
+    )
+    host = GitHubSyncLedgerWorkerHost(
+        worker,
+        _settings(max_items_per_execution=1, claim_target=_target()),
+        monotonic=lambda: 0.0,
+        run_id_factory=lambda: "target-outcome-run",
+    )
+
+    assert host.run() == expected
+    worker.execute_one_result.assert_called_once()
+
+
+def test_targeted_settings_require_exactly_one_item_budget():
+    with pytest.raises(ValueError, match="targeted processing requires max-items=1"):
+        _settings(claim_target=_target(), max_items_per_execution=2)
 
 
 def test_runtime_bound_prevents_new_claim_but_allows_active_item_to_finish():

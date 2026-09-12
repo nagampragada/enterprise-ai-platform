@@ -10,6 +10,7 @@ import pytest
 
 import infrastructure.workers.github_sync_ledger_planner_host as planner_module
 from app.config import GitHubPlannerClaimTarget
+from domain.connectors.sync_control_reservation import ControlReservationOwner
 from application.services.connector_sync_execution_service import (
     AcquiredSyncAttempt,
     TargetedSyncAttemptResult,
@@ -219,6 +220,7 @@ def test_planner_profile_provider_cannot_embed() -> None:
 
 
 def _acquired_attempt():
+    reservation_id = uuid4()
     lease = SimpleNamespace(
         organization_id=uuid4(),
         job_id=uuid4(),
@@ -231,6 +233,7 @@ def _acquired_attempt():
         mode="incremental",
         trigger_type="manual",
         max_attempts=3,
+        reservation_id=reservation_id,
     )
     return AcquiredSyncAttempt(lease=lease, sync_run_id=uuid4())
 
@@ -242,6 +245,7 @@ def _target_for(acquired) -> GitHubPlannerClaimTarget:
         lease.connector_id,
         lease.connector_scope_id,
         lease.job_id,
+        ControlReservationOwner(lease.reservation_id, "A" * 43),
     )
 
 
@@ -270,6 +274,7 @@ def test_targeted_host_uses_only_exact_recovery_and_claim_without_fallback() -> 
         target.connector_id,
         target.connector_scope_id,
         target.sync_job_id,
+        target.reservation_owner,
     )
     execution.acquire_target_github.assert_called_once()
     execution.recover_expired_github.assert_not_called()

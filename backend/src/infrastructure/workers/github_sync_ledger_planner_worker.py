@@ -236,6 +236,7 @@ def _lease(context: LocalFolderAttemptContext) -> SyncJobLease:
         context.lease_id,
         context.fencing_token,
         context.lease_expires_at,
+        context.reservation_id,
     )
 
 

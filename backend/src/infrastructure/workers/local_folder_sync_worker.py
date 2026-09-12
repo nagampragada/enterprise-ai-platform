@@ -61,6 +61,7 @@ class LocalFolderAttemptContext:
     mode: str
     trigger_type: str
     max_attempts: int
+    reservation_id: UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -375,6 +376,7 @@ def _lease(context: LocalFolderAttemptContext) -> SyncJobLease:
         context.lease_id,
         context.fencing_token,
         context.lease_expires_at,
+        context.reservation_id,
     )
 
 

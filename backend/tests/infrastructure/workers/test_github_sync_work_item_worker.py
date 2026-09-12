@@ -5,13 +5,16 @@ from uuid import uuid4
 
 import pytest
 
+from app.config import GitHubProcessorClaimTarget
 from application.services.connector_sync_retry_policy import ConnectorSyncRetryPolicy
 from application.services.github_staged_synchronization_service import (
     InvalidGitHubStagedSynchronizationRequest,
 )
 from domain.connectors.sync_work_ledger import FileWorkLease, FileWorkStatus
+from domain.connectors.sync_control_reservation import ControlReservationOwner
 from infrastructure.repositories.connector_sync_work_ledger_repository import (
     FileWorkCancellationConflict,
+    TargetedFileWorkClaimResult,
 )
 import infrastructure.workers.github_sync_work_item_worker as worker_module
 from infrastructure.workers.github_sync_work_item_worker import (
@@ -39,7 +42,7 @@ def _lease():
     )
 
 
-def _worker(preparation=None):
+def _worker(preparation=None, *, claim_target=None):
     return GitHubSyncWorkItemWorker(
         Mock(),
         Mock(),
@@ -51,6 +54,21 @@ def _worker(preparation=None):
         heartbeat_shutdown_timeout=timedelta(seconds=2),
         recovery_limit=10,
         clock=lambda: NOW,
+        claim_target=claim_target,
+    )
+
+
+def _claim_target():
+    return GitHubProcessorClaimTarget(
+        uuid4(),
+        uuid4(),
+        uuid4(),
+        uuid4(),
+        uuid4(),
+        ControlReservationOwner(
+            uuid4(),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ),
     )
 
 
@@ -212,6 +230,93 @@ def test_dedicated_fair_claim_uses_only_fair_repository_path(monkeypatch):
     repository.claim_next_available_fair.assert_called_once()
     repository.claim_next_available.assert_not_called()
     session.commit.assert_called_once()
+    session.close.assert_called_once()
+
+
+def test_targeted_claim_uses_only_exact_reserved_repository_path(monkeypatch):
+    target = _claim_target()
+    repository = Mock()
+    repository.acquire_target_available.return_value = TargetedFileWorkClaimResult(
+        "acquired", _lease(), True
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "ConnectorSyncWorkLedgerRepository",
+        Mock(return_value=repository),
+    )
+    session = Mock()
+    worker = _worker(claim_target=target)
+    worker._sessions = lambda: session
+
+    assert worker._recover_and_claim() == repository.acquire_target_available.return_value.lease
+
+    repository.acquire_target_available.assert_called_once_with(
+        target.organization_id,
+        target.connector_id,
+        target.connector_scope_id,
+        target.generation_id,
+        target.work_item_id,
+        target.reservation_owner,
+        provider_key="github",
+        profile_fingerprint=worker._preparation.profile.fingerprint,
+        worker_id="worker-1",
+        now=NOW,
+        lease_duration=timedelta(minutes=15),
+    )
+    repository.recover_expired_available.assert_not_called()
+    repository.claim_next_available.assert_not_called()
+    repository.claim_next_available_fair.assert_not_called()
+    session.commit.assert_called_once()
+    session.rollback.assert_not_called()
+    session.close.assert_called_once()
+
+
+def test_targeted_miss_is_sanitized_and_does_not_fall_back(monkeypatch):
+    target = _claim_target()
+    repository = Mock()
+    repository.acquire_target_available.return_value = TargetedFileWorkClaimResult(
+        "target_mismatch"
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "ConnectorSyncWorkLedgerRepository",
+        Mock(return_value=repository),
+    )
+    session = Mock()
+    worker = _worker(claim_target=target)
+    worker._sessions = lambda: session
+
+    result = worker.execute_one_result()
+
+    assert result.outcome == "target_mismatch"
+    assert result.work_item_id == target.work_item_id
+    assert result.organization_id == target.organization_id
+    assert result.attempt_number is None
+    repository.recover_expired_available.assert_not_called()
+    repository.claim_next_available.assert_not_called()
+    repository.claim_next_available_fair.assert_not_called()
+    session.commit.assert_called_once()
+    session.close.assert_called_once()
+
+
+def test_targeted_claim_gate_prevents_any_repository_operation(monkeypatch):
+    repository = Mock()
+    monkeypatch.setattr(
+        worker_module,
+        "ConnectorSyncWorkLedgerRepository",
+        Mock(return_value=repository),
+    )
+    session = Mock()
+    worker = _worker(claim_target=_claim_target())
+    worker._sessions = lambda: session
+
+    assert worker._recover_and_claim(lambda: False) is None
+
+    repository.acquire_target_available.assert_not_called()
+    repository.recover_expired_available.assert_not_called()
+    repository.claim_next_available.assert_not_called()
+    session.rollback.assert_called_once()
+    session.commit.assert_not_called()
     session.close.assert_called_once()
 
 

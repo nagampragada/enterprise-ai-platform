@@ -18,7 +18,7 @@ from infrastructure.db.base import Base
 ROOT = Path(__file__).resolve().parents[3]
 PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
 INI = ROOT / "alembic.ini"
-REVISION = "20260905_000024"
+REVISION = "20260911_000025"
 PRIOR_REVISION = "20260902_000022"
 TABLE = "connector_sync_generation_activations"
 

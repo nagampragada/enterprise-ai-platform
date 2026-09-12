@@ -8,15 +8,20 @@ from datetime import datetime, timedelta
 from typing import Callable
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, or_, select, text, update
+from sqlalchemy import and_, exists, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
+from domain.connectors.sync_control_reservation import (
+    ControlReservationOwner,
+    ControlledSyncReservationRequest,
+)
 from infrastructure.db.models import (
     Connector,
     ConnectorScope,
+    ConnectorSyncControlReservation,
     ConnectorSyncJob,
     ConnectorSyncRun,
 )
@@ -105,6 +110,7 @@ class SyncJobLease:
     lease_id: UUID
     fencing_token: int
     lease_expires_at: datetime
+    reservation_id: UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -174,6 +180,7 @@ class ExpiredSyncJobLease:
     lease_id: UUID
     fencing_token: int
     cancellation_requested: bool
+    reservation_id: UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -215,6 +222,7 @@ class ConnectorSyncJobRepository:
         requested_by_user_id: UUID | None = None,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         priority: int = 100,
+        reservation: ControlledSyncReservationRequest | None = None,
     ) -> EnqueueResult:
         organization_id = _uuid("organization_id", organization_id)
         connector_id = _uuid("connector_id", connector_id)
@@ -229,6 +237,14 @@ class ConnectorSyncJobRepository:
         )
         max_attempts = _max_attempts(max_attempts)
         priority = _priority(priority)
+        if reservation is not None and (
+            not isinstance(reservation, ControlledSyncReservationRequest)
+            or requester is None
+            or reservation.created_by_user_id != requester
+        ):
+            raise InvalidSyncJobRequest("controlled reservation is invalid")
+        if reservation is not None and not self._control_reservations_available():
+            raise SyncJobConflict("controlled synchronization schema is unavailable")
         job_id = uuid4()
         statement = (
             insert(ConnectorSyncJob)
@@ -273,22 +289,130 @@ class ConnectorSyncJobRepository:
                 raise SyncJobConflict("synchronization scope is unavailable")
             created_id = self._session.execute(statement).scalar_one_or_none()
             if created_id is not None:
+                if reservation is not None:
+                    self._create_control_reservation(
+                        organization_id,
+                        connector_id,
+                        connector_scope_id,
+                        created_id,
+                        reservation,
+                    )
                 return EnqueueResult(created_id, "queued", False)
             existing = self._session.execute(
-                select(ConnectorSyncJob.id, ConnectorSyncJob.status).where(
+                select(ConnectorSyncJob).where(
                     ConnectorSyncJob.organization_id == organization_id,
                     ConnectorSyncJob.connector_id == connector_id,
                     ConnectorSyncJob.connector_scope_id == connector_scope_id,
                     ConnectorSyncJob.status.in_(NONTERMINAL_STATUSES),
                 )
-            ).one_or_none()
+            ).scalar_one_or_none()
         except IntegrityError as exc:
             raise SyncJobConflict("synchronization job could not be enqueued") from exc
         except SQLAlchemyError as exc:
             raise SyncJobPersistenceError("synchronization job could not be enqueued") from exc
         if existing is None:
             raise SyncJobConflict("synchronization job could not be coalesced")
+        if reservation is None:
+            if (
+                self._control_reservations_available()
+                and self._has_live_job_reservation(existing)
+            ):
+                raise SyncJobConflict("controlled synchronization job is unavailable")
+        elif not self._matching_live_job_reservation(existing, reservation):
+            raise SyncJobConflict("controlled synchronization job is unavailable")
         return EnqueueResult(existing.id, existing.status, True)
+
+    def _create_control_reservation(
+        self,
+        organization_id: UUID,
+        connector_id: UUID,
+        connector_scope_id: UUID,
+        sync_job_id: UUID,
+        request: ControlledSyncReservationRequest,
+    ) -> None:
+        database_now = func.statement_timestamp()
+        statement = insert(ConnectorSyncControlReservation).values(
+            id=request.owner.reservation_id,
+            organization_id=organization_id,
+            connector_id=connector_id,
+            connector_scope_id=connector_scope_id,
+            sync_job_id=sync_job_id,
+            generation_id=None,
+            work_item_id=None,
+            created_by_user_id=request.created_by_user_id,
+            owner_token_hash=request.owner.owner_token_hash,
+            target_source_key_hash=request.target_source_key_hash,
+            target_provider_blob_id=request.target_provider_blob_id,
+            target_provider_revision_id=request.target_provider_revision_id,
+            target_profile_fingerprint=request.target_profile_fingerprint,
+            state="job",
+            planner_lease_id=None,
+            processor_lease_id=None,
+            created_at=database_now,
+            expires_at=database_now
+            + timedelta(seconds=request.expires_in_seconds),
+            handed_off_at=None,
+            released_at=None,
+        )
+        try:
+            self._session.execute(statement)
+        except IntegrityError as exc:
+            raise SyncJobConflict(
+                "controlled synchronization reservation could not be created"
+            ) from exc
+        except SQLAlchemyError as exc:
+            raise SyncJobPersistenceError(
+                "controlled synchronization reservation could not be created"
+            ) from exc
+
+    def _matching_live_job_reservation(
+        self,
+        job: ConnectorSyncJob,
+        request: ControlledSyncReservationRequest,
+    ) -> bool:
+        row = self._one(
+            select(ConnectorSyncControlReservation).where(
+                ConnectorSyncControlReservation.organization_id
+                == job.organization_id,
+                ConnectorSyncControlReservation.connector_id == job.connector_id,
+                ConnectorSyncControlReservation.connector_scope_id
+                == job.connector_scope_id,
+                ConnectorSyncControlReservation.sync_job_id == job.id,
+                ConnectorSyncControlReservation.id == request.owner.reservation_id,
+                ConnectorSyncControlReservation.owner_token_hash
+                == request.owner.owner_token_hash,
+                ConnectorSyncControlReservation.target_source_key_hash
+                == request.target_source_key_hash,
+                ConnectorSyncControlReservation.target_provider_blob_id
+                == request.target_provider_blob_id,
+                ConnectorSyncControlReservation.target_provider_revision_id
+                == request.target_provider_revision_id,
+                ConnectorSyncControlReservation.target_profile_fingerprint
+                == request.target_profile_fingerprint,
+                ConnectorSyncControlReservation.state == "job",
+                ConnectorSyncControlReservation.released_at.is_(None),
+                ConnectorSyncControlReservation.expires_at > func.clock_timestamp(),
+            ),
+            "controlled synchronization reservation could not be read",
+        )
+        return row is not None
+
+    def _has_live_job_reservation(self, job: ConnectorSyncJob) -> bool:
+        row = self._one(
+            select(ConnectorSyncControlReservation.id).where(
+                ConnectorSyncControlReservation.organization_id
+                == job.organization_id,
+                ConnectorSyncControlReservation.connector_id == job.connector_id,
+                ConnectorSyncControlReservation.connector_scope_id
+                == job.connector_scope_id,
+                ConnectorSyncControlReservation.sync_job_id == job.id,
+                ConnectorSyncControlReservation.released_at.is_(None),
+                ConnectorSyncControlReservation.expires_at
+                > func.clock_timestamp(),
+            ),
+            "controlled synchronization reservation could not be read",
+        )
+        return row is not None
 
     def acquire_next(
         self,
@@ -311,6 +435,7 @@ class ConnectorSyncJobRepository:
             ConnectorSyncJob.next_attempt_at <= now,
             ConnectorSyncJob.cancel_requested_at.is_(None),
             ConnectorSyncJob.attempt_count < ConnectorSyncJob.max_attempts,
+            _generic_job_reservation_available(),
         )
         if connector is not None:
             candidate = candidate.where(ConnectorSyncJob.connector_id == connector)
@@ -334,6 +459,7 @@ class ConnectorSyncJobRepository:
                 ConnectorSyncJob.next_attempt_at <= now,
                 ConnectorSyncJob.cancel_requested_at.is_(None),
                 ConnectorSyncJob.attempt_count < ConnectorSyncJob.max_attempts,
+                _generic_job_reservation_available(),
             )
             .values(
                 status="running",
@@ -390,6 +516,7 @@ class ConnectorSyncJobRepository:
         connector_id: UUID,
         connector_scope_id: UUID,
         sync_job_id: UUID,
+        reservation_owner: ControlReservationOwner,
         *,
         worker_id: str,
         lease_duration: timedelta,
@@ -402,14 +529,25 @@ class ConnectorSyncJobRepository:
             connector_scope_id,
             sync_job_id,
         )
+        owner = _reservation_owner(reservation_owner)
+        if self._lock_target_job(target) is None:
+            return None
+        reservation = self._lock_live_job_reservation(target, owner)
+        if reservation is None:
+            return None
         routed = self._acquire_routed(
             worker_id=worker_id,
             lease_duration=lease_duration,
             now=now,
             connector_type="github",
             target_predicates=_target_predicates(target),
+            generic_reservation_filter=False,
         )
-        return routed.lease if routed is not None else None
+        if routed is None:
+            return None
+        reservation.planner_lease_id = routed.lease.lease_id
+        self._flush("controlled synchronization reservation could not be claimed")
+        return _lease_with_reservation(routed.lease, owner.reservation_id)
 
     def acquire_next_routed(
         self,
@@ -426,6 +564,43 @@ class ConnectorSyncJobRepository:
             connector_type=None,
         )
 
+    def _lock_live_job_reservation(
+        self,
+        target: tuple[UUID, UUID, UUID, UUID],
+        owner: ControlReservationOwner,
+    ) -> ConnectorSyncControlReservation | None:
+        organization_id, connector_id, connector_scope_id, sync_job_id = target
+        return self._one(
+            select(ConnectorSyncControlReservation)
+            .where(
+                ConnectorSyncControlReservation.organization_id
+                == organization_id,
+                ConnectorSyncControlReservation.connector_id == connector_id,
+                ConnectorSyncControlReservation.connector_scope_id
+                == connector_scope_id,
+                ConnectorSyncControlReservation.sync_job_id == sync_job_id,
+                ConnectorSyncControlReservation.id == owner.reservation_id,
+                ConnectorSyncControlReservation.owner_token_hash
+                == owner.owner_token_hash,
+                ConnectorSyncControlReservation.state == "job",
+                ConnectorSyncControlReservation.released_at.is_(None),
+                ConnectorSyncControlReservation.expires_at > func.clock_timestamp(),
+            )
+            .with_for_update(skip_locked=True),
+            "controlled synchronization reservation could not be locked",
+        )
+
+    def _lock_target_job(
+        self, target: tuple[UUID, UUID, UUID, UUID]
+    ) -> ConnectorSyncJob | None:
+        """Establish the job-before-reservation lock order without mutation."""
+        return self._one(
+            select(ConnectorSyncJob)
+            .where(*_target_predicates(target))
+            .with_for_update(skip_locked=True),
+            "controlled synchronization job could not be locked",
+        )
+
     def _acquire_next_routed(
         self,
         *,
@@ -440,6 +615,7 @@ class ConnectorSyncJobRepository:
             now=now,
             connector_type=connector_type,
             target_predicates=(),
+            generic_reservation_filter=True,
         )
 
     def _acquire_routed(
@@ -450,6 +626,7 @@ class ConnectorSyncJobRepository:
         now: datetime,
         connector_type: str | None,
         target_predicates: tuple[ColumnElement[bool], ...],
+        generic_reservation_filter: bool = True,
     ) -> RoutedSyncJobLease | None:
         worker_id = _worker_id(worker_id)
         now = _aware("now", now)
@@ -462,6 +639,11 @@ class ConnectorSyncJobRepository:
         if connector_type is not None:
             connector_predicates.append(Connector.connector_type == connector_type)
         persisted_connector = select(Connector.id).where(*connector_predicates).exists()
+        reservation_predicates = (
+            (_generic_job_reservation_available(),)
+            if generic_reservation_filter
+            else ()
+        )
         candidate = (
             select(ConnectorSyncJob.id)
             .where(
@@ -470,6 +652,7 @@ class ConnectorSyncJobRepository:
                 ConnectorSyncJob.next_attempt_at <= now,
                 ConnectorSyncJob.cancel_requested_at.is_(None),
                 ConnectorSyncJob.attempt_count < ConnectorSyncJob.max_attempts,
+                *reservation_predicates,
                 *target_predicates,
             )
             .order_by(
@@ -491,6 +674,7 @@ class ConnectorSyncJobRepository:
                 ConnectorSyncJob.next_attempt_at <= now,
                 ConnectorSyncJob.cancel_requested_at.is_(None),
                 ConnectorSyncJob.attempt_count < ConnectorSyncJob.max_attempts,
+                *reservation_predicates,
                 *target_predicates,
             )
             .values(
@@ -551,7 +735,12 @@ class ConnectorSyncJobRepository:
         row = self._updated(statement, "synchronization heartbeat could not be persisted")
         if row is None:
             self._raise_lost_lease(lease, worker_id, cancellation=True)
-        return _lease(row)
+        renewed = _lease(row)
+        return (
+            _lease_with_reservation(renewed, lease.reservation_id)
+            if lease.reservation_id is not None
+            else renewed
+        )
 
     def validate_attempt(
         self,
@@ -659,6 +848,8 @@ class ConnectorSyncJobRepository:
         updated = self._updated(statement, "cancellation request could not be persisted")
         if updated is None:
             raise SyncJobCancellationConflict("cancellation request conflicted with job state")
+        if updated.status == "cancelled":
+            self._release_job_reservation(updated.organization_id, updated.id)
         return _history(updated)
 
     def acknowledge_cancellation(
@@ -689,6 +880,7 @@ class ConnectorSyncJobRepository:
         row = self._updated(statement, "cancellation acknowledgement could not be persisted")
         if row is None:
             self._raise_lost_lease(lease, worker_id, cancellation=True)
+        self._release_or_retain_job_reservation(lease, terminal=True, now=now)
         self._finish_attempt_run(lease, status="cancelled", now=now)
         return _history(row)
 
@@ -702,10 +894,12 @@ class ConnectorSyncJobRepository:
         lease = _valid_lease(lease)
         worker_id = _worker_id(worker_id)
         now = _aware("now", now)
+        if lease.reservation_id is not None:
+            self._require_reservation_handed_off(lease)
         statement = (
             update(ConnectorSyncJob)
             .where(
-                *_ownership_predicates(lease, worker_id, now),
+                *_ownership_predicates(lease, worker_id, now, allow_handoff=True),
                 ConnectorSyncJob.cancel_requested_at.is_(None),
             )
             .values(
@@ -771,6 +965,9 @@ class ConnectorSyncJobRepository:
         row = self._updated(statement, "synchronization failure could not be persisted")
         if row is None:
             self._raise_lost_lease(lease, worker_id, cancellation=True)
+        self._release_or_retain_job_reservation(
+            lease, terminal=target == "failed", now=now
+        )
         self._finish_attempt_run(lease, status="failed", now=now)
         return _history(row)
 
@@ -789,6 +986,7 @@ class ConnectorSyncJobRepository:
         statement = select(ConnectorSyncJob).where(
             ConnectorSyncJob.status == "running",
             ConnectorSyncJob.lease_expires_at <= now,
+            _generic_job_reservation_available(),
         )
         if organization is not None:
             statement = statement.where(ConnectorSyncJob.organization_id == organization)
@@ -821,6 +1019,7 @@ class ConnectorSyncJobRepository:
         connector_id: UUID,
         connector_scope_id: UUID,
         sync_job_id: UUID,
+        reservation_owner: ControlReservationOwner,
         *,
         now: datetime,
     ) -> tuple[ExpiredSyncJobLease, ...]:
@@ -831,11 +1030,19 @@ class ConnectorSyncJobRepository:
             connector_scope_id,
             sync_job_id,
         )
+        owner = _reservation_owner(reservation_owner)
+        if self._lock_target_job(target) is None:
+            return ()
+        reservation = self._lock_live_job_reservation(target, owner)
+        if reservation is None:
+            return ()
         return self._lock_expired_routed_with_predicates(
             now=now,
             limit=1,
             connector_type="github",
             target_predicates=_target_predicates(target),
+            generic_reservation_filter=False,
+            reservation_id=owner.reservation_id,
         )
 
     def lock_expired_routed(
@@ -851,6 +1058,7 @@ class ConnectorSyncJobRepository:
             limit=limit,
             connector_type=connector_type,
             target_predicates=(),
+            generic_reservation_filter=True,
         )
 
     def _lock_expired_routed_with_predicates(
@@ -860,6 +1068,8 @@ class ConnectorSyncJobRepository:
         limit: int,
         connector_type: str | None,
         target_predicates: tuple[ColumnElement[bool], ...],
+        generic_reservation_filter: bool = True,
+        reservation_id: UUID | None = None,
     ) -> tuple[ExpiredSyncJobLease, ...]:
         now = _aware("now", now)
         limit = _recovery_limit(limit)
@@ -870,12 +1080,18 @@ class ConnectorSyncJobRepository:
         if connector_type is not None:
             connector_predicates.append(Connector.connector_type == connector_type)
         persisted_connector = select(Connector.id).where(*connector_predicates).exists()
+        reservation_predicates = (
+            (_generic_job_reservation_available(),)
+            if generic_reservation_filter
+            else ()
+        )
         statement = (
             select(ConnectorSyncJob)
             .where(
                 persisted_connector,
                 ConnectorSyncJob.status == "running",
                 ConnectorSyncJob.lease_expires_at <= now,
+                *reservation_predicates,
                 *target_predicates,
             )
             .order_by(ConnectorSyncJob.lease_expires_at, ConnectorSyncJob.id)
@@ -883,7 +1099,7 @@ class ConnectorSyncJobRepository:
             .limit(limit)
         )
         rows = self._all(statement, "expired routed synchronization jobs could not be read")
-        return tuple(_expired(row) for row in rows)
+        return tuple(_expired(row, reservation_id=reservation_id) for row in rows)
 
     def recover_expired(
         self,
@@ -935,6 +1151,12 @@ class ConnectorSyncJobRepository:
         row = self._updated(statement, "expired synchronization job could not be recovered")
         if row is None:
             raise LostSyncJobLease("expired synchronization lease is no longer recoverable")
+        if expired.reservation_id is not None:
+            self._release_or_retain_expired_job_reservation(
+                expired,
+                terminal=target in {"failed", "cancelled"},
+                now=now,
+            )
         lease = SyncJobLease(
             expired.organization_id,
             expired.job_id,
@@ -947,6 +1169,7 @@ class ConnectorSyncJobRepository:
             expired.lease_id,
             expired.fencing_token,
             now,
+            expired.reservation_id,
         )
         self._finish_attempt_run(
             lease,
@@ -954,6 +1177,128 @@ class ConnectorSyncJobRepository:
             now=now,
         )
         return _history(row)
+
+    def _require_reservation_handed_off(self, lease: SyncJobLease) -> None:
+        reservation = self._one(
+            select(ConnectorSyncControlReservation).where(
+                ConnectorSyncControlReservation.organization_id
+                == lease.organization_id,
+                ConnectorSyncControlReservation.connector_id == lease.connector_id,
+                ConnectorSyncControlReservation.connector_scope_id
+                == lease.connector_scope_id,
+                ConnectorSyncControlReservation.sync_job_id == lease.job_id,
+                ConnectorSyncControlReservation.id == lease.reservation_id,
+                ConnectorSyncControlReservation.state == "work_item",
+                ConnectorSyncControlReservation.planner_lease_id.is_(None),
+                ConnectorSyncControlReservation.released_at.is_(None),
+                ConnectorSyncControlReservation.expires_at
+                > func.clock_timestamp(),
+            ),
+            "controlled synchronization handoff could not be validated",
+        )
+        if reservation is None:
+            raise LostSyncJobLease(
+                "controlled synchronization reservation was not handed off"
+            )
+
+    def _release_job_reservation(
+        self, organization_id: UUID, sync_job_id: UUID
+    ) -> None:
+        # The API image is intentionally compatible with predecessor schema
+        # 000024. Ordinary cancellation must remain available before the
+        # additive reservation table is migrated.
+        if not self._control_reservations_available():
+            return
+        reservation = self._one(
+            select(ConnectorSyncControlReservation)
+            .where(
+                ConnectorSyncControlReservation.organization_id == organization_id,
+                ConnectorSyncControlReservation.sync_job_id == sync_job_id,
+                ConnectorSyncControlReservation.state == "job",
+                ConnectorSyncControlReservation.released_at.is_(None),
+            )
+            .with_for_update(),
+            "controlled synchronization reservation could not be locked",
+        )
+        if reservation is None:
+            return
+        reservation.state = "released"
+        reservation.planner_lease_id = None
+        reservation.released_at = func.clock_timestamp()
+        self._flush("controlled synchronization reservation could not be released")
+
+    def _control_reservations_available(self) -> bool:
+        try:
+            return self._session.scalar(
+                select(
+                    func.to_regclass("public.connector_sync_control_reservations")
+                )
+            ) is not None
+        except SQLAlchemyError as exc:
+            raise SyncJobPersistenceError(
+                "controlled synchronization reservation schema could not be read"
+            ) from exc
+
+    def _release_or_retain_job_reservation(
+        self, lease: SyncJobLease, *, terminal: bool, now: datetime
+    ) -> None:
+        if lease.reservation_id is None:
+            return
+        reservation = self._one(
+            select(ConnectorSyncControlReservation)
+            .where(
+                ConnectorSyncControlReservation.organization_id
+                == lease.organization_id,
+                ConnectorSyncControlReservation.sync_job_id == lease.job_id,
+                ConnectorSyncControlReservation.id == lease.reservation_id,
+                ConnectorSyncControlReservation.state == "job",
+                ConnectorSyncControlReservation.planner_lease_id == lease.lease_id,
+                ConnectorSyncControlReservation.released_at.is_(None),
+            )
+            .with_for_update(),
+            "controlled synchronization reservation could not be locked",
+        )
+        if reservation is None:
+            raise LostSyncJobLease(
+                "controlled synchronization reservation is no longer owned"
+            )
+        reservation.planner_lease_id = None
+        if terminal:
+            reservation.state = "released"
+            reservation.released_at = func.clock_timestamp()
+        self._flush("controlled synchronization reservation could not be updated")
+
+    def _release_or_retain_expired_job_reservation(
+        self,
+        expired: ExpiredSyncJobLease,
+        *,
+        terminal: bool,
+        now: datetime,
+    ) -> None:
+        reservation = self._one(
+            select(ConnectorSyncControlReservation)
+            .where(
+                ConnectorSyncControlReservation.organization_id
+                == expired.organization_id,
+                ConnectorSyncControlReservation.sync_job_id == expired.job_id,
+                ConnectorSyncControlReservation.id == expired.reservation_id,
+                ConnectorSyncControlReservation.state == "job",
+                ConnectorSyncControlReservation.planner_lease_id == expired.lease_id,
+                ConnectorSyncControlReservation.released_at.is_(None),
+                ConnectorSyncControlReservation.expires_at > func.clock_timestamp(),
+            )
+            .with_for_update(),
+            "controlled synchronization reservation could not be locked",
+        )
+        if reservation is None:
+            raise LostSyncJobLease(
+                "controlled synchronization reservation is no longer owned"
+            )
+        reservation.planner_lease_id = None
+        if terminal:
+            reservation.state = "released"
+            reservation.released_at = func.clock_timestamp()
+        self._flush("controlled synchronization reservation could not be recovered")
 
     def create_attempt_run(
         self,
@@ -1290,6 +1635,14 @@ class ConnectorSyncJobRepository:
         except SQLAlchemyError as exc:
             raise SyncJobPersistenceError(message) from exc
 
+    def _flush(self, message: str) -> None:
+        try:
+            self._session.flush()
+        except IntegrityError as exc:
+            raise SyncJobConflict(message) from exc
+        except SQLAlchemyError as exc:
+            raise SyncJobPersistenceError(message) from exc
+
     def _lease_uuid(self) -> UUID:
         value = self._lease_id_factory()
         if not isinstance(value, UUID):
@@ -1297,8 +1650,14 @@ class ConnectorSyncJobRepository:
         return value
 
 
-def _ownership_predicates(lease: SyncJobLease, worker_id: str, now: datetime):
-    return (
+def _ownership_predicates(
+    lease: SyncJobLease,
+    worker_id: str,
+    now: datetime,
+    *,
+    allow_handoff: bool = False,
+):
+    predicates: tuple[ColumnElement[bool], ...] = (
         ConnectorSyncJob.organization_id == lease.organization_id,
         ConnectorSyncJob.id == lease.job_id,
         ConnectorSyncJob.status == "running",
@@ -1308,6 +1667,35 @@ def _ownership_predicates(lease: SyncJobLease, worker_id: str, now: datetime):
         ConnectorSyncJob.attempt_count == lease.attempt_number,
         ConnectorSyncJob.lease_expires_at > now,
     )
+    if lease.reservation_id is None:
+        return predicates
+    live_planner = exists(
+        select(ConnectorSyncControlReservation.id).where(
+            ConnectorSyncControlReservation.organization_id
+            == lease.organization_id,
+            ConnectorSyncControlReservation.sync_job_id == lease.job_id,
+            ConnectorSyncControlReservation.id == lease.reservation_id,
+            ConnectorSyncControlReservation.state == "job",
+            ConnectorSyncControlReservation.planner_lease_id == lease.lease_id,
+            ConnectorSyncControlReservation.released_at.is_(None),
+            ConnectorSyncControlReservation.expires_at > func.clock_timestamp(),
+        )
+    )
+    if not allow_handoff:
+        return (*predicates, live_planner)
+    handed_off = exists(
+        select(ConnectorSyncControlReservation.id).where(
+            ConnectorSyncControlReservation.organization_id
+            == lease.organization_id,
+            ConnectorSyncControlReservation.sync_job_id == lease.job_id,
+            ConnectorSyncControlReservation.id == lease.reservation_id,
+            ConnectorSyncControlReservation.state == "work_item",
+            ConnectorSyncControlReservation.planner_lease_id.is_(None),
+            ConnectorSyncControlReservation.released_at.is_(None),
+            ConnectorSyncControlReservation.expires_at > func.clock_timestamp(),
+        )
+    )
+    return (*predicates, or_(live_planner, handed_off))
 
 
 def _cleared_lease() -> dict[str, None]:
@@ -1358,6 +1746,25 @@ def _history(row: ConnectorSyncJob) -> SyncJobHistoryItem:
     )
 
 
+def _lease_with_reservation(
+    lease: SyncJobLease, reservation_id: UUID
+) -> SyncJobLease:
+    return SyncJobLease(
+        lease.organization_id,
+        lease.job_id,
+        lease.connector_id,
+        lease.connector_scope_id,
+        lease.mode,
+        lease.trigger_type,
+        lease.attempt_number,
+        lease.max_attempts,
+        lease.lease_id,
+        lease.fencing_token,
+        lease.lease_expires_at,
+        reservation_id,
+    )
+
+
 def _target_identifiers(
     organization_id: UUID,
     connector_id: UUID,
@@ -1402,7 +1809,9 @@ def _run_summary(row: ConnectorSyncRun) -> SyncJobRunSummary:
     )
 
 
-def _expired(row: ConnectorSyncJob) -> ExpiredSyncJobLease:
+def _expired(
+    row: ConnectorSyncJob, *, reservation_id: UUID | None = None
+) -> ExpiredSyncJobLease:
     if row.lease_id is None:
         raise SyncJobPersistenceError("expired synchronization lease is incomplete")
     return ExpiredSyncJobLease(
@@ -1415,6 +1824,7 @@ def _expired(row: ConnectorSyncJob) -> ExpiredSyncJobLease:
         row.lease_id,
         row.fencing_token,
         row.cancel_requested_at is not None,
+        reservation_id,
     )
 
 
@@ -1426,6 +1836,8 @@ def _valid_lease(value: object) -> SyncJobLease:
     _uuid("connector_id", value.connector_id)
     _uuid("connector_scope_id", value.connector_scope_id)
     _uuid("lease_id", value.lease_id)
+    if value.reservation_id is not None:
+        _uuid("reservation_id", value.reservation_id)
     _max_attempts(value.max_attempts)
     if (
         value.attempt_number < 1
@@ -1445,6 +1857,8 @@ def _valid_expired(value: object) -> ExpiredSyncJobLease:
     _uuid("connector_id", value.connector_id)
     _uuid("connector_scope_id", value.connector_scope_id)
     _uuid("lease_id", value.lease_id)
+    if value.reservation_id is not None:
+        _uuid("reservation_id", value.reservation_id)
     _max_attempts(value.max_attempts)
     if (
         value.attempt_count < 1
@@ -1521,6 +1935,25 @@ def _recovery_limit(value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= MAX_RECOVERY_LIMIT:
         raise InvalidSyncJobRequest(f"limit must be between 1 and {MAX_RECOVERY_LIMIT}")
     return value
+
+
+def _reservation_owner(value: object) -> ControlReservationOwner:
+    if not isinstance(value, ControlReservationOwner):
+        raise InvalidSyncJobRequest("controlled reservation owner is invalid")
+    return value
+
+
+def _generic_job_reservation_available() -> ColumnElement[bool]:
+    live = exists(
+        select(ConnectorSyncControlReservation.id).where(
+            ConnectorSyncControlReservation.organization_id
+            == ConnectorSyncJob.organization_id,
+            ConnectorSyncControlReservation.sync_job_id == ConnectorSyncJob.id,
+            ConnectorSyncControlReservation.released_at.is_(None),
+            ConnectorSyncControlReservation.expires_at > func.clock_timestamp(),
+        )
+    )
+    return ~live
 
 
 def _cursor(value: SyncJobPageCursor | None) -> None:

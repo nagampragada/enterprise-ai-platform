@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import base64
 import subprocess
 import threading
 import time
@@ -9,13 +10,17 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, select, text
+from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from application.services.connector_sync_execution_service import ConnectorSyncExecutionService
 from application.services.connector_sync_retry_policy import ConnectorSyncRetryPolicy, SyncFailureKind
-from infrastructure.db.models import ConnectorSyncJob, ConnectorSyncRun
+from infrastructure.db.models import (
+    ConnectorSyncControlReservation,
+    ConnectorSyncJob,
+    ConnectorSyncRun,
+)
 from infrastructure.repositories.connector_sync_job_repository import (
     ConnectorSyncJobRepository,
     InvalidSyncJobTransition,
@@ -24,8 +29,13 @@ from infrastructure.repositories.connector_sync_job_repository import (
     SyncJobCancellationConflict,
     SyncJobConflict,
     SyncJobNotFound,
+    SyncJobPersistenceError,
 )
 from infrastructure.workers.lease_heartbeat import LeaseHeartbeat, LeaseHeartbeatFailure
+from domain.connectors.sync_control_reservation import (
+    ControlReservationOwner,
+    ControlledSyncReservationRequest,
+)
 
 ROOT = Path(__file__).resolve().parents[3]
 PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
@@ -34,6 +44,7 @@ TEST_URL = "TEST_DATABASE_URL"
 DEV_URL = "DATABASE_URL"
 NOW = datetime(2026, 8, 24, 12, tzinfo=timezone.utc)
 LEASE = timedelta(minutes=5)
+_RESERVATION_OWNERS: dict[uuid.UUID, ControlReservationOwner] = {}
 
 
 def _identity(url: str):
@@ -232,14 +243,429 @@ def _target_claim(
     worker="targeted-planner",
     now=NOW,
 ):
+    owner = _ensure_job_reservation(session, job_id)
     return _service(session, now=now).acquire_target_github(
         organization_id,
         connector_id,
         scope_id,
         job_id,
+        owner,
         worker_id=worker,
         lease_duration=LEASE,
     )
+
+
+def _ensure_job_reservation(session: Session, job_id) -> ControlReservationOwner:
+    owner = _RESERVATION_OWNERS.get(job_id)
+    if owner is not None:
+        return owner
+    job = session.execute(
+        text(
+            "SELECT organization_id,connector_id,connector_scope_id "
+            "FROM connector_sync_jobs WHERE id=:job"
+        ),
+        {"job": job_id},
+    ).one_or_none()
+    if job is None:
+        return ControlReservationOwner(uuid.uuid4(), "A" * 43)
+    creator_id = uuid.uuid5(uuid.NAMESPACE_URL, f"creator:{job_id}")
+    reservation_id = uuid.uuid5(uuid.NAMESPACE_URL, f"reservation:{job_id}")
+    token = base64.urlsafe_b64encode(job_id.bytes + job_id.bytes).decode().rstrip("=")
+    owner = ControlReservationOwner(reservation_id, token)
+    _exec(
+        session,
+        """INSERT INTO users
+           (id,organization_id,email,normalized_email,password_hash,display_name)
+           VALUES (:id,:org,:email,:email,'test-hash','Test Creator')
+           ON CONFLICT (id) DO NOTHING""",
+        id=creator_id,
+        org=job.organization_id,
+        email=f"{creator_id}@example.test",
+    )
+    _exec(
+        session,
+        """INSERT INTO connector_sync_control_reservations
+           (id,organization_id,connector_id,connector_scope_id,sync_job_id,
+            created_by_user_id,owner_token_hash,target_source_key_hash,
+            target_provider_blob_id,target_provider_revision_id,
+            target_profile_fingerprint,state,created_at,expires_at)
+           VALUES (:id,:org,:connector,:scope,:job,:creator,:token_hash,
+                   :source_hash,:blob,:revision,:profile,'job',
+                   clock_timestamp(),clock_timestamp()+interval '1 hour')
+           ON CONFLICT (id) DO NOTHING""",
+        id=reservation_id,
+        org=job.organization_id,
+        connector=job.connector_id,
+        scope=job.connector_scope_id,
+        job=job_id,
+        creator=creator_id,
+        token_hash=owner.owner_token_hash,
+        source_hash="a" * 64,
+        blob="b" * 40,
+        revision="c" * 40,
+        profile="test-profile",
+    )
+    session.commit()
+    _RESERVATION_OWNERS[job_id] = owner
+    return owner
+
+
+def _controlled_request(
+    session: Session, organization_id: uuid.UUID
+) -> ControlledSyncReservationRequest:
+    creator_id = uuid.uuid4()
+    _exec(
+        session,
+        """INSERT INTO users
+           (id,organization_id,email,normalized_email,password_hash,display_name)
+           VALUES (:id,:org,:email,:email,'test-hash','Controlled Creator')""",
+        id=creator_id,
+        org=organization_id,
+        email=f"{creator_id}@example.test",
+    )
+    token = base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
+    return ControlledSyncReservationRequest(
+        ControlReservationOwner(uuid.uuid4(), token),
+        creator_id,
+        3600,
+        "a" * 64,
+        "b" * 40,
+        "c" * 40,
+        "test-profile",
+    )
+
+
+def test_controlled_enqueue_creates_job_and_reservation_atomically(engine):
+    setup = Session(engine, expire_on_commit=False)
+    organization_id, connector_id, scope_id = _setup_github(
+        setup, "ControlledAtomic"
+    )
+    request = _controlled_request(setup, organization_id)
+
+    result = _repo(setup).enqueue_or_coalesce(
+        organization_id,
+        connector_id,
+        scope_id,
+        mode="incremental",
+        trigger_type="manual",
+        now=NOW,
+        requested_by_user_id=request.created_by_user_id,
+        reservation=request,
+    )
+    reservation = setup.get(
+        ConnectorSyncControlReservation, request.owner.reservation_id
+    )
+    replay = _repo(setup).enqueue_or_coalesce(
+        organization_id,
+        connector_id,
+        scope_id,
+        mode="incremental",
+        trigger_type="manual",
+        now=NOW,
+        requested_by_user_id=request.created_by_user_id,
+        reservation=request,
+    )
+
+    assert result.coalesced is False
+    assert replay == type(replay)(result.job_id, "queued", True)
+    assert reservation is not None
+    assert reservation.sync_job_id == result.job_id
+    assert reservation.owner_token_hash == request.owner.owner_token_hash
+    assert reservation.state == "job"
+    setup.rollback()
+    setup.close()
+
+    with Session(engine) as verification:
+        assert verification.get(ConnectorSyncJob, result.job_id) is None
+        assert (
+            verification.get(
+                ConnectorSyncControlReservation, request.owner.reservation_id
+            )
+            is None
+        )
+
+
+def test_generic_job_consumers_skip_live_controlled_reservation(session):
+    organization_id, connector_id, scope_id = _setup_github(
+        session, "ControlledGenericSkip"
+    )
+    request = _controlled_request(session, organization_id)
+    result = _repo(session).enqueue_or_coalesce(
+        organization_id,
+        connector_id,
+        scope_id,
+        mode="incremental",
+        trigger_type="manual",
+        now=NOW,
+        requested_by_user_id=request.created_by_user_id,
+        reservation=request,
+    )
+    session.commit()
+
+    assert _acquire_routed(session) is None
+    controlled = _service(session).acquire_target_github(
+        organization_id,
+        connector_id,
+        scope_id,
+        result.job_id,
+        request.owner,
+        worker_id="controlled-owner",
+        lease_duration=LEASE,
+    )
+    session.commit()
+    assert controlled.outcome == "acquired"
+    assert (
+        _repo(session).lock_expired_routed(
+            now=NOW + LEASE + timedelta(seconds=1), limit=10
+        )
+        == ()
+    )
+    state = _repo(session).get(organization_id, result.job_id)
+    assert state is not None
+    assert state.status == "running"
+    assert state.attempt_count == 1
+
+
+def test_concurrent_generic_and_target_job_acquisition_select_only_reserved_target(
+    engine,
+):
+    setup = Session(engine, expire_on_commit=False)
+    organization_id, connector_id, scope_id = _setup_github(
+        setup, "ControlledConcurrentAcquisition"
+    )
+    request = _controlled_request(setup, organization_id)
+    result = _repo(setup).enqueue_or_coalesce(
+        organization_id,
+        connector_id,
+        scope_id,
+        mode="incremental",
+        trigger_type="manual",
+        now=NOW,
+        requested_by_user_id=request.created_by_user_id,
+        reservation=request,
+    )
+    setup.commit()
+    setup.close()
+
+    barrier = threading.Barrier(2)
+    outcomes: dict[str, object] = {}
+    errors: list[BaseException] = []
+
+    def generic() -> None:
+        value = Session(engine)
+        try:
+            barrier.wait()
+            outcomes["generic"] = _repo(value).acquire_next_github(
+                worker_id="generic-racer", lease_duration=LEASE, now=NOW
+            )
+            value.commit()
+        except BaseException as error:  # pragma: no cover - surfaced below
+            errors.append(error)
+        finally:
+            value.close()
+
+    def targeted() -> None:
+        value = Session(engine)
+        try:
+            barrier.wait()
+            outcomes["target"] = _service(value).acquire_target_github(
+                organization_id,
+                connector_id,
+                scope_id,
+                result.job_id,
+                request.owner,
+                worker_id="target-racer",
+                lease_duration=LEASE,
+            )
+            value.commit()
+        except BaseException as error:  # pragma: no cover - surfaced below
+            errors.append(error)
+        finally:
+            value.close()
+
+    threads = [threading.Thread(target=generic), threading.Thread(target=targeted)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert outcomes["generic"] is None
+    target = outcomes["target"]
+    assert target is not None
+    assert target.outcome == "acquired"
+    assert target.attempt is not None
+    assert target.attempt.lease.job_id == result.job_id
+
+
+def test_ordinary_queued_cancellation_remains_compatible_before_reservation_schema(
+    session,
+):
+    organization_id, connector_id, scope_id = _setup_github(
+        session, "PredecessorCancellation"
+    )
+    job = _enqueue(session, organization_id, connector_id, scope_id)
+    session.commit()
+
+    # PostgreSQL DDL is transactional: this models transition revision 000024,
+    # then rollback restores the current fixture without cross-test state.
+    session.execute(text("DROP TABLE connector_sync_control_reservations"))
+    cancelled = _repo(session).request_cancellation(
+        organization_id, job.job_id, now=NOW
+    )
+    assert cancelled.status == "cancelled"
+    session.rollback()
+
+    persisted = _repo(session).get(organization_id, job.job_id)
+    assert persisted is not None
+    assert persisted.status == "queued"
+
+
+def test_ordinary_enqueue_cannot_coalesce_onto_live_controlled_job(session):
+    organization_id, connector_id, scope_id = _setup_github(
+        session, "ControlledCoalesceIsolation"
+    )
+    request = _controlled_request(session, organization_id)
+    controlled = _repo(session).enqueue_or_coalesce(
+        organization_id,
+        connector_id,
+        scope_id,
+        mode="incremental",
+        trigger_type="manual",
+        now=NOW,
+        requested_by_user_id=request.created_by_user_id,
+        reservation=request,
+    )
+
+    with pytest.raises(SyncJobConflict, match="controlled synchronization job"):
+        _repo(session).enqueue_or_coalesce(
+            organization_id,
+            connector_id,
+            scope_id,
+            mode="incremental",
+            trigger_type="manual",
+            now=NOW,
+            requested_by_user_id=request.created_by_user_id,
+        )
+
+    assert session.scalar(
+        select(func.count()).select_from(ConnectorSyncJob).where(
+            ConnectorSyncJob.organization_id == organization_id,
+            ConnectorSyncJob.connector_scope_id == scope_id,
+        )
+    ) == 1
+    assert session.get(ConnectorSyncControlReservation, request.owner.reservation_id)
+    assert controlled.coalesced is False
+
+
+def test_reserved_enqueue_fails_before_job_mutation_on_predecessor_schema(session):
+    organization_id, connector_id, scope_id = _setup_github(
+        session, "ControlledPredecessorEnqueue"
+    )
+    request = _controlled_request(session, organization_id)
+    session.commit()
+    before = session.scalar(select(func.count()).select_from(ConnectorSyncJob))
+
+    session.execute(text("DROP TABLE connector_sync_control_reservations"))
+    with pytest.raises(SyncJobConflict, match="schema is unavailable"):
+        _repo(session).enqueue_or_coalesce(
+            organization_id,
+            connector_id,
+            scope_id,
+            mode="incremental",
+            trigger_type="manual",
+            now=NOW,
+            requested_by_user_id=request.created_by_user_id,
+            reservation=request,
+        )
+    assert session.scalar(select(func.count()).select_from(ConnectorSyncJob)) == before
+    session.rollback()
+
+
+def test_new_job_consumers_fail_closed_without_mutation_on_predecessor_schema(session):
+    organization_id, connector_id, scope_id = _setup_github(
+        session, "ControlledPredecessorWorker"
+    )
+    job = _enqueue(session, organization_id, connector_id, scope_id)
+    session.commit()
+
+    session.execute(text("DROP TABLE connector_sync_control_reservations"))
+    with pytest.raises(SyncJobPersistenceError):
+        _repo(session).acquire_next_github(
+            worker_id="new-worker-on-predecessor",
+            lease_duration=LEASE,
+            now=NOW,
+        )
+    session.rollback()
+
+    persisted = _repo(session).get(organization_id, job.job_id)
+    assert persisted is not None
+    assert persisted.status == "queued"
+    assert persisted.attempt_count == 0
+
+
+def test_targeted_job_consumer_fails_closed_on_predecessor_schema(session):
+    organization_id, connector_id, scope_id = _setup_github(
+        session, "ControlledPredecessorTarget"
+    )
+    request = _controlled_request(session, organization_id)
+    job = _enqueue(session, organization_id, connector_id, scope_id)
+    session.commit()
+
+    session.execute(text("DROP TABLE connector_sync_control_reservations"))
+    with pytest.raises(SyncJobPersistenceError):
+        _service(session).acquire_target_github(
+            organization_id,
+            connector_id,
+            scope_id,
+            job.job_id,
+            request.owner,
+            worker_id="target-on-predecessor",
+            lease_duration=LEASE,
+        )
+    session.rollback()
+
+    persisted = _repo(session).get(organization_id, job.job_id)
+    assert persisted is not None
+    assert persisted.status == "queued"
+    assert persisted.attempt_count == 0
+
+
+def test_wrong_controlled_owner_cannot_claim_or_mutate_job(session):
+    organization_id, connector_id, scope_id = _setup_github(
+        session, "ControlledWrongOwner"
+    )
+    request = _controlled_request(session, organization_id)
+    result = _repo(session).enqueue_or_coalesce(
+        organization_id,
+        connector_id,
+        scope_id,
+        mode="incremental",
+        trigger_type="manual",
+        now=NOW,
+        requested_by_user_id=request.created_by_user_id,
+        reservation=request,
+    )
+    session.commit()
+    wrong_token = base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
+    wrong = ControlReservationOwner(request.owner.reservation_id, wrong_token)
+
+    acquired = _service(session).acquire_target_github(
+        organization_id,
+        connector_id,
+        scope_id,
+        result.job_id,
+        wrong,
+        worker_id="wrong-owner",
+        lease_duration=LEASE,
+    )
+
+    assert acquired.outcome == "not_eligible"
+    assert acquired.attempt is None
+    state = _repo(session).get(organization_id, result.job_id)
+    assert state is not None
+    assert state.status == "queued"
+    assert state.attempt_count == 0
 
 
 def test_targeted_github_claim_ignores_unrelated_eligible_jobs(session):
@@ -476,6 +902,7 @@ def test_targeted_recovery_changes_only_exact_expired_job_and_fences_stale_owner
         connector_id,
         target_scope,
         target_job.job_id,
+        _RESERVATION_OWNERS[target_job.job_id],
     )
     session.commit()
 
@@ -512,6 +939,7 @@ def test_mismatched_target_recovery_leaves_expired_job_unchanged(session):
         connector_id,
         uuid.uuid4(),
         job.job_id,
+        _RESERVATION_OWNERS[job.job_id],
     )
 
     assert recovered == ()
@@ -564,6 +992,7 @@ def test_targeted_recovery_preserves_cancellation_and_attempt_limit_semantics(
         connector_id,
         scope_id,
         job.job_id,
+        _RESERVATION_OWNERS[job.job_id],
     )
     session.commit()
 
@@ -675,6 +1104,7 @@ def test_targeted_recovery_rolls_back_without_partial_lifecycle_mutation(engine)
         connector_id,
         scope_id,
         job.job_id,
+        _RESERVATION_OWNERS[job.job_id],
     )
     assert len(recovered) == 1
     setup.rollback()

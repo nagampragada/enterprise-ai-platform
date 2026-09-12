@@ -23,7 +23,7 @@ from infrastructure.repositories.permission_aware_document_chunk_search_reposito
 ROOT = Path(__file__).resolve().parents[3]
 PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
 INI = ROOT / "alembic.ini"
-REVISION = "20260905_000024"
+REVISION = "20260911_000025"
 PRIOR_REVISION = "20260904_000023"
 OBSERVATIONS = "connector_sync_generation_observations"
 GENERATIONS = "connector_sync_generations"
@@ -142,9 +142,9 @@ def test_reconciliation_revision_schema_round_trip_preserves_transition_compatib
         monkeypatch.setattr(db_health, "engine", downgraded)
         health = db_health.check_database_connection()
         assert health.healthy is True
-        assert health.schema_compatible is True
+        assert health.schema_compatible is False
         assert health.schema_current is False
-        assert health.migration_required is True
+        assert health.migration_required is False
         with downgraded.begin() as connection:
             organization_id, user_id, connector_id, space_id, scope_id, job_id, generation_id = (
                 uuid.uuid4() for _ in range(7)

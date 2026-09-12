@@ -193,6 +193,8 @@ class GitHubSyncWorkPlanningService:
         snapshot: GitHubRepositorySnapshot,
         profile_fingerprint: str,
         now: datetime,
+        reservation_id: UUID | None = None,
+        planner_lease_id: UUID | None = None,
     ) -> RepositoryGenerationView:
         generation, _created = self.ensure_generation(
             organization_id=organization_id,
@@ -205,7 +207,11 @@ class GitHubSyncWorkPlanningService:
             now=now,
         )
         return self._repository.mark_discovery_complete(
-            organization_id, generation.generation_id, now=now
+            organization_id,
+            generation.generation_id,
+            now=now,
+            reservation_id=reservation_id,
+            planner_lease_id=planner_lease_id,
         )
 
 

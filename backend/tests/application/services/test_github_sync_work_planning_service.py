@@ -254,5 +254,41 @@ def test_completion_is_idempotently_bound_to_the_exact_generation() -> None:
     )
     assert result.discovery_complete is True
     repository.mark_discovery_complete.assert_called_once_with(
-        organization_id, generation_id, now=NOW
+        organization_id,
+        generation_id,
+        now=NOW,
+        reservation_id=None,
+        planner_lease_id=None,
+    )
+
+
+def test_controlled_completion_forwards_reservation_and_planner_fence() -> None:
+    context = _context()
+    service, repository, generation_id = _service()
+    reservation_id, planner_lease_id = uuid4(), uuid4()
+    repository.mark_discovery_complete.return_value = SimpleNamespace(
+        generation_id=generation_id,
+        discovery_complete=True,
+    )
+    organization_id, connector_id, scope_id, job_id, authorization, snapshot = context
+
+    service.mark_discovery_complete(
+        organization_id=organization_id,
+        connector_id=connector_id,
+        connector_scope_id=scope_id,
+        sync_job_id=job_id,
+        authorization=authorization,
+        snapshot=snapshot,
+        profile_fingerprint=PROFILE,
+        now=NOW,
+        reservation_id=reservation_id,
+        planner_lease_id=planner_lease_id,
+    )
+
+    repository.mark_discovery_complete.assert_called_once_with(
+        organization_id,
+        generation_id,
+        now=NOW,
+        reservation_id=reservation_id,
+        planner_lease_id=planner_lease_id,
     )

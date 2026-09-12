@@ -7,6 +7,10 @@ from uuid import uuid4
 
 import pytest
 
+from domain.connectors.sync_control_reservation import (
+    ControlReservationOwner,
+    ControlledSyncReservationRequest,
+)
 from application.services.connector_management_service import (
     ConnectorManagementConflict,
     ConnectorManagementNotFound,
@@ -261,6 +265,24 @@ def test_github_enqueue_requires_canonical_scope_and_persisted_authorization():
     service._credentials.lock.assert_called_once_with(organization_id, connector_id)
     service._installations.lock.assert_called_once_with(organization_id, connector_id)
     session.commit.assert_not_called()
+
+    reservation = ControlledSyncReservationRequest(
+        ControlReservationOwner(uuid4(), "A" * 43),
+        user_id,
+        3600,
+        "a" * 64,
+        "b" * 40,
+        "c" * 40,
+        "profile",
+    )
+    service.enqueue_sync_job(
+        organization_id,
+        user_id,
+        connector_id,
+        scope_id,
+        reservation=reservation,
+    )
+    assert service._jobs.enqueue_or_coalesce.call_args.kwargs["reservation"] is reservation
 
     service._credentials.lock.return_value.status = "revoked"
     with pytest.raises(ConnectorManagementConflict, match="authorization"):

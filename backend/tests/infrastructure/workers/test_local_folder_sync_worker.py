@@ -151,7 +151,7 @@ def test_claim_acquires_one_run_commits_closes_and_returns_scalar_immutable_cont
     execution.acquire_one.assert_called_once()
     assert sessions.events == ["open:1", "commit", "close"]
     assert all(
-        isinstance(value, (UUID, int, str, datetime))
+        isinstance(value, (UUID, int, str, datetime, type(None)))
         for value in context.__dict__.values()
     )
     with pytest.raises(FrozenInstanceError):

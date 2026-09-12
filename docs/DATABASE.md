@@ -1,5 +1,50 @@
 # Database Architecture
 
+## Controlled synchronization reservations (`20260911_000025`)
+
+Migration `20260911_000025` additively creates
+`connector_sync_control_reservations`. Revision `20260905_000024` remains the
+only compatible predecessor during rollout. Each row is tenant-qualified and
+binds one synchronization job to its authenticated creator, intended
+source-key hash, immutable provider blob/revision, processing profile, bounded
+database-time expiry, and SHA-256 hash of an opaque owner capability. The raw
+capability is never persisted.
+
+The row begins in `job` state with no generation or work item. The planner may
+own it only through its current job lease. Discovery completion atomically
+validates the one-item manifest, binds the generation/work item, clears planner
+ownership, and advances the row to `work_item`; job completion is in that same
+caller transaction. The processor lease is then bound atomically with the
+exact work claim. Retry clears processor ownership but retains the reservation;
+terminal completion, terminal failure, or cancellation moves it to `released`.
+Tenant-qualified foreign keys, unique job/work-item bindings, lifecycle checks,
+lease-state checks, strict hash/provider-identity checks, and the 5-minute to
+2-hour expiry bound independently reject malformed durable state.
+
+Every compatible generic job and work-item claim/recovery query excludes a live
+reservation. Before handoff the work filter joins through the generation's job;
+after handoff it uses the exact bound item. Expiry is not lease revocation: an
+unexpired work lease remains fenced, then ordinary recovery becomes possible
+only after both protections lapse. Short acquisition, handoff, retry, and
+completion transactions use database time and row locks. Reservation state is
+not referenced by permission-aware retrieval, activation, promotion, or
+reconciliation. Existing activated retrieval still reads the generation-
+activation, generation, materialization, and staged-chunk ledger relations; the
+narrower guarantee is that this migration adds no reservation-table dependency
+to retrieval.
+
+Downgrade removes the reservation table, its indexes, and every reservation row;
+it preserves synchronization jobs, generations, work items, and historical
+content. Because binaries before this migration do not exclude reservations,
+deploy the compatible API first, keep all new worker binaries idle on the
+predecessor, migrate, and then update or hold idle the legacy connector worker,
+dedicated planner, and dedicated processor before creating a controlled
+reservation. New generic worker queries are not executable against predecessor
+`20260905_000024` because they contain reservation-table predicates. Do not
+downgrade or roll back to an older consumer while any live reservation or
+reserved job/item exists; require quiescence and independently verified zero
+reservation dependency first.
+
 ## Authoritative generation observations and deletion reconciliation (`20260905_000024`)
 
 Migration `20260905_000024` adds the tenant-qualified
@@ -179,8 +224,9 @@ the next active row in the same caller-owned transaction; rollback preserves the
 previous authority. Readiness accepts only predecessor `20260902_000022` and
 current `20260904_000023` during this additive transition.
 
-That Slice 4 compatibility window is historical. The current Slice 5 window is
-the exact `20260904_000023`/`20260905_000024` pair documented above.
+Those Slice 4/5 compatibility windows are historical. The current controlled-
+reservation window is the exact `20260905_000024`/`20260911_000025` pair
+documented above.
 
 `GitHubSyncGenerationPromotionService` requires explicit
 `GITHUB_SYNC_LEDGER_PROMOTION_ENABLED=true`. The flag defaults to `false` and

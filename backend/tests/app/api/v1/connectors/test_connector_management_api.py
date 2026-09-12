@@ -43,6 +43,9 @@ from infrastructure.repositories.connector_sync_job_repository import (
     SyncJobPageCursor,
     SyncJobRunSummary,
 )
+from domain.connectors.sync_control_reservation import (
+    generate_control_reservation_owner,
+)
 
 NOW = datetime(2026, 8, 18, tzinfo=timezone.utc)
 
@@ -293,7 +296,7 @@ def test_scope_list_is_bounded_deterministic_and_redacted():
     assert "secret-root" not in response.text and "safe_config" not in response.text
 
 
-def test_enqueue_returns_202_coalesces_and_never_executes_worker_or_accepts_body():
+def test_enqueue_returns_202_coalesces_and_never_executes_worker_or_accepts_unknown_body():
     service, session, admin = _setup()
     connector_id, scope_id = uuid4(), uuid4()
     job = _job(connector_id, scope_id)
@@ -311,6 +314,75 @@ def test_enqueue_returns_202_coalesces_and_never_executes_worker_or_accepts_body
     service.enqueue_sync_job.assert_called_with(admin.organization_id, admin.user_id, connector_id, scope_id)
     run.assert_not_called()
     assert "lease" not in response.text and "worker" not in response.text
+
+
+def test_controlled_enqueue_accepts_bounded_secret_reservation_without_echoing_it():
+    service, session, admin = _setup()
+    connector_id, scope_id, reservation_id = uuid4(), uuid4(), uuid4()
+    job = _job(connector_id, scope_id)
+    token = generate_control_reservation_owner(reservation_id).owner_token
+    service.enqueue_sync_job.return_value = (
+        EnqueueResult(job.job_id, "queued", False),
+        job,
+    )
+    payload = {
+        "reservation": {
+            "reservation_id": str(reservation_id),
+            "owner_token": token,
+            "expires_in_seconds": 3600,
+            "target_source_key_hash": "a" * 64,
+            "target_provider_blob_id": "b" * 40,
+            "target_provider_revision_id": "c" * 40,
+            "target_profile_fingerprint": "github:extract-v1:chunk-v2:embed-v1",
+        }
+    }
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/api/v1/connectors/{connector_id}/scopes/{scope_id}/sync-jobs",
+            json=payload,
+        )
+
+    assert response.status_code == 202
+    reservation = service.enqueue_sync_job.call_args.kwargs["reservation"]
+    assert reservation.created_by_user_id == admin.user_id
+    assert reservation.owner.reservation_id == reservation_id
+    assert reservation.owner.owner_token == token
+    assert token not in response.text
+    assert token not in repr(reservation)
+    assert "reservation" not in response.json()
+    assert session.commit_calls == 1
+
+
+def test_controlled_enqueue_fails_closed_for_partial_or_invalid_capability():
+    service, session, _admin = _setup()
+    connector_id, scope_id = uuid4(), uuid4()
+
+    with TestClient(app) as client:
+        partial = client.post(
+            f"/api/v1/connectors/{connector_id}/scopes/{scope_id}/sync-jobs",
+            json={"reservation": {"reservation_id": str(uuid4())}},
+        )
+        invalid = client.post(
+            f"/api/v1/connectors/{connector_id}/scopes/{scope_id}/sync-jobs",
+            json={
+                "reservation": {
+                    "reservation_id": str(uuid4()),
+                    "owner_token": "not-a-capability",
+                    "expires_in_seconds": 3600,
+                    "target_source_key_hash": "a" * 64,
+                    "target_provider_blob_id": "b" * 40,
+                    "target_provider_revision_id": "c" * 40,
+                    "target_profile_fingerprint": "profile",
+                }
+            },
+        )
+
+    assert partial.status_code == 422
+    assert invalid.status_code == 422
+    assert "not-a-capability" not in invalid.text
+    service.enqueue_sync_job.assert_not_called()
+    assert session.commit_calls == 0
 
 
 def test_job_list_and_get_are_redacted_and_cross_tenant_not_found_is_safe():

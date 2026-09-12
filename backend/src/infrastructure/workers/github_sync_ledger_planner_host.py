@@ -75,6 +75,9 @@ class _PlannerClaimResult:
                 "owned_elsewhere",
                 "retry_not_due",
                 "not_eligible",
+                "recovered_retry_wait",
+                "recovered_cancelled",
+                "recovered_failed",
             }
         )
         acquired = self.outcome == "acquired"
@@ -216,12 +219,17 @@ class GitHubSyncLedgerPlannerHost:
                     self._claim_target.connector_id,
                     self._claim_target.connector_scope_id,
                     self._claim_target.sync_job_id,
+                    self._claim_target.reservation_owner,
                 )
             if recovered:
                 self._logger.info(
                     "event=github_ledger_planner_expired_jobs_recovered count=%d",
                     len(recovered),
                 )
+                if self._claim_target is not None:
+                    recovered_status = recovered[0].status
+                    session.commit()
+                    return _PlannerClaimResult(f"recovered_{recovered_status}")
             result = _PlannerClaimResult("shutdown")
             if not self._shutdown.is_set():
                 if self._claim_target is None:
@@ -240,6 +248,7 @@ class GitHubSyncLedgerPlannerHost:
                         self._claim_target.connector_id,
                         self._claim_target.connector_scope_id,
                         self._claim_target.sync_job_id,
+                        self._claim_target.reservation_owner,
                         worker_id=self._settings.worker_id,
                         lease_duration=self._settings.lease_duration,
                     )
@@ -345,6 +354,7 @@ def _attempt_context(acquired, worker_id: str) -> LocalFolderAttemptContext:
         lease.mode,
         lease.trigger_type,
         lease.max_attempts,
+        getattr(lease, "reservation_id", None),
     )
 
 

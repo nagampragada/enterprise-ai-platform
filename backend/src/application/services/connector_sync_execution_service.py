@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from typing import Callable
 from uuid import UUID
 
+from domain.connectors.sync_control_reservation import ControlReservationOwner
 from application.services.connector_sync_retry_policy import (
     ConnectorSyncRetryPolicy,
     RetryPolicyViolation,
@@ -176,6 +177,7 @@ class ConnectorSyncExecutionService:
         connector_id: UUID,
         connector_scope_id: UUID,
         sync_job_id: UUID,
+        reservation_owner: ControlReservationOwner,
         *,
         worker_id: str,
         lease_duration: timedelta,
@@ -187,6 +189,7 @@ class ConnectorSyncExecutionService:
             connector_id,
             connector_scope_id,
             sync_job_id,
+            reservation_owner,
             worker_id=worker_id,
             lease_duration=lease_duration,
             now=now,
@@ -377,6 +380,7 @@ class ConnectorSyncExecutionService:
         connector_id: UUID,
         connector_scope_id: UUID,
         sync_job_id: UUID,
+        reservation_owner: ControlReservationOwner,
     ) -> tuple[SyncJobHistoryItem, ...]:
         """Recover only the exact expired target; never scan global GitHub work."""
         now = self._now()
@@ -385,6 +389,7 @@ class ConnectorSyncExecutionService:
             connector_id,
             connector_scope_id,
             sync_job_id,
+            reservation_owner,
             now=now,
         )
         return self._recover_expired(expired, now)

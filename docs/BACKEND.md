@@ -21,25 +21,35 @@ cursor, entry, file, byte, and chunk limits remain independent hard limits. The
 planner does not download blobs, extract, embed, process, promote, reconcile,
 or change retrieval authority.
 
-Controlled planner executions may additionally supply the all-or-none canonical
+Controlled planner executions additionally require a durable reservation created
+atomically with the synchronization job. They supply the all-or-none canonical
 UUID tuple `GITHUB_LEDGER_PLANNER_TARGET_ORGANIZATION_ID`,
 `GITHUB_LEDGER_PLANNER_TARGET_CONNECTOR_ID`,
 `GITHUB_LEDGER_PLANNER_TARGET_SCOPE_ID`, and
-`GITHUB_LEDGER_PLANNER_TARGET_SYNC_JOB_ID`. Any partial, blank, whitespace,
+`GITHUB_LEDGER_PLANNER_TARGET_SYNC_JOB_ID`, plus
+`GITHUB_LEDGER_CONTROL_RESERVATION_ID` and its 32-byte base64url
+`GITHUB_LEDGER_CONTROL_RESERVATION_OWNER_TOKEN` capability. Any partial, blank, whitespace,
 malformed, normalized, or noncanonical tuple fails before database/provider
 composition, even while planning is disabled. Targeted mode restricts both
 expired-job recovery and the atomic GitHub claim to that exact tuple and never
-falls back to global selection. A missing, terminal, cancelled, exhausted,
+falls back to global selection. The raw owner capability is never stored in
+the database, response model, application repr, or structured application log;
+only its SHA-256 digest is durable. Transport through Cloud Run literal
+environment/argument overrides is not approved because execution metadata,
+audit logs, CLI history, or local flags files may persist the bearer value. A
+future controller must generate 32 bytes with a cryptographically secure random
+source and use a separately reviewed secret-reference transport. A missing,
+expired, released,
+wrongly owned, terminal, cancelled, exhausted,
 not-due, locked, or mismatched target exits unsuccessfully without reporting
 discovery success or touching unrelated jobs. Without the tuple, established
 global selection and bounded recovery remain unchanged. `--once` means one
 claim followed by multiple bounded batches for that job; batch/runtime exhaustion
-is resumable and a later invocation is required. Targeting prevents this planner
-from choosing another job, but cannot prevent a legacy/global consumer from
-winning the target first. Production use still requires an independently proven
-exclusive window and invocation-source controls. Keeping the persistent planner
-flag false and using future execution-scoped settings is a rollout proposal only;
-this implementation does not enable or execute it.
+is resumable and a later invocation is required. Every compatible generic job
+claim and recovery path excludes a live reservation, so target selection is
+durably protected rather than relying on a check-to-claim window. Older binaries
+do not know this table and remain unsafe until every potentially competing
+planner/legacy worker image is upgraded or held idle.
 
 The sanitized target-miss outcome is one of `completed`, `cancelled`, `failed`,
 `attempts_exhausted`, `owned_elsewhere`, `retry_not_due`, `not_eligible`, or
@@ -69,6 +79,25 @@ legacy source/document/version/chunk graph and remain retrieval-invisible unless
 an independently validated Slice 4 activation exists. It does not promote or
 reconcile a generation.
 The API, scheduler, migration, and bootstrap processes do not consume the flag.
+
+The dedicated processor has a corresponding exact-target mode. All five
+canonical IDs (`ORGANIZATION`, `CONNECTOR`, `SCOPE`, `GENERATION`, and
+`WORK_ITEM`) plus the same reservation ID/owner capability must be present or
+all absent. Validation precedes database/provider composition. The planner's
+final manifest transaction atomically proves that exactly one registered item
+matches the reserved source/blob/revision/profile, binds that generation and
+item, moves the reservation from `job` to `work_item`, completes the job, and
+commits the handoff. Every compatible generic item claim/recovery path excludes
+the live reservation before and after handoff. Targeted acquisition can recover
+and claim only that exact reserved item in one short transaction; it never runs
+global recovery or fairness selection and stops after its single outcome.
+Retries retain the reservation without retaining a stale processor lease;
+terminal success/failure/cancellation releases it. Reservation expiry is based
+on database time, does not revoke an unexpired work lease, and makes stale
+capability completions fail fencing checks. After both reservation and work
+lease expire, normal recovery becomes available again. Expiry ends exclusive
+reservation protection: the controller must stop after ownership loss and may
+not assume indefinite protection or silently reacquire.
 
 `GITHUB_SYNC_LEDGER_PROMOTION_ENABLED` is the independent Slice 4 gate. It
 defaults to `false` and accepts only exact lowercase `true` or `false`. No
@@ -193,7 +222,24 @@ GET  /api/v1/connectors/{connector_id}/sync-jobs/{job_id}
 POST /api/v1/connectors/{connector_id}/sync-jobs/{job_id}/cancel
 ```
 
-Create accepts only `connector_scope_id`; cancel needs no body and accepts no fields. Connector type, organization, knowledge space, provider authorization, trigger, retry policy, priority, and worker controls are server-owned. Manual and scheduled enqueue share the database-enforced one-nonterminal-job-per-scope invariant, so a repeated or concurrent request returns the existing safe job without resetting attempts or backoff.
+Create normally accepts only `connector_scope_id`; the established scope-specific
+enqueue endpoint may additionally accept one administrator-authenticated,
+GitHub-only `reservation` object for an explicitly controlled run. That object
+contains a canonical reservation UUID, an opaque 32-byte base64url owner
+capability, a 300–7,200 second lifetime, and the intended source-hash/blob/
+revision/profile tuple. It is inserted atomically with the job. The capability
+is write-only and never appears in a response. Cancel needs no body and accepts
+no fields. Connector type, organization, knowledge space, provider authorization,
+trigger, retry policy, priority, and worker controls are otherwise server-owned.
+Manual and scheduled enqueue share the database-enforced one-nonterminal-job-per-scope
+invariant, so a repeated or concurrent request returns the existing safe job
+without resetting attempts or backoff; a reserved retry coalesces only to the
+same live reservation.
+
+The POST route creates job/reservation control-plane state only. It is public
+to authenticated organization administrators, but it is not a planner or
+processor execution endpoint and performs no provider call. An ordinary
+enqueue cannot coalesce onto a live reserved job.
 
 Listing uses newest-first `(created_at,id)` ordering with `page` limited to 1–1,000 and `page_size` limited to 1–100. Detail includes at most 20 newest run summaries. Responses are explicit DTOs and omit tenant identity, worker/lease/fence/heartbeat data, cursors, provider metadata, credentials, secrets, source content, vectors, raw exceptions, and arbitrary JSON.
 
@@ -215,6 +261,18 @@ python -m infrastructure.bootstrap.sandbox
 
 The API launcher runs one Uvicorn process on `0.0.0.0` with a validated `PORT`; reload and debug behavior are absent. `APP_ENVIRONMENT` accepts only `development`, `test`, `sandbox`, and `production`. Its deliberate missing-value default is `development`, never production. Sandbox and production require a non-development PostgreSQL URL plus distinct strong JWT and refresh-token secrets. Validation is process-specific so provider credentials are not required by operations that do not consume them.
 
-`GET /health` is dependency-free liveness. `GET /api/v1/health` is readiness: it returns 200 only when configuration is valid, bounded database checks succeed, the schema is in the exact transition allowlist, and required GitHub/Secret Manager composition is available in a strict runtime. The Slice 5 application explicitly accepts only `20260904_000023` and `20260905_000024`; it reports compatibility, currentness, and migration requirement separately. Revision `20260904_000023` remains ready but is not represented as current. Unknown, missing, malformed, newer, older, or multiple heads fail closed. The endpoint uses only fixed values and never retrieves provider secrets.
+`GET /health` is dependency-free liveness. `GET /api/v1/health` is readiness: it returns 200 only when configuration is valid, bounded database checks succeed, the schema is in the exact transition allowlist, and required GitHub/Secret Manager composition is available in a strict runtime. The reservation transition explicitly accepts only `20260905_000024` and `20260911_000025`; it reports compatibility, currentness, and migration requirement separately. Revision `20260905_000024` remains ready but is not represented as current. Unknown, missing, malformed, newer, older, or multiple heads fail closed. The endpoint uses only fixed values and never retrieves provider secrets.
+Ordinary enqueue/read/cancellation behavior remains usable on the predecessor;
+queued cancellation checks `to_regclass` before attempting reservation cleanup.
+Controlled reservation creation and all reserved worker modes require migration
+`20260911_000025` and must remain disabled before it is established.
+API startup, health, retrieval, ordinary enqueue, and ordinary queued
+cancellation are supported on predecessor `20260905_000024`. New generic job
+and work-item binaries already compile reservation-table predicates and must not
+execute until `20260911_000025` exists; health compatibility is not worker
+runtime compatibility. After migration, update or hold idle the legacy
+connector worker, dedicated planner, and dedicated processor before the first
+reservation is created. Rollback to an older binary or schema is prohibited
+while a live reservation or reserved job/item remains.
 
 The image and runbook are implemented and statically tested, but no image or cloud resource has been built or deployed. See `GCP_GITHUB_SANDBOX_RUNBOOK.md`.

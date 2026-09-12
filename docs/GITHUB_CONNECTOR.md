@@ -78,19 +78,29 @@ expiry/recovery. Each batch still obeys the 500-row ledger cap and each provider
 continuation still obeys the tree/request limits below.
 
 An optional controlled mode binds the planner to one exact organization,
-connector, scope, and synchronization-job UUID. All four
-`GITHUB_LEDGER_PLANNER_TARGET_*` settings must be present in lowercase canonical
-UUID form or all must be absent; invalid targeting fails before composition.
+connector, scope, and synchronization-job UUID plus a durable control
+reservation. All four `GITHUB_LEDGER_PLANNER_TARGET_*` settings and the shared
+`GITHUB_LEDGER_CONTROL_RESERVATION_ID` and
+`GITHUB_LEDGER_CONTROL_RESERVATION_OWNER_TOKEN` settings must be present or
+all absent. IDs use lowercase canonical UUID form; the owner token is a
+canonical 32-byte base64url capability generated in memory from a
+cryptographically secure random source equivalent to
+`secrets.token_bytes(32)`. Invalid targeting fails before
+database/provider composition.
 Target predicates are part of target-only expired recovery and the atomic claim,
 not a post-claim Python filter. There is no global fallback. A target miss,
 terminal/cancelled/exhausted state, future retry, or lease held elsewhere is a
 non-successful execution outcome and cannot select unrelated work. Omitting the
 tuple preserves global mode. One invocation still performs one claim and then
 multiple bounded continuation batches for only that job; budget exhaustion is
-resumable and never triggers another claim. Database leases prevent duplicate
-ownership but do not reserve which consumer wins, so an older/global worker may
-still acquire the target first. Production targeting remains blocked on an
-exclusive consumer window and complete automatic-invocation evidence.
+resumable and never triggers another claim. The reservation is created in the
+same transaction as the controlled job and every compatible generic job claim
+or recovery excludes it while live. Its raw capability is never stored in the
+database, response, repr, or structured application log. That does not make
+literal CLI, environment, flags-file, audit-log, or Cloud Run execution-metadata
+transport safe; such transport remains prohibited until separately reviewed.
+Older deployed binaries remain unaware of this exclusion, so rollout
+must upgrade or hold idle every potentially competing worker before using it.
 
 Target misses emit the safe target tuple plus exactly one of `completed`,
 `cancelled`, `failed`, `attempts_exhausted`, `owned_elsewhere`,
@@ -109,6 +119,29 @@ GitHub claim surface and must not run concurrently with the planner. Claim
 leases, attempts, fences, heartbeats, cancellation, and durable retry semantics
 remain the same. Planner composition validates no OpenAI setting and constructs
 no OpenAI client.
+
+At discovery completion, one transaction verifies that the complete manifest
+contains exactly the reserved source identity and that its blob, revision, and
+profile match; it then binds the generated work-item ID, transfers reservation
+state from `job` to `work_item`, completes the synchronization job, and commits
+the handoff. There is no unreserved gap between planner and processor. Every
+compatible generic ledger claim/recovery excludes a live pre-handoff or
+post-handoff reservation.
+
+The processor exact-target mode requires all five canonical
+`GITHUB_LEDGER_PROCESSOR_TARGET_*` IDs plus the same reservation ID/capability.
+It validates them before composing the database or provider clients. Its single
+acquisition transaction may recover only the exact expired target and claim
+only that target; global recovery, organization fairness, and fallback are not
+called. It stops after one safe outcome. Successful staging/completion releases
+the reservation atomically; application retry retains it with no processor
+lease; terminal failure or cancellation releases it. Database time bounds the
+5-minute to 2-hour lifetime. Expiry never permits generic recovery while the
+work lease remains valid, and stale completion cannot bypass the lease/fence/
+reservation ownership predicates.
+Reservation expiry ends exclusive reservation protection. A controller that
+loses ownership must stop and must not silently reacquire or assume that the
+reservation remains exclusive.
 
 One execution drains at most 25 items for at most 20 minutes by default. It
 requires 12 minutes of safe runway before another claim, uses a 15-minute

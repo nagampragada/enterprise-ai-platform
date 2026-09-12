@@ -166,6 +166,34 @@ templates and zero active executions as a rollout gate.
 No Cloud Run Job, scheduler, or trigger for this host is provisioned by the
 current implementation.
 
+A controlled run must create the job and its bounded reservation atomically
+through the authenticated API, then supply all four planner target UUIDs plus
+`GITHUB_LEDGER_CONTROL_RESERVATION_ID` and the execution-scoped owner capability.
+Generate the owner capability in memory with a cryptographically secure source
+equivalent to `secrets.token_bytes(32)`. Never store or log it in a persistent
+template. Do not pass it through a literal command, argument, environment
+override, shell history, or flags file: Cloud Run execution metadata and audit
+or CLI logs may persist those values. A separately reviewed secret-reference
+transport is a mandatory gate before any controlled production execution. The
+planner's
+final transaction transfers the same reservation to exactly one generated work
+item. The processor execution must supply all five processor target UUIDs plus
+the same capability; it then bypasses global recovery/fairness and stops after
+one outcome. Compatible generic job/item consumers exclude live reservations,
+but binaries predating `20260911_000025` do not. Upgrade or hold idle every
+potential consumer before creating a controlled reservation, and keep all
+persistent flags disabled outside the reviewed window.
+
+The expand order is API-only compatible deployment, migration to
+`20260911_000025`, then image alignment (or verified idleness) for the legacy
+connector worker, dedicated planner, and dedicated processor. New generic
+worker binaries must not execute on predecessor `20260905_000024`; their claim
+queries already reference the reservation table. Before the first reserved job,
+verify all four resource images/templates and zero active incompatible
+executions. Once any live reservation or reserved job/item exists, do not roll
+back to an older binary or downgrade the schema. Downgrade destroys reservation
+rows and requires quiescence plus independently verified safe disposition.
+
 Slice 4 adds `GITHUB_SYNC_LEDGER_PROMOTION_ENABLED`, defaulting to lowercase
 `false`. Do not add or enable it on an existing worker: no deployed host consumes
 the promotion contract yet. A later controlled promotion operator must use the
@@ -195,16 +223,16 @@ gcloud run jobs create $BOOTSTRAP_JOB --image=$IMAGE --region=$REGION --project=
 
 ## 9. Execute migrations, bootstrap, and readiness verification
 
-For the Phase 3 expand-migration transition, deploy in this order and inspect
+For the controlled-reservation expand-migration transition, deploy in this order and inspect
 each operation's nonsecret status before continuing:
 
 1. deploy the transition-compatible API image before changing the database;
 2. require readiness HTTP 200 with `schema_compatible=true`,
    `schema_current=false`, and `migration_required=true` at revision
-   `20260904_000023`;
+   `20260905_000024`;
 3. update only the established migration job to the same immutable image;
 4. execute the migration job exactly once and verify the image's expected
-   revision (Slice 5: `20260905_000024`);
+   revision (`20260911_000025`);
 5. require readiness HTTP 200 with `schema_compatible=true`,
    `schema_current=true`, and `migration_required=false`;
 6. update worker images while keeping planning/processing false and leaving
@@ -213,7 +241,7 @@ each operation's nonsecret status before continuing:
 
 The predecessor compatibility entry is deliberate temporary expand-migration
 policy. Remove it in a later cleanup only after all environments are confirmed
-at `20260905_000024`. Do not broaden it into revision ordering or a range.
+at `20260911_000025`. Do not broaden it into revision ordering or a range.
 
 For initial provisioning after the compatible API is deployed:
 

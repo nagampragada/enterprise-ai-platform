@@ -1162,6 +1162,7 @@ class GitHubStagedSynchronizationService:
             )
         self._replace_cursor(snapshot, target, current_row, now)
         if target.phase == "reconciliation" and self._planner is not None:
+            reservation_id = getattr(lease, "reservation_id", None)
             self._planner.mark_discovery_complete(
                 organization_id=lease.organization_id,
                 connector_id=lease.connector_id,
@@ -1171,6 +1172,8 @@ class GitHubStagedSynchronizationService:
                 snapshot=target.snapshot,
                 profile_fingerprint=snapshot.profile.fingerprint,
                 now=now,
+                reservation_id=reservation_id,
+                planner_lease_id=lease.lease_id if reservation_id else None,
             )
         return GitHubPersistenceOutcome(
             "in_progress",
@@ -1189,6 +1192,27 @@ class GitHubStagedSynchronizationService:
         now: datetime,
     ) -> GitHubPersistenceOutcome:
         """Durably advance only the immutable ledger discovery projection."""
+        if getattr(lease, "reservation_id", None) is None:
+            return self._persist_planning_batch(
+                lease, snapshot, batch, worker_id=worker_id, now=now
+            )
+        # A controlled final batch performs several repository-level
+        # transitions. The savepoint ensures that a caller which catches a
+        # later validation error cannot commit a partial handoff.
+        with self._session.begin_nested():
+            return self._persist_planning_batch(
+                lease, snapshot, batch, worker_id=worker_id, now=now
+            )
+
+    def _persist_planning_batch(
+        self,
+        lease: SyncJobLease,
+        snapshot: GitHubSynchronizationSnapshot,
+        batch: GitHubDiscoveryBatch,
+        *,
+        worker_id: str,
+        now: datetime,
+    ) -> GitHubPersistenceOutcome:
         if not self._ledger_planning_enabled or self._planner is None:
             raise InvalidGitHubStagedSynchronizationRequest(
                 "GitHub ledger planning is disabled"
@@ -1281,6 +1305,12 @@ class GitHubStagedSynchronizationService:
                 snapshot=target.snapshot,
                 profile_fingerprint=snapshot.profile.fingerprint,
                 now=now,
+                reservation_id=getattr(lease, "reservation_id", None),
+                planner_lease_id=(
+                    lease.lease_id
+                    if getattr(lease, "reservation_id", None) is not None
+                    else None
+                ),
             )
         self._replace_cursor(snapshot, target, current_row, now)
         if completed:
